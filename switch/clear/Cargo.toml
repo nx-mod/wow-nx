@@ -1,0 +1,25 @@
+[package]
+name = "clear"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# wow-nx render step 2 (docs/SWITCH-RENDER.md): wgpu on deko3d clears the screen. For now it checks that wgpu, wgpu-core
+# and the vendored wgpu-hal build for the Switch with the deko3d backend in the GL slot.
+[dependencies]
+wgpu = { version = "27", default-features = false, features = ["gles", "wgsl", "std"] }
+benilla-horizon = { path = "../../crates/benilla-horizon" }
+pollster = "0.4"
+
+[workspace]
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+
+[profile.dev]
+panic = "abort"
+
+[patch.crates-io]
+libc = { path = "../../third_party/libc" }
+wgpu-hal = { path = "../../third_party/wgpu-hal" }

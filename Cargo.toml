@@ -45,6 +45,8 @@ alsa = { path = "third_party/alsa-0.9" }
 # wow-nx: libc with devkitA64's types for the Switch (third_party/libc/WOW-NX.md): the same 0.2.186 as the lock, with
 # changes only under target_os = "horizon" on aarch64.
 libc = { path = "third_party/libc" }
+# wow-nx: wgpu-hal 27 with a deko3d backend standing in for GLES on Horizon (docs/SWITCH-RENDER.md); unchanged elsewhere.
+wgpu-hal = { path = "third_party/wgpu-hal" }
 
 # Dependencies at opt-level 3 in dev: at opt-level 0, avian/parry collision drops a run to <1 fps.
 [profile.dev.package."*"]
