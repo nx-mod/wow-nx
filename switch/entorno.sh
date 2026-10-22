@@ -11,6 +11,8 @@ A64=/opt/devkitpro/devkitA64/bin
 export CC_aarch64_nintendo_switch_newlib=$A64/aarch64-none-elf-gcc
 export AR_aarch64_nintendo_switch_newlib=$A64/aarch64-none-elf-ar
 export CFLAGS_aarch64_nintendo_switch_newlib="-march=armv8-a+crc+crypto -fPIE -D__SWITCH__ -I/opt/devkitpro/libnx/include"
+export CXX_aarch64_nintendo_switch_newlib=$A64/aarch64-none-elf-g++
+export CXXFLAGS_aarch64_nintendo_switch_newlib="-march=armv8-a+crc+crypto -fPIE -D__SWITCH__ -I/opt/devkitpro/libnx/include"
 SRC="$RAIZ/target/switch-rust-src/library"
 if [ ! -f "$SRC/.wow-nx-libc" ]; then
   rm -rf "$RAIZ/target/switch-rust-src" && mkdir -p "$RAIZ/target/switch-rust-src"

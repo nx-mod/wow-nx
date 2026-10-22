@@ -1,0 +1,12 @@
+[package]
+name = "benilla-uam"
+description = "wow-nx: uam, deko3d's GLSL to DKSH shader compiler (third_party/uam), for the Switch's wgpu backend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+links = "uam"
+
+# Only on the Switch target; elsewhere the crate is empty.
+[build-dependencies]
+cc = "1"
