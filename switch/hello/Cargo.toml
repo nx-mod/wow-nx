@@ -4,6 +4,19 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+[lib]
+# rlib for src/main.rs (test A), staticlib for the C main in c/ (test B).
+crate-type = ["rlib", "staticlib"]
+
+[dependencies]
+# getrandom and sysconf for std, from libnx (the port's platform seam).
+benilla-horizon = { path = "../../crates/benilla-horizon" }
+# Step 2's first crate on the console: the game's MPQ archives, if they are on the SD card.
+benilla-mpq = { path = "../../crates/benilla-mpq" }
+# Only for src/tipos.rs, the compile-time check of its C types against devkitA64's newlib.
+libc = "0.2"
+
+
 # Not part of benilla's workspace: built only for the Switch target.
 [workspace]
 
@@ -13,3 +26,7 @@ opt-level = "s"
 
 [profile.dev]
 panic = "abort"
+
+# libc with devkitA64's types (third_party/libc/WOW-NX.md), for std's own copy too.
+[patch.crates-io]
+libc = { path = "../../third_party/libc" }

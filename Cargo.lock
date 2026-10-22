@@ -598,6 +598,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "benilla-horizon"
+version = "0.2.0"
+dependencies = [
+ "getrandom 0.2.17",
+]
+
+[[package]]
 name = "benilla-lua"
 version = "0.2.0"
 dependencies = [
@@ -645,6 +652,7 @@ dependencies = [
 name = "benilla-srp"
 version = "0.2.0"
 dependencies = [
+ "benilla-horizon",
  "num-bigint",
  "rand 0.8.6",
  "sha1",
@@ -4184,8 +4192,6 @@ checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
 [[package]]
 name = "libc"
 version = "0.2.186"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
 name = "libloading"

@@ -42,6 +42,9 @@ kira = { path = "third_party/kira" }
 # A lock-only stand-in: bevy_audio's unbuilt cpal 0.15 would otherwise hold `alsa-sys` 0.3 against
 # cpal 0.17's 0.4, and a lock holds one `links = "alsa"` (`third_party/alsa-0.9/BENILLA.md`).
 alsa = { path = "third_party/alsa-0.9" }
+# wow-nx: libc with devkitA64's types for the Switch (third_party/libc/WOW-NX.md): the same 0.2.186 as the lock, with
+# changes only under target_os = "horizon" on aarch64.
+libc = { path = "third_party/libc" }
 
 # Dependencies at opt-level 3 in dev: at opt-level 0, avian/parry collision drops a run to <1 fps.
 [profile.dev.package."*"]

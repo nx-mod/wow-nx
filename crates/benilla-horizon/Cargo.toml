@@ -1,0 +1,12 @@
+[package]
+name = "benilla-horizon"
+description = "wow-nx: what the Switch (Horizon, libnx) gives Rust that its C library lacks"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# Only on the Switch target; elsewhere the crate is empty.
+[target.'cfg(target_os = "horizon")'.dependencies]
+# `custom`: getrandom 0.2 knows Horizon only on 32-bit ARM (the 3DS). Feature unification turns it on for rand's copy.
+getrandom = { version = "0.2", features = ["custom"] }

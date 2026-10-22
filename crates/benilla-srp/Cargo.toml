@@ -12,3 +12,7 @@ workspace = true
 num-bigint = "0.4.6"
 sha1.workspace = true
 rand = "0.8.6"
+
+# wow-nx: on the Switch, rand's random source (getrandom's custom backend) and std's C shims.
+[target.'cfg(target_os = "horizon")'.dependencies]
+benilla-horizon = { path = "../benilla-horizon" }

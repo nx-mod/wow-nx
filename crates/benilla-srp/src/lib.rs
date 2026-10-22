@@ -15,6 +15,10 @@
 //! `B` lands ambiguous, because a client that picks either serialization fails about 1 handshake
 //! in 45 against vmangos. The arithmetic stays the client's; only an ambiguous draw is declined.
 
+// wow-nx: linked on the Switch for the random source rand needs (benilla-horizon).
+#[cfg(target_os = "horizon")]
+extern crate benilla_horizon;
+
 use num_bigint::BigInt;
 use rand::{thread_rng, RngCore};
 use sha1::{Digest, Sha1};
