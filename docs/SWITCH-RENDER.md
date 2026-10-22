@@ -13,8 +13,9 @@ deko3d backend under its own validation layer (`nx-mod/dawn-nx`, branch `switch-
 ~6,000 lines of C++): the map from WebGPU concepts to deko3d is worked out there.
 
 The deko3d backend is a module of a vendored **wgpu-hal 27** (`third_party/wgpu-hal`), and on `target_os = "horizon"` it
-stands in for the `gles` module. wgpu-core, wgpu and Bevy are untouched: to them it is the GL backend, picked with
-`Backends::GL`. Only wgpu-hal is patched (`[patch.crates-io]`).
+stands in for the `gles` module. To wgpu-core, wgpu and Bevy it is the GL backend, picked with `Backends::GL`. wgpu and
+wgpu-core are vendored too, for one line each: upstream builds their GL backend only on Windows, Linux, Android and
+FreeBSD, so on Horizon they had none (`third_party/wgpu*/WOW-NX.md`). Bevy is untouched.
 
 ## Pieces
 

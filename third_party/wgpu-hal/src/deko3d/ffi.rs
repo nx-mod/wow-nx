@@ -628,6 +628,11 @@ pub type DkFreeFunc = ::core::option::Option<
 pub type DkCmdBufAddMemFunc = ::core::option::Option<
     unsafe extern "C" fn(userData: *mut ::core::ffi::c_void, cmdbuf: DkCmdBuf, minReqSize: usize),
 >;
+pub const DkDeviceFlags_DepthZeroToOne: _bindgen_ty_1 = 0;
+pub const DkDeviceFlags_DepthMinusOneToOne: _bindgen_ty_1 = 256;
+pub const DkDeviceFlags_OriginUpperLeft: _bindgen_ty_1 = 0;
+pub const DkDeviceFlags_OriginLowerLeft: _bindgen_ty_1 = 512;
+pub type _bindgen_ty_1 = ::core::ffi::c_uint;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct DkDeviceMaker {
@@ -641,6 +646,23 @@ unsafe extern "C" {
     #[link_name = "dkDeviceMakerDefaults__extern"]
     pub fn dkDeviceMakerDefaults(maker: *mut DkDeviceMaker);
 }
+pub const DkMemAccess_None: _bindgen_ty_2 = 0;
+pub const DkMemAccess_Uncached: _bindgen_ty_2 = 1;
+pub const DkMemAccess_Cached: _bindgen_ty_2 = 2;
+pub const DkMemAccess_Mask: _bindgen_ty_2 = 3;
+pub type _bindgen_ty_2 = ::core::ffi::c_uint;
+pub const DkMemBlockFlags_CpuAccessShift: _bindgen_ty_3 = 0;
+pub const DkMemBlockFlags_GpuAccessShift: _bindgen_ty_3 = 2;
+pub const DkMemBlockFlags_CpuUncached: _bindgen_ty_3 = 1;
+pub const DkMemBlockFlags_CpuCached: _bindgen_ty_3 = 2;
+pub const DkMemBlockFlags_CpuAccessMask: _bindgen_ty_3 = 3;
+pub const DkMemBlockFlags_GpuUncached: _bindgen_ty_3 = 4;
+pub const DkMemBlockFlags_GpuCached: _bindgen_ty_3 = 8;
+pub const DkMemBlockFlags_GpuAccessMask: _bindgen_ty_3 = 12;
+pub const DkMemBlockFlags_Code: _bindgen_ty_3 = 16;
+pub const DkMemBlockFlags_Image: _bindgen_ty_3 = 32;
+pub const DkMemBlockFlags_ZeroFillInit: _bindgen_ty_3 = 256;
+pub type _bindgen_ty_3 = ::core::ffi::c_uint;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct DkMemBlockMaker {
@@ -712,6 +734,15 @@ unsafe extern "C" {
     #[link_name = "dkCmdBufMakerDefaults__extern"]
     pub fn dkCmdBufMakerDefaults(maker: *mut DkCmdBufMaker, device: DkDevice);
 }
+pub const DkQueueFlags_Graphics: _bindgen_ty_4 = 1;
+pub const DkQueueFlags_Compute: _bindgen_ty_4 = 2;
+pub const DkQueueFlags_MediumPrio: _bindgen_ty_4 = 0;
+pub const DkQueueFlags_HighPrio: _bindgen_ty_4 = 4;
+pub const DkQueueFlags_LowPrio: _bindgen_ty_4 = 8;
+pub const DkQueueFlags_PrioMask: _bindgen_ty_4 = 12;
+pub const DkQueueFlags_EnableZcull: _bindgen_ty_4 = 0;
+pub const DkQueueFlags_DisableZcull: _bindgen_ty_4 = 16;
+pub type _bindgen_ty_4 = ::core::ffi::c_uint;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct DkQueueMaker {
@@ -752,6 +783,14 @@ pub enum DkStage {
     DkStage_Fragment = 4,
     DkStage_Compute = 5,
 }
+pub const DkStageFlag_Vertex: _bindgen_ty_5 = 1;
+pub const DkStageFlag_TessCtrl: _bindgen_ty_5 = 2;
+pub const DkStageFlag_TessEval: _bindgen_ty_5 = 4;
+pub const DkStageFlag_Geometry: _bindgen_ty_5 = 8;
+pub const DkStageFlag_Fragment: _bindgen_ty_5 = 16;
+pub const DkStageFlag_Compute: _bindgen_ty_5 = 32;
+pub const DkStageFlag_GraphicsMask: _bindgen_ty_5 = 31;
+pub type _bindgen_ty_5 = ::core::ffi::c_uint;
 #[repr(u32)]
 #[non_exhaustive]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
@@ -762,6 +801,12 @@ pub enum DkBarrier {
     DkBarrier_Primitives = 3,
     DkBarrier_Full = 4,
 }
+pub const DkInvalidateFlags_Image: _bindgen_ty_6 = 1;
+pub const DkInvalidateFlags_Shader: _bindgen_ty_6 = 2;
+pub const DkInvalidateFlags_Descriptors: _bindgen_ty_6 = 4;
+pub const DkInvalidateFlags_Zcull: _bindgen_ty_6 = 8;
+pub const DkInvalidateFlags_L2Cache: _bindgen_ty_6 = 16;
+pub type _bindgen_ty_6 = ::core::ffi::c_uint;
 #[repr(u32)]
 #[non_exhaustive]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
@@ -779,6 +824,17 @@ pub enum DkImageType {
     DkImageType_CubemapArray = 10,
     DkImageType_Buffer = 11,
 }
+pub const DkImageFlags_BlockLinear: _bindgen_ty_7 = 0;
+pub const DkImageFlags_PitchLinear: _bindgen_ty_7 = 1;
+pub const DkImageFlags_CustomTileSize: _bindgen_ty_7 = 2;
+pub const DkImageFlags_HwCompression: _bindgen_ty_7 = 4;
+pub const DkImageFlags_Z16EnableZbc: _bindgen_ty_7 = 8;
+pub const DkImageFlags_UsageRender: _bindgen_ty_7 = 256;
+pub const DkImageFlags_UsageLoadStore: _bindgen_ty_7 = 512;
+pub const DkImageFlags_UsagePresent: _bindgen_ty_7 = 1024;
+pub const DkImageFlags_Usage2DEngine: _bindgen_ty_7 = 2048;
+pub const DkImageFlags_UsageVideo: _bindgen_ty_7 = 4096;
+pub type _bindgen_ty_7 = ::core::ffi::c_uint;
 #[repr(u32)]
 #[non_exhaustive]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
@@ -1134,6 +1190,11 @@ pub enum DkPolygonMode {
     DkPolygonMode_Line = 1,
     DkPolygonMode_Fill = 2,
 }
+pub const DkPolygonFlag_Point: _bindgen_ty_8 = 1;
+pub const DkPolygonFlag_Line: _bindgen_ty_8 = 2;
+pub const DkPolygonFlag_Fill: _bindgen_ty_8 = 4;
+pub const DkPolygonFlag_All: _bindgen_ty_8 = 7;
+pub type _bindgen_ty_8 = ::core::ffi::c_uint;
 #[repr(u32)]
 #[non_exhaustive]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
@@ -2060,6 +2121,13 @@ unsafe extern "C" {
     #[link_name = "dkColorStateSetBlendEnable__extern"]
     pub fn dkColorStateSetBlendEnable(state: *mut DkColorState, id: u32, enable: bool);
 }
+pub const DkColorMask_R: _bindgen_ty_9 = 1;
+pub const DkColorMask_G: _bindgen_ty_9 = 2;
+pub const DkColorMask_B: _bindgen_ty_9 = 4;
+pub const DkColorMask_A: _bindgen_ty_9 = 8;
+pub const DkColorMask_RGB: _bindgen_ty_9 = 7;
+pub const DkColorMask_RGBA: _bindgen_ty_9 = 15;
+pub type _bindgen_ty_9 = ::core::ffi::c_uint;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct DkColorWriteState {
@@ -3255,6 +3323,20 @@ pub struct DkDispatchIndirectData {
     pub numGroupsY: u32,
     pub numGroupsZ: u32,
 }
+pub const DkBlitFlag_Flip_Mask: _bindgen_ty_10 = 7;
+pub const DkBlitFlag_FlipX: _bindgen_ty_10 = 1;
+pub const DkBlitFlag_FlipY: _bindgen_ty_10 = 2;
+pub const DkBlitFlag_FlipZ: _bindgen_ty_10 = 4;
+pub const DkBlitFlag_Filter_Mask: _bindgen_ty_10 = 16;
+pub const DkBlitFlag_FilterNearest: _bindgen_ty_10 = 0;
+pub const DkBlitFlag_FilterLinear: _bindgen_ty_10 = 16;
+pub const DkBlitFlag_Mode_Mask: _bindgen_ty_10 = 224;
+pub const DkBlitFlag_ModeBlit: _bindgen_ty_10 = 0;
+pub const DkBlitFlag_ModeAlphaMask: _bindgen_ty_10 = 32;
+pub const DkBlitFlag_ModeAlphaBlend: _bindgen_ty_10 = 64;
+pub const DkBlitFlag_ModePremultBlit: _bindgen_ty_10 = 96;
+pub const DkBlitFlag_ModePremultBlend: _bindgen_ty_10 = 128;
+pub type _bindgen_ty_10 = ::core::ffi::c_uint;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct DkImageRect {

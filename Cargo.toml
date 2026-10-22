@@ -47,6 +47,9 @@ alsa = { path = "third_party/alsa-0.9" }
 libc = { path = "third_party/libc" }
 # wow-nx: wgpu-hal 27 with a deko3d backend standing in for GLES on Horizon (docs/SWITCH-RENDER.md); unchanged elsewhere.
 wgpu-hal = { path = "third_party/wgpu-hal" }
+# wow-nx: wgpu and wgpu-core as upstream, except that their GL backend is built on Horizon too.
+wgpu = { path = "third_party/wgpu" }
+wgpu-core = { path = "third_party/wgpu-core" }
 
 # Dependencies at opt-level 3 in dev: at opt-level 0, avian/parry collision drops a run to <1 fps.
 [profile.dev.package."*"]

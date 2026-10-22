@@ -95,7 +95,9 @@ name = "clear"
 version = "0.1.0"
 dependencies = [
  "benilla-horizon",
+ "log",
  "pollster",
+ "raw-window-handle",
  "wgpu",
 ]
 
@@ -692,8 +694,6 @@ dependencies = [
 [[package]]
 name = "wgpu"
 version = "27.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bfe68bac7cde125de7a731c3400723cadaaf1703795ad3f4805f187459cd7a77"
 dependencies = [
  "arrayvec",
  "bitflags",
@@ -715,8 +715,6 @@ dependencies = [
 [[package]]
 name = "wgpu-core"
 version = "27.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "27a75de515543b1897b26119f93731b385a19aea165a1ec5f0e3acecc229cae7"
 dependencies = [
  "arrayvec",
  "bit-set",
