@@ -1,3 +1,6 @@
+> **wow-nx** is nx-mod's Nintendo Switch port of benilla. The port has not started: this `switch` branch is upstream's
+> code plus the plan in [docs/SWITCH.md](docs/SWITCH.md); `main` mirrors upstream.
+
 <div align="center">
   <h1>benilla</h1>
   <p><b>A complete World of Warcraft 1.12.1 client, written from scratch in Rust and <a href="https://bevy.org">Bevy</a></b></p>
