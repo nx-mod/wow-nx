@@ -254,6 +254,9 @@ features = [
 version = "0.29"
 features = ["android-native-activity"]
 
+[build-dependencies.cc]
+version = "1"
+
 [build-dependencies.cfg_aliases]
 version = "0.2.1"
 

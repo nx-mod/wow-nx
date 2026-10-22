@@ -1,4 +1,18 @@
 fn main() {
+    // wow-nx: on Horizon the GLES slot is the deko3d backend (src/deko3d): deko3d.h's inline functions as real ones
+    // (bindgen's wrappers in ffi_inline.c), compiled by devkitA64's gcc, and libdeko3d from libnx.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("horizon") && std::env::var_os("CARGO_FEATURE_GLES").is_some()
+    {
+        let devkitpro = std::env::var("DEVKITPRO").unwrap_or_else(|_| "/opt/devkitpro".into());
+        cc::Build::new()
+            .file("src/deko3d/ffi_inline.c")
+            .include(format!("{devkitpro}/libnx/include"))
+            .define("__SWITCH__", None)
+            .compile("deko3d_inline");
+        println!("cargo:rustc-link-search=native={devkitpro}/libnx/lib");
+        println!("cargo:rustc-link-lib=static=deko3d");
+        println!("cargo:rerun-if-changed=src/deko3d/ffi_inline.c");
+    }
     cfg_aliases::cfg_aliases! {
         native: { not(target_arch = "wasm32") },
         send_sync: { any(

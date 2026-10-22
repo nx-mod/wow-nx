@@ -10,6 +10,15 @@ use portable_atomic::AtomicU64;
 
 use crate::TlasInstance;
 
+#[allow(
+    dead_code,
+    non_camel_case_types,
+    non_snake_case,
+    non_upper_case_globals,
+    unsafe_op_in_unsafe_fn,
+    clippy::all
+)]
+mod ffi;
 mod buffer;
 pub use buffer::Buffer;
 mod command;
