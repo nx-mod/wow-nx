@@ -1,8 +1,8 @@
 # wow-nx: the Switch port
 
-Status: **step 1 builds** (`switch/hello`: Rust std for the Switch links into an NRO; not run on the console yet).
-**Step 2 builds:** the 14 crates that do not draw (MPQ, DBC, BLP, ADT, M2, WMO, WDT, Lua, protocol, SRP...) with
-`switch/build-crates.sh`; the hello NRO also opens the game's MPQs if they are in `sdmc:/wow-nx/Data`.
+Status (2026-10-22): **step 1 runs on the console** (`switch/hello`: allocation, threads, HashMap, files, clock).
+**Step 2 builds:** the 14 crates that do not draw, with `switch/build-crates.sh`. **Rendering:** wgpu clears the screen
+through the deko3d backend on the console (`switch/clear`); shaders and draws are next.
 `main` mirrors upstream untouched.
 
 ## What stands in the way
