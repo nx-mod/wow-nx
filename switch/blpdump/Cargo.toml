@@ -1,0 +1,14 @@
+[package]
+name = "blpdump"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Writes BLP textures from a WoW client's MPQs as PNG files, with benilla's own MPQ and BLP readers (art for the
+# Switch forwarder icon). `cargo run --release -- <Data folder> <out folder> <file in the MPQs>...`
+[dependencies]
+benilla-mpq = { path = "../../crates/benilla-mpq" }
+benilla-blp = { path = "../../crates/benilla-blp" }
+png = "0.17"
+
+[workspace]
