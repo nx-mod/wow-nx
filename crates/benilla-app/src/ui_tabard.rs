@@ -9,11 +9,12 @@ use bevy::prelude::*;
 
 use benilla_formats::GuildEmblem;
 use benilla_protocol::messages::GUILD_EMBLEM_RESULT_MESSAGES;
-use benilla_ui::script::{TabardHost, TabardIntent, UiScript, TABARD_COUNTS, TABARD_CREATION_COST};
+use benilla_ui::script::{TabardCall, TabardHost, UiScript, TABARD_COUNTS, TABARD_CREATION_COST};
+use bevy::ecs::system::SystemParam;
 
 use crate::net::{ClientCommand, EnteredWorldMessage, NetCommands, ObjectStore, SelfPlayer};
 use crate::ui_guild::GuildState;
-use crate::ui_script::{SweepApp, SweepLeg, UiFeed, UiInput};
+use crate::ui_script::{SweepApp, SweepLeg, UiFeed};
 use crate::ui_session::{LatchApp, LatchedWindow, NpcWindow};
 
 /// The open designer: its vendor (`[0xbdcee8]`), the save-in-flight latch (`[0xc4d780]`), and
@@ -161,114 +162,123 @@ pub(crate) fn preflight(
 }
 
 fn feed_tabard(
-    script: Option<NonSendMut<UiScript>>,
-    mut open: ResMut<TabardOpen>,
+    mut vm: crate::script_calls::VmWith<ResMut<'static, TabardOpen>>,
     mut design: ResMut<TabardDesign>,
     guilds: Res<GuildState>,
     self_q: Query<&ObjectStore, With<SelfPlayer>>,
     mut last_host: Local<crate::ui_script::VmMemo<Option<TabardHost>>>,
-    mut last_identity: Local<crate::ui_script::VmMemo<Option<u64>>>,
     mut sink: crate::ui_action::MessageSink,
 ) {
-    let Some(mut script) = script else {
-        return;
-    };
-    // Our guild's cached record and the latch, pushed on change.
-    let guild_id = self_q.iter().next().map_or(0, |s| s.0.player_guild_id());
-    let host = TabardHost {
-        guild_record: guilds.own_emblem_record(guild_id),
-        save_pending: open.save_pending,
-    };
-    let last = last_host.get(&script);
-    if *last != Some(host) {
-        *last = Some(host);
-        script.set_tabard_host(host);
-    }
+    let mut lines = Vec::new();
+    vm.feed(|script, mut open, fires| {
+        let Some(script) = script else {
+            return;
+        };
+        // Our guild's cached record and the latch, pushed on change.
+        let guild_id = self_q.iter().next().map_or(0, |s| s.0.player_guild_id());
+        let host = TabardHost {
+            guild_record: guilds.own_emblem_record(guild_id),
+            save_pending: open.save_pending,
+        };
+        let last = last_host.get(script);
+        if *last != Some(host) {
+            *last = Some(host);
+            script.set_tabard_host(host);
+        }
 
-    // The events, in the reference's order.
-    if std::mem::take(&mut open.open_event) {
-        script.fire_event("OPEN_TABARD_FRAME", vec![]);
-    }
-    for _ in 0..std::mem::take(&mut open.pending_events) {
-        script.fire_event("TABARD_SAVE_PENDING", vec![]);
-    }
-    // `TABARD_CANSAVE_CHANGED` on a re-fetched guild record, which refreshes each held member's
-    // tag (`0x5e2890` → `0x5e29c0` → `0x5e08e0`); here, when our identity cache moves. A guild id
-    // change and a player's first create are the field watches' (`crate::field_watch::guild_tag`).
-    let gen = guilds.identity_generation();
-    let last_gen = last_identity.get(&script);
-    if last_gen.is_some() && *last_gen != Some(gen) {
-        script.fire_event("TABARD_CANSAVE_CHANGED", vec![]);
-    }
-    *last_gen = Some(gen);
+        // The events, in the reference's order.
+        if std::mem::take(&mut open.open_event) {
+            fires.post("OPEN_TABARD_FRAME", vec![]);
+        }
+        for _ in 0..std::mem::take(&mut open.pending_events) {
+            fires.post("TABARD_SAVE_PENDING", vec![]);
+        }
+        // `TABARD_CANSAVE_CHANGED` is `RefreshGuildTag`'s (`0x5e0902`), raised by its callers
+        // ([`crate::field_watch::guild_tag`]); a guild record landing or dropped raises nothing.
 
-    let lines: Vec<_> = open
-        .lines
-        .drain(..)
-        .filter_map(|key| crate::ui_action::keyed_line(&script, key))
-        .collect();
-    crate::ui_action::show_messages(&mut script, &mut sink, "ui_tabard", lines);
+        lines = open
+            .lines
+            .drain(..)
+            .filter_map(|key| crate::ui_action::keyed_line(script, key))
+            .collect();
 
-    // The body wears the pane's design while the designer is open; `TabardModel:SetUnit("player")`
-    // mirrors that body.
-    let shown = open.vendor.is_some() && script.frame_visible("TabardFrame");
-    let current = shown.then(|| script.tabard_design()).flatten();
-    if design.0 != current {
-        design.0 = current;
+        // The body wears the pane's design while the designer is open;
+        // `TabardModel:SetUnit("player")` mirrors that body.
+        let shown = open.vendor.is_some() && script.frame_visible("TabardFrame");
+        let current = shown.then(|| script.tabard_design()).flatten();
+        if design.0 != current {
+            design.0 = current;
+        }
+    });
+    if !lines.is_empty() {
+        vm.run(|script| {
+            if let Some(script) = script {
+                crate::ui_action::show_messages(script, &mut sink, "ui_tabard", lines);
+            }
+        });
     }
 }
 
-fn drain_tabard(
-    script: Option<NonSendMut<UiScript>>,
-    mut open: ResMut<TabardOpen>,
-    mut world_commands: Commands,
-    guilds: Res<GuildState>,
-    self_q: Query<&ObjectStore, With<SelfPlayer>>,
-    commands: Res<NetCommands>,
-    mut sink: crate::ui_action::MessageSink,
-) {
-    let Some(mut script) = script else {
-        return;
-    };
-    for intent in script.take_tabard_intents() {
-        match intent {
-            TabardIntent::Close => crate::ui_session::queue(&mut world_commands, close_core),
-            TabardIntent::Save(design) => {
-                // The reference sends the global interaction target (`0x502a60` reads
-                // `[0xb4e2d0]`), which the open set to this vendor: the same guid.
-                let Some(vendor) = open.vendor else {
-                    continue;
-                };
-                let store = self_q.iter().next();
-                let guild_id = store.map_or(0, |s| s.0.player_guild_id());
-                let record = guilds.own_emblem_record(guild_id);
-                let rank = store.map_or(0, |s| s.0.player_guild_rank());
-                let purse = store.and_then(|s| s.0.player_money()).unwrap_or(0);
-                match preflight(design, record, rank, purse) {
-                    Err(key) => {
-                        if let Some(line) = crate::ui_action::keyed_line(&script, key) {
-                            crate::ui_action::show_messages(
-                                &mut script,
-                                &mut sink,
-                                "ui_tabard",
-                                [line],
-                            );
-                        }
-                    }
-                    Ok(design) => {
-                        let _ = commands
-                            .0
-                            .send(ClientCommand::SaveGuildEmblem { vendor, design });
-                        // The latch, then the event (`0x5e05f5`, `0x5e05fc`): a handler
-                        // calling `CanSaveTabardNow()` already sees nil.
-                        open.save_pending = true;
-                        script.set_tabard_host(TabardHost {
-                            guild_record: record,
-                            save_pending: true,
-                        });
-                        script.fire_event("TABARD_SAVE_PENDING", vec![]);
-                    }
+/// `CloseTabardCreation` into its close core, which needs the interaction latch; `Save` applies
+/// inside its call ([`TabardSteps`]).
+fn drain_tabard(mut hosted_vm: crate::script_calls::HostedVm, mut world_commands: Commands) {
+    hosted_vm.run(|script| {
+        if script.is_some_and(|script| script.take_tabard_close()) {
+            crate::ui_session::queue(&mut world_commands, close_core);
+        }
+    })
+}
+
+/// The designer's latch and what its save reads and sends through: the engine half of the tabard
+/// calls ([`crate::script_calls::ScriptCallHost`]).
+#[derive(SystemParam)]
+pub(crate) struct TabardSteps<'w, 's> {
+    /// Absent in a world with no designer, which drops the calls.
+    open: Option<ResMut<'w, TabardOpen>>,
+    guilds: Option<Res<'w, GuildState>>,
+    self_q: Query<'w, 's, &'static ObjectStore, With<SelfPlayer>>,
+    net: Res<'w, NetCommands>,
+    sink: crate::ui_action::MessageSink<'w>,
+}
+
+impl TabardSteps<'_, '_> {
+    /// `Save()` (`0x502bd0` → `0x5e03f0`) inside its call: the checks, whose refusal shows its
+    /// line there, else the send, the latch and `TABARD_SAVE_PENDING` (`0x5e05eb`-`0x5e05fc`).
+    pub(crate) fn apply(&mut self, script: &mut UiScript, call: TabardCall) {
+        let TabardCall::Save(design) = call;
+        let (Some(open), Some(guilds)) = (self.open.as_deref_mut(), self.guilds.as_deref()) else {
+            debug!("ui_tabard: no designer in this world; {call:?} dropped");
+            return;
+        };
+        // The reference sends the global interaction target (`0x502a60` reads `[0xb4e2d0]`),
+        // which the open set to this vendor: the same guid.
+        let Some(vendor) = open.vendor else {
+            return;
+        };
+        let store = self.self_q.iter().next();
+        let guild_id = store.map_or(0, |s| s.0.player_guild_id());
+        let record = guilds.own_emblem_record(guild_id);
+        let rank = store.map_or(0, |s| s.0.player_guild_rank());
+        let purse = store.and_then(|s| s.0.player_money()).unwrap_or(0);
+        match preflight(design, record, rank, purse) {
+            Err(key) => {
+                if let Some(line) = crate::ui_action::keyed_line(script, key) {
+                    crate::ui_action::show_now(script, &mut self.sink, "ui_tabard", line);
                 }
+            }
+            Ok(design) => {
+                let _ = self
+                    .net
+                    .0
+                    .send(ClientCommand::SaveGuildEmblem { vendor, design });
+                // The latch, then the event (`0x5e05f5`, `0x5e05fc`): a handler calling
+                // `CanSaveTabardNow()` already sees nil.
+                open.save_pending = true;
+                script.set_tabard_host(TabardHost {
+                    guild_record: record,
+                    save_pending: true,
+                });
+                script.fire_event("TABARD_SAVE_PENDING", vec![]);
             }
         }
     }
@@ -336,9 +346,12 @@ impl Plugin for TabardUiPlugin {
             .add_systems(
                 Update,
                 (
-                    reset_on_world_enter.before(feed_tabard),
-                    feed_tabard.in_set(UiFeed),
-                    drain_tabard.after(UiInput),
+                    // Moves what the save's call reads, so ahead of every host.
+                    reset_on_world_enter.before(crate::vm_pass::VmPass::Start),
+                    feed_tabard
+                        .in_set(UiFeed)
+                        .in_set(crate::ui_session::NpcWindowFeed),
+                    drain_tabard.in_set(crate::ui_script::UiDrain),
                 ),
             );
     }
@@ -413,6 +426,36 @@ mod tests {
         assert!(t.save_pending);
     }
 
+    /// `TABARD_CANSAVE_CHANGED` is `RefreshGuildTag`'s alone (`0x5e0902`), from its three callers:
+    /// a guild record landing, ours or another's, and the emblem save's drop of ours (`0x5e715f`)
+    /// signal nothing.
+    #[test]
+    fn a_landed_or_dropped_guild_record_signals_no_tabard_change() {
+        use crate::ui_script::sweep_test::{seen_in, spied_vm};
+        let mut app = App::new();
+        app.init_resource::<TabardOpen>()
+            .init_resource::<TabardDesign>()
+            .init_resource::<GuildState>()
+            .init_resource::<crate::ui_chat::ChatLog>()
+            .init_resource::<crate::sound::MessageSounds>()
+            .add_systems(Update, feed_tabard)
+            .insert_non_send_resource(spied_vm(&["TABARD_CANSAVE_CHANGED"]));
+        app.update();
+        let mut guild = app.world_mut().resource_mut::<GuildState>();
+        guild.join_for_test(5);
+        guild.land_for_test(5, "Probe Guild");
+        app.update();
+        app.world_mut()
+            .resource_mut::<GuildState>()
+            .land_for_test(6, "Strangers");
+        app.update();
+        app.world_mut()
+            .resource_mut::<GuildState>()
+            .evict_own_identity();
+        app.update();
+        assert!(seen_in(&app).is_empty(), "{:?}", seen_in(&app));
+    }
+
     /// The core fires only with a vendor stored, twice while the designer holds the latch, and
     /// tells an open not yet fed first.
     #[test]
@@ -439,6 +482,104 @@ mod tests {
         assert_eq!(app.world().resource::<TabardOpen>().npc(), None);
         close_core(app.world_mut());
         assert_eq!(seen_in(&app).len(), 3, "a second close is silent");
+    }
+
+    /// `Save` (`0x502bd0` → `0x5e03f0`) runs the checks, sends `MSG_SAVE_GUILD_EMBLEM`, sets the
+    /// latch and signals `TABARD_SAVE_PENDING` before it returns (`0x5e05eb`-`0x5e05fc`), and a
+    /// refusal shows its line there; the drain after it sends nothing more.
+    #[test]
+    fn a_save_checks_sends_and_signals_inside_its_call() {
+        use crate::net::{ClientCommand, NetCommands, ObjectStore};
+        use crate::script_calls::with_hosted_vm;
+        use benilla_ui::script::{TabardHost, UnitState};
+        const VENDOR: u64 = 0xF130_0000_0000_0042;
+        let mut app = crate::game_plugins::schedule_tests::headless_client();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        app.insert_resource(NetCommands(tx));
+        let world = app.world_mut();
+        world.spawn((
+            crate::net::SelfPlayer,
+            ObjectStore(benilla_protocol::ObjectFields::from_pairs(&[
+                (191, 5),
+                (192, 0),
+                (1176, 200_000),
+            ])),
+        ));
+        {
+            let mut guild = world.resource_mut::<GuildState>();
+            guild.join_for_test(5);
+            guild.land_for_test(5, "Probe Guild");
+        }
+        world.resource_mut::<TabardOpen>().open(VENDOR);
+        let mut script = UiScript::new().expect("a VM");
+        script.set_unit(
+            "player",
+            Some(UnitState {
+                exists: true,
+                ..Default::default()
+            }),
+        );
+        script.set_tabard_host(TabardHost {
+            guild_record: Some([1, 2, 3, 4, 5]),
+            save_pending: false,
+        });
+        script
+            .run(
+                r#"HEARD = ""
+                ERR_NOT_ENOUGH_MONEY = "Not enough money."
+                local f = CreateFrame("Frame")
+                f:RegisterEvent("TABARD_SAVE_PENDING")
+                f:RegisterEvent("UI_ERROR_MESSAGE")
+                f:SetScript("OnEvent", function()
+                    HEARD = HEARD .. event .. "(" .. tostring(arg1) .. ") "
+                end)
+                TM = CreateFrame("TabardModel", "TM")
+                TM:InitializeTabardColors()
+                TM:CycleVariation(1, 1)"#,
+            )
+            .expect("the designer seeds");
+        world.insert_non_send_resource(script);
+        let drain = world.register_system(drain_tabard);
+        let run = |app: &mut App, lua: &str| {
+            with_hosted_vm(app.world_mut(), |vm| vm.expect("a VM").run(lua))
+                .expect("the chunk runs");
+        };
+        let eval = |app: &mut App, lua: &str| -> String {
+            with_hosted_vm(app.world_mut(), |vm| vm.expect("a VM").eval::<String>(lua))
+                .expect("the chunk runs")
+        };
+        let sent = |rx: &crossbeam_channel::Receiver<ClientCommand>| -> Vec<String> {
+            rx.try_iter()
+                .map(|c| format!("{c:?}"))
+                .filter(|c| !c.starts_with("GuildQuery"))
+                .collect()
+        };
+        run(&mut app, "TM:Save() SEEN = HEARD HEARD = ''");
+        assert_eq!(eval(&mut app, "return SEEN"), "TABARD_SAVE_PENDING(nil) ");
+        assert_eq!(
+            sent(&rx),
+            [format!(
+                "SaveGuildEmblem {{ vendor: {VENDOR}, design: [2, 2, 3, 4, 5] }}"
+            )]
+        );
+        assert!(app.world().resource::<TabardOpen>().save_pending);
+        app.world_mut().run_system(drain).expect("the drain runs");
+        assert!(sent(&rx).is_empty(), "sent once");
+
+        // The purse below the price: the client's own `ERR_NOT_ENOUGH_MONEY`, in the call.
+        app.world_mut().resource_mut::<TabardOpen>().save_pending = false;
+        let mut me = app
+            .world_mut()
+            .query_filtered::<&mut ObjectStore, With<crate::net::SelfPlayer>>();
+        me.single_mut(app.world_mut()).expect("our store").0.merge(
+            benilla_protocol::ObjectFields::from_pairs(&[(1176, 99_999)]),
+        );
+        run(&mut app, "TM:Save() SEEN = HEARD HEARD = ''");
+        assert_eq!(
+            eval(&mut app, "return SEEN"),
+            "UI_ERROR_MESSAGE(Not enough money.) "
+        );
+        assert!(sent(&rx).is_empty());
     }
 
     /// An activate from the vendor whose designer is open writes the cell before it registers,

@@ -63,8 +63,10 @@ mod go_anim;
 mod go_templates;
 #[cfg(feature = "dev")]
 mod hover_log;
+mod item_lane;
 mod item_watch;
 mod items;
+mod lanes;
 mod loading_screen;
 mod local_state;
 mod minimap;
@@ -77,6 +79,7 @@ mod npc_text;
 mod perf;
 mod pipe_warm;
 mod player;
+mod player_commands;
 mod poi_marker;
 mod portrait;
 #[cfg(feature = "dev")]
@@ -159,7 +162,6 @@ mod ui_party;
 mod ui_pass;
 mod ui_pet;
 mod ui_pet_book;
-mod ui_pet_doll;
 mod ui_pet_stats;
 mod ui_petition;
 mod ui_quest;
@@ -186,9 +188,11 @@ mod ui_trainer;
 mod ui_unit;
 mod ui_world_map;
 mod video;
+mod vm_pass;
 mod vplates;
 mod weapon_trail;
 mod world_backdrop;
+mod world_console;
 mod world_state;
 mod world_state_ui;
 

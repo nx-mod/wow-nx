@@ -5,6 +5,7 @@
 
 use super::super::pets::tests::{app, app_with, flag, frame, member, ME};
 use super::*;
+use benilla_ui::script::UiScript;
 
 const ON: u8 = member_status::ONLINE;
 const DEAD: u8 = member_status::ONLINE | member_status::DEAD;
@@ -61,9 +62,16 @@ fn send_rows(app: &mut App, group_type: u8, rows: &[(u8, u8)], missing: &[u64]) 
         master: 0,
         threshold: 2,
     });
-    group.apply_list_awaiting(group_type, 0, list, ME, loot, Some(ME), &|guid| {
-        (!missing.contains(&guid)).then(String::new)
-    });
+    group.apply_list_awaiting(
+        group_type,
+        0,
+        list,
+        ME,
+        loot,
+        Some(ME),
+        &|guid| (!missing.contains(&guid)).then(String::new),
+        &|_| Some(String::new()),
+    );
     // The handler's record leg (`net::seat_new_records`): a member new to the roster is seated at
     // 1/1 with the row's online bit.
     for (guid, online) in seats {
@@ -200,9 +208,11 @@ fn answer(app: &mut App, i: u64) {
         format!("M{i}"),
         Some((1, 1, 0)),
     );
-    app.world_mut()
+    let name = format!("M{i}");
+    let _ = app
+        .world_mut()
         .resource_mut::<GroupState>()
-        .apply_player_name(member(i));
+        .apply_player_name(member(i), Some(&name));
 }
 
 /// A frame that counts `PARTY_MEMBERS_CHANGED` and `RAID_ROSTER_UPDATE` in the order the VM is
@@ -675,7 +685,7 @@ fn the_sandbox_answers_a_raid_intent_with_a_raid_roster_update() {
 
     let intent = |app: &mut App, req: PartyRequest| {
         let mut group = app.world_mut().resource_mut::<GroupState>();
-        assert!(test_apply_local(&mut group, &req, Some(ME), None));
+        assert!(test_apply_local(&mut group, &req, Some(ME)));
     };
     intent(&mut app, PartyRequest::LootThreshold(4));
     assert_eq!(fired(&mut app), 0, "a party intent");
@@ -684,7 +694,7 @@ fn the_sandbox_answers_a_raid_intent_with_a_raid_roster_update() {
     assert_eq!(rows(&mut app), 5.0, "its four, then us");
     intent(&mut app, PartyRequest::LootThreshold(4));
     assert_eq!(fired(&mut app), 1, "a raid intent that moves no member");
-    intent(&mut app, PartyRequest::PromoteUnit("party2".into()));
+    intent(&mut app, PartyRequest::PromoteGuid(0xF002));
     assert_eq!(
         fired(&mut app),
         1,
@@ -695,13 +705,7 @@ fn the_sandbox_answers_a_raid_intent_with_a_raid_roster_update() {
         (0.0, 2.0),
         "row 2 leads"
     );
-    intent(
-        &mut app,
-        PartyRequest::SetRaidTarget {
-            unit: "player".into(),
-            index: 1,
-        },
-    );
+    super::echo_raid_target(&mut app.world_mut().resource_mut::<GroupState>(), 0, ME);
     assert_eq!(fired(&mut app), 0, "a mark is no list");
     intent(&mut app, PartyRequest::Leave);
     assert_eq!(fired(&mut app), 1, "the raid ended");

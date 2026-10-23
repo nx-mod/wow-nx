@@ -64,7 +64,7 @@ impl Plugin for UiHonorPlugin {
         net::register(app);
         app.init_resource::<InspectHonor>()
             .init_resource::<HonorFeedState>()
-            .init_resource::<crate::nameplates::PvpNameStrings>()
+            .init_resource::<crate::nameplates::NameLineStrings>()
             // Ahead of the unit feed: the reference writes the block with the create whose hook
             // runs the world-enter cascade, so `PLAYER_ENTERING_WORLD`'s repaint reads it, and
             // the field events' handlers read it too.
@@ -79,33 +79,45 @@ impl Plugin for UiHonorPlugin {
             // lines the frame it arrives.
             .add_systems(
                 Update,
-                feed_pvp_name_strings
+                feed_name_line_strings
                     .after(crate::ui_script::UiInput)
                     .before(crate::nameplates::drive_nameplates),
             );
     }
 }
 
-/// The overhead name's rank strings ([`crate::nameplates::PvpNameStrings`]), read off a VM the
-/// first frame it is in the world. Every VM is installed whole, outside `Update` (the glue VM after
-/// its GlueXML, a world VM after its FrameXML and addon load), so the read sees what the load
-/// defined; any other frame pays one compare.
-fn feed_pvp_name_strings(
-    script: Option<NonSend<UiScript>>,
-    mut strings: ResMut<crate::nameplates::PvpNameStrings>,
+/// The overhead name's strings ([`crate::nameplates::NameLineStrings`]), read with the host lent
+/// the first frame a VM is in the world and after a player line rebuilds: the reference's builder
+/// reads each through `lua_gettable` (`0x70436e`, so `_G`'s `__index` runs) only when a name
+/// rebuilds (`0x5ec9e0`, `0x609370`), so a steady frame runs no Lua.
+fn feed_name_line_strings(
+    mut vm: crate::script_calls::HostedVm,
+    mut strings: ResMut<crate::nameplates::NameLineStrings>,
 ) {
-    let Some(script) = script else {
-        return;
-    };
-    if strings.session() != Some(script.session()) {
-        strings.set(script.session(), pvp_name_strings(&script));
-    }
+    vm.run(|script| {
+        let Some(script) = script else {
+            return;
+        };
+        // Both read, so a new VM's read also spends a pending ask.
+        if (strings.session() != Some(script.session())) | strings.take_reread() {
+            strings.set(script.session(), name_line_strings(script));
+        }
+    });
 }
 
-/// The [`benilla_ui::script::pvp_name_global_keys`] that `script` defines, with their values.
-fn pvp_name_strings(script: &UiScript) -> HashMap<String, String> {
-    benilla_ui::script::pvp_name_global_keys()
-        .into_iter()
+/// The name line's global keys: the flag tags ([`crate::nameplates::FLAG_PREFIXES`]) and the
+/// [`benilla_ui::script::pvp_name_global_keys`].
+fn name_line_keys() -> impl Iterator<Item = String> {
+    crate::nameplates::FLAG_PREFIXES
+        .iter()
+        .map(|(_, key)| key.to_string())
+        .chain(benilla_ui::script::pvp_name_global_keys())
+}
+
+/// The name line's globals that `script` defines, with their values: the flag tags
+/// ([`crate::nameplates::FLAG_PREFIXES`]) and the [`benilla_ui::script::pvp_name_global_keys`].
+fn name_line_strings(script: &UiScript) -> HashMap<String, String> {
+    name_line_keys()
         .filter_map(|key| benilla_ui::strings::global(script.lua(), &key).map(|value| (key, value)))
         .collect()
 }
@@ -146,90 +158,93 @@ fn honor_snapshot(store: &ObjectStore) -> Option<HonorState> {
 
 /// Push the self snapshot and the inspect reply, and drain the pane's request.
 pub(crate) fn feed_honor(
-    script: Option<NonSendMut<UiScript>>,
+    // The selection, read before the VM runs with the host lent, which a call may move.
+    mut hosted: ParamSet<(Res<crate::target::Selection>, crate::script_calls::HostedVm)>,
     self_store: Query<&ObjectStore, With<SelfPlayer>>,
     inspect_target: Res<crate::ui_inspect::InspectTarget>,
-    selection: Res<crate::target::Selection>,
     group: Res<crate::ui_party::GroupState>,
     mut inspect_honor: ResMut<InspectHonor>,
     mut state: ResMut<HonorFeedState>,
     commands: Res<NetCommands>,
 ) {
-    let Some(mut script) = script else {
-        return;
-    };
-    let memo = state.vm.get(&script);
+    let selection = *hosted.p0();
+    hosted.p1().run(|script| {
+        let Some(script) = script else {
+            return;
+        };
+        let memo = state.vm.get(script);
 
-    // --- the self snapshot -------------------------------------------------------------------
-    if let Ok(store) = self_store.single() {
-        if let Some(fresh) = honor_snapshot(store) {
-            if memo.last.as_ref() != Some(&fresh) {
-                script.set_honor(Some(fresh));
-                memo.last = Some(fresh);
+        // --- the self snapshot -------------------------------------------------------------------
+        if let Ok(store) = self_store.single() {
+            if let Some(fresh) = honor_snapshot(store) {
+                if memo.last.as_ref() != Some(&fresh) {
+                    script.set_honor(Some(fresh));
+                    memo.last = Some(fresh);
+                }
             }
         }
-    }
 
-    // --- the inspect reply -------------------------------------------------------------------
-    // The reference's latch clears only at `0x4c6f70`, from a `NotifyInspect` naming another
-    // player, and on `ClearInspectPlayer`. Deviation: we clear it whenever the inspected token's
-    // guid moves, because our window re-resolves its token each frame and both tabs read it, so
-    // the reference's rule would let the two tabs show different players. `ClearInspectPlayer`
-    // drops the token, which clears the slot here too.
-    let inspected = inspect_target
-        .token
-        .as_deref()
-        .and_then(|t| crate::ui_unit::player_token_guid(t, &selection, &group));
-    if inspect_honor
-        .0
-        .as_ref()
-        .is_some_and(|reply| Some(reply.player_guid) != inspected)
-    {
-        // Dropped from the resource, so `HasInspectHonorData` and this store agree.
-        inspect_honor.0 = None;
-    }
-    let held = inspect_honor.0.as_ref().map(|r| r.player_guid);
-    if memo.last_inspect != held {
-        script.set_inspect_honor(inspect_honor.0.as_ref().map(|r| {
-            let (session_hk, session_dk) = r.session_kills();
-            InspectHonorData {
-                guid: r.player_guid,
-                session_hk,
-                session_dk,
-                yesterday_hk: r.yesterday_hk,
-                yesterday_honor: r.yesterday_honor,
-                this_week_hk: r.this_week_hk,
-                this_week_honor: r.this_week_honor,
-                last_week_hk: r.last_week_hk,
-                last_week_honor: r.last_week_honor,
-                last_week_standing: r.last_week_rank,
-                lifetime_hk: r.lifetime_hk,
-                lifetime_dk: r.lifetime_dhk,
-                highest_rank: r.highest_rank,
-                rank_bar: r.rank_bar,
-            }
-        }));
-        memo.last_inspect = held;
-        // Fired on a clear too, so the pane stops showing the previous player's numbers.
-        script.fire_event("INSPECT_HONOR_UPDATE", Vec::<ScriptValue>::new());
-    }
-
-    // --- the pane's request ------------------------------------------------------------------
-    // `RequestInspectHonorData()` takes no argument: it asks about the inspected token's guid now,
-    // so a re-target before the Honor tab opens asks about the new player.
-    let requests = script.take_inspect_honor_requests();
-    if requests > 0 {
-        match inspected {
-            Some(guid) => {
-                debug!("honor: inspect-honor request -> {guid:#x}");
-                let _ = commands
-                    .0
-                    .send(ClientCommand::InspectHonorStats { target: guid });
-            }
-            // Nothing to ask about; the pane asks again from its next `OnShow`.
-            None => debug!("honor: inspect-honor request with no resolvable target — not sent"),
+        // --- the inspect reply -------------------------------------------------------------------
+        // The reference's latch clears only at `0x4c6f70`, from a `NotifyInspect` naming another
+        // player, and on `ClearInspectPlayer`. Deviation: we clear it whenever the inspected
+        // token's guid moves, because our window re-resolves its token each frame and both tabs
+        // read it, so the reference's rule would let the two tabs show different players.
+        // `ClearInspectPlayer` drops the token, which clears the slot here too.
+        let inspected = inspect_target
+            .token
+            .as_deref()
+            .and_then(|t| crate::ui_unit::player_token_guid(t, &selection, &group));
+        if inspect_honor
+            .0
+            .as_ref()
+            .is_some_and(|reply| Some(reply.player_guid) != inspected)
+        {
+            // Dropped from the resource, so `HasInspectHonorData` and this store agree.
+            inspect_honor.0 = None;
         }
-    }
+        let held = inspect_honor.0.as_ref().map(|r| r.player_guid);
+        if memo.last_inspect != held {
+            script.set_inspect_honor(inspect_honor.0.as_ref().map(|r| {
+                let (session_hk, session_dk) = r.session_kills();
+                InspectHonorData {
+                    guid: r.player_guid,
+                    session_hk,
+                    session_dk,
+                    yesterday_hk: r.yesterday_hk,
+                    yesterday_honor: r.yesterday_honor,
+                    this_week_hk: r.this_week_hk,
+                    this_week_honor: r.this_week_honor,
+                    last_week_hk: r.last_week_hk,
+                    last_week_honor: r.last_week_honor,
+                    last_week_standing: r.last_week_rank,
+                    lifetime_hk: r.lifetime_hk,
+                    lifetime_dk: r.lifetime_dhk,
+                    highest_rank: r.highest_rank,
+                    rank_bar: r.rank_bar,
+                }
+            }));
+            memo.last_inspect = held;
+            // Fired on a clear too, so the pane stops showing the previous player's numbers.
+            script.fire_event("INSPECT_HONOR_UPDATE", Vec::<ScriptValue>::new());
+        }
+
+        // --- the pane's request ------------------------------------------------------------------
+        // `RequestInspectHonorData()` takes no argument: it asks about the inspected token's guid
+        // now, so a re-target before the Honor tab opens asks about the new player.
+        let requests = script.take_inspect_honor_requests();
+        if requests > 0 {
+            match inspected {
+                Some(guid) => {
+                    debug!("honor: inspect-honor request -> {guid:#x}");
+                    let _ = commands
+                        .0
+                        .send(ClientCommand::InspectHonorStats { target: guid });
+                }
+                // Nothing to ask about; the pane asks again from its next `OnShow`.
+                None => debug!("honor: inspect-honor request with no resolvable target — not sent"),
+            }
+        }
+    })
 }
 
 #[cfg(test)]
@@ -300,7 +315,7 @@ mod tests {
     /// nothing else.
     #[test]
     fn the_rank_strings_read_takes_only_the_title_keys() {
-        let strings = pvp_name_strings(&vm(r#"UNIT_PVP_NAME = "%s %s"
+        let strings = name_line_strings(&vm(r#"UNIT_PVP_NAME = "%s %s"
                PVP_RANK_7_1 = "Sergeant"
                PVP_RANK_7_1_FEMALE = "Sergeant (f)"
                GARBAGE_KEY = "x""#));
@@ -315,17 +330,34 @@ mod tests {
         assert!(!strings.contains_key("GARBAGE_KEY"), "only the title keys");
     }
 
-    /// Each VM is read once, the first frame it is in the world, so a world VM whose addon renames
-    /// a title reaches the overhead line.
+    /// The name line's flag tags are read with the titles (`0x5eca17`, `0x5eca54`, `0x5eca99`).
     #[test]
-    fn each_new_vm_is_read_once() {
+    fn the_strings_read_takes_the_chat_flag_tags() {
+        let strings = name_line_strings(&vm(r#"CHAT_FLAG_AFK = "<Away>"
+               CHAT_FLAG_DND = "<Busy>"
+               CHAT_FLAG_GM = "<GM>""#));
+        for (key, value) in [
+            ("CHAT_FLAG_AFK", "<Away>"),
+            ("CHAT_FLAG_DND", "<Busy>"),
+            ("CHAT_FLAG_GM", "<GM>"),
+        ] {
+            assert_eq!(strings.get(key).map(String::as_str), Some(value), "{key}");
+        }
+    }
+
+    /// Each VM is read the first frame it is in the world, so a world VM whose addon renames a
+    /// title reaches the overhead line, and read again after a player line rebuilds: the builder
+    /// reads the title (`0x609370`) and the flag tags (`0x5eca17`, `0x5eca54`, `0x5eca99`) at
+    /// every rebuild, and only then.
+    #[test]
+    fn each_vm_is_read_and_read_again_after_a_rebuild() {
         use bevy::ecs::system::RunSystemOnce;
         let mut world = World::new();
-        world.init_resource::<crate::nameplates::PvpNameStrings>();
-        world.run_system_once(feed_pvp_name_strings).unwrap();
+        world.init_resource::<crate::nameplates::NameLineStrings>();
+        world.run_system_once(feed_name_line_strings).unwrap();
         assert_eq!(
             world
-                .resource::<crate::nameplates::PvpNameStrings>()
+                .resource::<crate::nameplates::NameLineStrings>()
                 .session(),
             None,
             "no VM, no read"
@@ -335,26 +367,64 @@ mod tests {
         let boot = vm(stock);
         let boot_session = boot.session();
         world.insert_non_send_resource(boot);
-        world.run_system_once(feed_pvp_name_strings).unwrap();
-        let held = world.resource::<crate::nameplates::PvpNameStrings>();
+        world.run_system_once(feed_name_line_strings).unwrap();
+        let held = world.resource::<crate::nameplates::NameLineStrings>();
         assert_eq!(held.session(), Some(boot_session));
         assert_eq!(held.get("PVP_RANK_7_1"), Some("Sergeant"));
 
-        // The same VM is not read again: a global it sets later stays out.
+        // A global the same VM sets later waits for a rebuild, then reaches the held strings, a
+        // flag tag's included.
         world
             .non_send_resource::<UiScript>()
-            .run(r#"PVP_RANK_7_1 = "Later""#)
+            .run(r#"PVP_RANK_7_1 = "Later" CHAT_FLAG_AFK = "<Away>""#)
             .expect("global set");
-        world.run_system_once(feed_pvp_name_strings).unwrap();
-        let held = world.resource::<crate::nameplates::PvpNameStrings>();
-        assert_eq!(held.get("PVP_RANK_7_1"), Some("Sergeant"));
+        world.run_system_once(feed_name_line_strings).unwrap();
+        let held = world.resource::<crate::nameplates::NameLineStrings>();
+        assert_eq!(held.get("PVP_RANK_7_1"), Some("Sergeant"), "no rebuild yet");
+        held.ask_reread();
+        world.run_system_once(feed_name_line_strings).unwrap();
+        let held = world.resource::<crate::nameplates::NameLineStrings>();
+        assert_eq!(held.get("PVP_RANK_7_1"), Some("Later"));
+        assert_eq!(held.get("CHAT_FLAG_AFK"), Some("<Away>"));
 
         let world_vm = vm(&format!("{stock}\nPVP_RANK_7_1 = \"Feldwebel\""));
         let world_session = world_vm.session();
         world.insert_non_send_resource(world_vm);
-        world.run_system_once(feed_pvp_name_strings).unwrap();
-        let held = world.resource::<crate::nameplates::PvpNameStrings>();
+        world.run_system_once(feed_name_line_strings).unwrap();
+        let held = world.resource::<crate::nameplates::NameLineStrings>();
         assert_eq!(held.session(), Some(world_session));
         assert_eq!(held.get("PVP_RANK_7_1"), Some("Feldwebel"));
+    }
+
+    /// The builder reads its globals through `_G`'s `__index` (`lua_gettable`, `0x70436e`) only
+    /// when a name rebuilds (`0x5ec9e0`, `0x609370`), so a steady frame runs no Lua: an addon's
+    /// `__index` is called by the VM's first read and not again until a rebuild asks.
+    #[test]
+    fn a_steady_frame_runs_no_index_metamethod() {
+        use bevy::ecs::system::RunSystemOnce;
+        let mut world = World::new();
+        world.init_resource::<crate::nameplates::NameLineStrings>();
+        world.insert_non_send_resource(vm(r#"INDEXED = 0
+            setmetatable(getfenv(0), { __index = function(t, k)
+                rawset(t, "INDEXED", rawget(t, "INDEXED") + 1)
+            end })"#));
+        let indexed = |world: &World| -> i64 {
+            world
+                .non_send_resource::<UiScript>()
+                .eval("return rawget(getfenv(0), 'INDEXED')")
+                .unwrap()
+        };
+        world.run_system_once(feed_name_line_strings).unwrap();
+        let first = indexed(&world);
+        assert!(first > 0, "the VM's first read asks the metamethod");
+        for _ in 0..3 {
+            world.run_system_once(feed_name_line_strings).unwrap();
+        }
+        assert_eq!(indexed(&world), first, "no rebuild, no read");
+        world
+            .resource::<crate::nameplates::NameLineStrings>()
+            .ask_reread();
+        world.run_system_once(feed_name_line_strings).unwrap();
+        assert_eq!(indexed(&world), 2 * first, "a rebuild's read asks it again");
     }
 }

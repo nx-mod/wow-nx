@@ -14,9 +14,11 @@ fn one_item_backpack(item_id: u32, name: &str, quality: u32) -> ContainerState {
     slots.insert(
         1,
         ContainerSlot {
+            uncached_link: None,
             use_fork: Default::default(),
             item_class: None,
             duration_ms: None,
+            field_duration: 0,
             petition: None,
             already_bound: false,
             occupied_seats: None,
@@ -42,6 +44,7 @@ fn one_item_backpack(item_id: u32, name: &str, quality: u32) -> ContainerState {
             flags: 0,
             enchants: Vec::new(),
             spell_0: false,
+            spell_charges: [0; 5],
         },
     );
     ContainerState {
@@ -54,6 +57,7 @@ fn one_item_backpack(item_id: u32, name: &str, quality: u32) -> ContainerState {
 /// The stock popup stack and the world frame the drop is clicked on.
 fn setup() -> UiScript {
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     // The drop is a click on the full-screen world frame, so it must be loaded.
     for file in super::test_ui::production_order(&[
@@ -87,6 +91,7 @@ fn setup() -> UiScript {
 /// The stock bag windows (`BAG_UI`) and the world frame, for the test that watches a bag repaint.
 fn bag_setup() -> UiScript {
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     for file in crate::ui_script::test_ui::production_order(&[
         BAG_UI,
@@ -484,6 +489,7 @@ fn the_plain_arm_shows_no_edit_box() {
 fn the_world_drop_survives_the_whole_shipped_interface() {
     let _data = benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     let failures = super::load_default_ui(&s);
     assert!(failures.is_empty(), "manifest load errors: {failures:#?}");

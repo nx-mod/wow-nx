@@ -20,17 +20,27 @@ use crossbeam_channel::{Receiver, Sender};
 use benilla_world::schedule::WorldStage;
 
 mod apply;
+mod game_time;
 pub(crate) mod handlers;
 pub(crate) mod io;
 pub(crate) mod motion;
 mod objects;
-pub(crate) use objects::tear_down;
+#[cfg(test)]
+pub(crate) use objects::wire;
+pub(crate) use objects::Listed;
+pub(crate) use objects::{release_unheld, ReleasePending};
+mod reputations;
 mod session;
 mod world;
+
+pub(crate) use reputations::Reputations;
 
 pub(crate) use apply::apply_net_updates;
 pub(crate) use apply::enter_world_on_self_create;
 use apply::tag_self_player;
+#[cfg(test)]
+pub(crate) use game_time::GameTime;
+pub(crate) use game_time::{clock_tick, ServerTime};
 pub(crate) use handlers::NetHandlerApp;
 
 pub(crate) use io::LoginRequest;
@@ -67,11 +77,7 @@ impl Plugin for NetPlugin {
         if !self.connect {
             app.insert_resource(NetOffline);
         }
-        // In the net stage: the lighting resolve runs after it and reads this frame's clock.
-        app.add_systems(
-            Update,
-            publish_world_time.in_set(benilla_world::schedule::WorldStage::Net),
-        );
+        game_time::register(app);
         world::register(app);
         session::register(app);
         objects::register(app);
@@ -102,8 +108,11 @@ impl Plugin for NetPlugin {
             .init_resource::<crate::world_state::WorldStates>()
             .add_message::<TeleportMessage>()
             .add_message::<FieldChanged>()
-            .add_message::<crate::item_watch::ItemNotice>()
-            .add_message::<crate::field_watch::FieldNotice>()
+            .add_message::<AuraFieldsChanged>()
+            .init_resource::<crate::item_lane::ItemLane>()
+            .init_resource::<crate::item_watch::BagCache>()
+            .init_resource::<crate::ui_items::feed::BagView>()
+            .init_resource::<crate::field_watch::NoticeLane>()
             .add_message::<SelfMoveMessage>()
             .add_message::<SpeedChangeMessage>()
             .add_message::<ClientControlMessage>()
@@ -253,14 +262,20 @@ impl ObjectStore {
     }
 }
 
-/// One descriptor dword moved on a streamed object, the reference's `CMirrorHandler` edge: the
-/// values notifier (`0x465330`) diffs live against a shadow copy and passes the old value
-/// (`0x465570`). A first create fires nothing; a re-create of a live guid fires like a delta.
+/// One descriptor dword moved on a streamed object, the reference's `CMirrorHandler` edge: an
+/// update packet's notify pass (`0x465330`) diffs the object against the copy its last write in
+/// the packet took (`0x46664b`) and passes the old value (`0x465570`). A first create fires
+/// nothing; a create of an object shown before fires every dword it moved, an omitted one cleared.
 ///
 /// `kind` is the store's class from its create block, since a raw index differs per class (`36`
 /// is a unit's `BYTES_0` and a corpse's `DYNAMIC_FLAGS`).
+///
+/// `at` is the edge's place among what the packets queue ([`crate::lanes::stamp`]), taken as the
+/// handler writes it, so a line a later system words off the edge fires where the reference's
+/// field callback wrote it, inside the update's handler.
 #[derive(Message, Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct FieldChanged {
+    pub at: crate::lanes::Stamp,
     pub entity: Entity,
     pub guid: u64,
     pub kind: benilla_protocol::messages::ObjectType,
@@ -279,36 +294,83 @@ impl FieldChanged {
     pub fn unit_field(&self, index: u16) -> bool {
         self.is_unit() && self.index == index
     }
+    /// A unit's alive-to-dead edge, signed as the health watcher compares it (`0x6046f0`:
+    /// `0x604774 jg` on the old health, `0x604778 jle` on the new), which runs `OnDied`.
+    pub fn unit_died(&self) -> bool {
+        self.unit_field(benilla_protocol::field::FIELD_UNIT_HEALTH)
+            && self.old as i32 > 0
+            && self.new as i32 <= 0
+    }
     /// The edge's slot in a unit-block array of `len` dwords at `base` (`UNIT_FIELD_AURA[48]`).
     pub fn unit_array_slot(&self, base: u16, len: u16) -> Option<u16> {
         (self.is_unit() && (base..base + len).contains(&self.index)).then(|| self.index - base)
     }
 }
 
-/// Merge a descriptor update into a store and emit its [`FieldChanged`] edges; the drain and the
-/// test harness share it.
-pub(crate) fn merge_store_fields(
-    store: &mut ObjectFields,
-    delta: ObjectFields,
-    entity: Entity,
-    guid: u64,
-    mut emit: impl FnMut(FieldChanged),
-) {
-    let Some(kind) = store.created_as() else {
-        // A bare delta with no create: nothing for the reference to notify on; the fields land.
+/// The dwords the aura watcher `0x604d00` covers from `UNIT_FIELD_AURA`: the 48 slot ids and the
+/// 6 `UNIT_FIELD_AURAFLAGS` nibble words, fields 47 to 100 (registered at `0x604226`).
+pub(crate) const AURA_WATCH_SPAN: usize = 54;
+
+/// One call of the aura watcher `0x604d00` on a unit: once per notified block whose fields 47 to
+/// 100 moved, with the watch copy's old dwords and the descriptor's new ones, as the notify pass
+/// hands a range watcher its copy (`0x4655c7`). `at` is the watcher's place among what the packets
+/// queue, the stamp of the block's first edge in the range, where
+/// [`crate::field_watch::in_watch_order`] places them all. `health` is the descriptor's
+/// `UNIT_FIELD_HEALTH` as the watcher runs, which the loss line reads (`0x62b50e`).
+#[derive(Message, Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AuraFieldsChanged {
+    pub at: crate::lanes::Stamp,
+    pub entity: Entity,
+    pub guid: u64,
+    pub old: [u32; AURA_WATCH_SPAN],
+    pub new: [u32; AURA_WATCH_SPAN],
+    pub health: u32,
+}
+
+/// Whether a unit field lies in the aura watcher's range.
+pub(crate) fn in_aura_watch(index: u16) -> bool {
+    use benilla_protocol::field::FIELD_UNIT_AURA;
+    (FIELD_UNIT_AURA..FIELD_UNIT_AURA + AURA_WATCH_SPAN as u16).contains(&index)
+}
+
+/// The watch copy and the descriptor of the aura watcher's range for one block, or `None` when
+/// the block moved nothing in it: `fields` is the descriptor after the block, `moved` the block's
+/// `(index, old, new)` edges.
+pub(crate) fn aura_watch_span(
+    fields: &ObjectFields,
+    moved: impl IntoIterator<Item = (u16, u32, u32)>,
+) -> Option<([u32; AURA_WATCH_SPAN], [u32; AURA_WATCH_SPAN])> {
+    use benilla_protocol::field::FIELD_UNIT_AURA;
+    let slot = |index: u16| in_aura_watch(index).then(|| usize::from(index - FIELD_UNIT_AURA));
+    let mut new = [0u32; AURA_WATCH_SPAN];
+    for (index, value) in fields.raw_fields() {
+        if let Some(i) = slot(index) {
+            new[i] = value;
+        }
+    }
+    let mut old = new;
+    let mut any = false;
+    for (index, was, _) in moved {
+        if let Some(i) = slot(index) {
+            old[i] = was;
+            any = true;
+        }
+    }
+    any.then_some((old, new))
+}
+
+/// A block's write into a held store (`0x466590` with its copy flag clear): a create's delta
+/// replaces the store, clearing what it omits (`0x466582`); a values delta lands on top. The
+/// dwords it moved come back as `(index, old, new)`. A store no create made has no type to
+/// notify by, and the fields land with none.
+pub(crate) fn write_fields(store: &mut ObjectFields, delta: ObjectFields) -> Vec<(u16, u32, u32)> {
+    let mut moved = Vec::new();
+    if store.created_as().is_none() {
         store.merge(delta);
-        return;
-    };
-    store.merge_diff(delta, |index, old, new| {
-        emit(FieldChanged {
-            entity,
-            guid,
-            kind,
-            index,
-            old,
-            new,
-        });
-    });
+    } else {
+        store.merge_diff(delta, |index, old, new| moved.push((index, old, new)));
+    }
+    moved
 }
 
 /// Apply a descriptor update the way the drain does. The first one must be
@@ -318,7 +380,20 @@ pub(crate) fn apply_fields_for_test(world: &mut World, entity: Entity, delta: Ob
     let guid = world.get::<Guid>(entity).map_or(0, |g| g.0);
     let mut edges = Vec::new();
     match world.get_mut::<ObjectStore>(entity) {
-        Some(mut store) => merge_store_fields(&mut store.0, delta, entity, guid, |e| edges.push(e)),
+        Some(mut store) => {
+            let moved = write_fields(&mut store.0, delta);
+            if let Some(kind) = store.0.created_as() {
+                edges.extend(moved.into_iter().map(|(index, old, new)| FieldChanged {
+                    at: crate::lanes::stamp(),
+                    entity,
+                    guid,
+                    kind,
+                    index,
+                    old,
+                    new,
+                }));
+            }
+        }
         None => {
             assert!(
                 delta.created_as().is_some(),
@@ -562,6 +637,11 @@ impl Objects<'_, '_> {
         self.me.single().ok()
     }
 
+    /// Our own player's descriptor fields, once in the world.
+    pub(crate) fn player_fields(&self) -> Option<&ObjectFields> {
+        self.stores.get(self.player()?).ok().map(|s| &s.0)
+    }
+
     /// An item object's countdown cells.
     pub(crate) fn countdowns(&self, guid: u64) -> Option<&crate::items::Countdowns> {
         self.index
@@ -598,27 +678,6 @@ pub(crate) struct DroppedOpcodes(pub(crate) HashMap<u16, DropTally>);
 pub(crate) struct DropTally {
     pub(crate) unknown: u64,
     pub(crate) unparseable: u64,
-}
-
-/// The in-game clock (`SMSG_LOGIN_SETTIMESPEED`), advanced by its timescale.
-#[derive(Resource, Default)]
-pub(crate) struct ServerTime(pub(crate) Option<GameTime>);
-
-/// Publish the session clock into [`benilla_world::lighting::WorldTime`] each frame; with no
-/// server, its default (noon).
-pub(crate) fn publish_world_time(
-    server: Res<ServerTime>,
-    mut world_time: ResMut<benilla_world::lighting::WorldTime>,
-) {
-    *world_time = match server.0 {
-        Some(gt) => benilla_world::lighting::WorldTime {
-            minute: gt.minute_of_day(),
-            minute_f: gt.minute_of_day_f32(),
-            day: gt.day_continuous(),
-            live: true,
-        },
-        None => benilla_world::lighting::WorldTime::default(),
-    };
 }
 
 /// The server's unix wall clock (`SMSG_QUERY_TIME_RESPONSE`), advanced monotonically. Descriptor
@@ -698,54 +757,6 @@ pub(crate) fn send_query_time(
     }
 }
 
-/// Our reputation state: the `(flags, standing)` per slot and the forced-reaction table.
-///
-/// `slots` is indexed by `Faction.dbc`'s `reputationIndex`. The standing excludes the DBC
-/// race/class base, which consumers add before ranking. Filled by `SMSG_INITIALIZE_FACTIONS`, kept
-/// current by `SMSG_SET_FACTION_STANDING` (which also reveals) and `SMSG_SET_FACTION_VISIBLE`.
-/// Flag bit `0x08` marks a pane header.
-///
-/// `forced` is `SMSG_SET_FORCED_REACTIONS` (`0x4d59a0`): `(Faction.dbc id, reaction rank)` per
-/// faction a `SPELL_AURA_FORCE_REACTION` aura forces, which answers with that rank whatever its
-/// templates or our standing say. Both halves live on one resource so a change to either wakes the
-/// unit feed and the questgiver-marker re-query that read reactions.
-#[derive(Resource, Default, Clone)]
-pub(crate) struct Reputations {
-    pub(crate) slots: Vec<(u8, i32)>,
-    pub(crate) forced: Vec<(u32, u32)>,
-    /// How many forced tables have arrived. The reference's handler fires `UNIT_FACTION` on every
-    /// arrival, a resend of the same table included, so a feed counts arrivals, not table diffs.
-    forced_arrivals: u64,
-}
-
-impl Reputations {
-    /// A store holding only `slots`, with nothing forced.
-    #[cfg(test)]
-    pub(crate) const fn from_slots(slots: Vec<(u8, i32)>) -> Self {
-        Self {
-            slots,
-            forced: Vec::new(),
-            forced_arrivals: 0,
-        }
-    }
-
-    /// `SMSG_SET_FORCED_REACTIONS`: the table replaces the last whole (`0x4d59a0`).
-    pub(crate) fn set_forced(&mut self, table: Vec<(u32, u32)>) {
-        self.forced = table;
-        self.forced_arrivals += 1;
-    }
-
-    /// Drops the table: the reference's teardown zeroes the count (`0x4d5419`).
-    pub(crate) fn clear_forced(&mut self) {
-        self.forced.clear();
-    }
-
-    /// The tables that have arrived so far.
-    pub(crate) fn forced_arrivals(&self) -> u64 {
-        self.forced_arrivals
-    }
-}
-
 /// The hearthstone bind point (`SMSG_BINDPOINTUPDATE`): the AreaTable id the tooltip's `$z`
 /// token names.
 #[derive(Resource, Default)]
@@ -760,47 +771,6 @@ pub(crate) struct PlayedTimeAnswer(pub(crate) Option<(u32, u32)>);
 /// bitmask, the client's `0xc4d4a0[class]` store.
 #[derive(Resource, Default)]
 pub(crate) struct Proficiencies(pub(crate) std::collections::HashMap<u32, u32>);
-
-/// The in-game clock from `SMSG_LOGIN_SETTIMESPEED`: the server's `localtime()`, advancing at
-/// `timescale` game-minutes per real second (vmangos about `0.01667`, real time).
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct GameTime {
-    /// Minute of the game day (`0..1440`) at `received`.
-    base_minute: u32,
-    /// Day serial of the packed date, `year*372 + month*31 + day`; only differences matter.
-    base_day: u32,
-    timescale: f32,
-    received: Instant,
-}
-
-impl GameTime {
-    pub(crate) fn new(hours: u8, minutes: u8, day_serial: u32, timescale: f32) -> Self {
-        Self {
-            base_minute: hours as u32 * 60 + minutes as u32,
-            base_day: day_serial,
-            timescale,
-            received: Instant::now(),
-        }
-    }
-
-    /// Current minute of the game day (`0..1440`).
-    pub(crate) fn minute_of_day(&self) -> u32 {
-        self.minute_of_day_f32() as u32
-    }
-
-    /// Current fractional minute of the game day, so the sky bodies move without steps.
-    pub(crate) fn minute_of_day_f32(&self) -> f32 {
-        let elapsed = self.received.elapsed().as_secs_f32() * self.timescale;
-        (self.base_minute as f32 + elapsed).rem_euclid(1440.0)
-    }
-
-    /// Days and day fraction since the serial epoch, unwrapped, for the moon phase
-    /// `(dayCounter + todPhase) mod 1.7` (`0x6d41b9`); `f64` for sub-minute grain at ~12k days.
-    pub(crate) fn day_continuous(&self) -> f64 {
-        let elapsed = self.received.elapsed().as_secs_f64() * self.timescale as f64;
-        self.base_day as f64 + (self.base_minute as f64 + elapsed) / 1440.0
-    }
-}
 
 // ── Outbound commands + one-shot inbound events ──────────────────────────────────────────────────
 
@@ -933,7 +903,7 @@ pub(crate) static CAST_TRACE: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| std::env::var("WOW_CAST_TRACE").is_ok());
 
 /// A message to the server through the write thread, carrying any pose it needs.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum ClientCommand {
     /// A self-movement packet. Each tail is written iff its flag is set (`JUMPING`, `SWIMMING`,
     /// `ON_TRANSPORT`): a flag without its tail desyncs the server's parse.
@@ -1108,6 +1078,10 @@ pub(crate) enum ClientCommand {
         slot: u8,
         count: u8,
     },
+    /// `CMSG_EMOTE`: a one-shot emote, the wave a placed bid sends (`0x4cc5dd`-`0x4cc60c`).
+    Emote {
+        emote: u32,
+    },
     /// `CMSG_TEXT_EMOTE`; our own sound and animation ride the `SMSG_TEXT_EMOTE` echo.
     TextEmote {
         text_id: u32,
@@ -1160,6 +1134,14 @@ pub(crate) enum ClientCommand {
         pet_guid: u64,
         packed: u32,
         target_guid: u64,
+    },
+    /// `CMSG_PET_CAST_SPELL`: a cast the ladder sent with the pet or a possessed unit as its
+    /// caster (`SendCast 0x6e54f0`, `0x6e5816`), the bar's client-targeted and possessed presses
+    /// (`0x4bd385`). A refusal comes back as `SMSG_PET_CAST_FAILED`.
+    PetCastSpell {
+        caster_guid: u64,
+        spell_id: u32,
+        target: benilla_protocol::messages::UseItemTarget,
     },
     /// `CMSG_PET_SET_ACTION`: one or two `(position, word)` pairs. The bar's autocast toggle is
     /// one entry with bit 30 flipped.
@@ -1228,11 +1210,12 @@ pub(crate) enum ClientCommand {
     GossipHello {
         guid: u64,
     },
-    /// `CMSG_GOSSIP_SELECT_OPTION` with the line's `index`. No code is ever sent: coded options
-    /// are not selectable.
+    /// `CMSG_GOSSIP_SELECT_OPTION` with the line's `index`, and the code a coded option was
+    /// given.
     GossipSelectOption {
         guid: u64,
         option: u32,
+        code: Option<Vec<u8>>,
     },
     /// `CMSG_NPC_TEXT_QUERY`, asked once per `text_id` on menu receipt.
     NpcTextQuery {
@@ -1518,6 +1501,12 @@ pub(crate) enum ClientCommand {
         spell_id: u32,
         item_guid: u64,
     },
+    /// A cast at the partner's trade slot `slot` (`TARGET_FLAG_TRADE_ITEM`, the bind of
+    /// `0x6e6900`).
+    CastSpellTradeItem {
+        spell_id: u32,
+        slot: u8,
+    },
     /// `CMSG_LOOT` on a unit; the server rejects a GameObject guid, which loots by `GameObjUse`.
     Loot {
         guid: u64,
@@ -1650,6 +1639,7 @@ pub(crate) enum ClientCommand {
     MailCreateTextItem {
         mailbox: u64,
         mail_id: u32,
+        template_id: u32,
     },
     /// `CMSG_ITEM_TEXT_QUERY`, once per mail with a nonzero `item_text_id`.
     ItemTextQuery {
@@ -1737,8 +1727,10 @@ pub(crate) enum ClientCommand {
     /// `CMSG_BUSY_TRADE` (`0x118`, sent by `0x5d4150`): five of the ladder's eight refusal legs;
     /// vmangos sends `TRADE_STATUS_BUSY` to both. The player's own No is [`Self::CancelTrade`].
     BusyTrade,
-    /// `CMSG_ACCEPT_TRADE`: the Trade button.
-    AcceptTrade,
+    /// `CMSG_ACCEPT_TRADE`: the Trade button, with the partner's last extended-status flag.
+    AcceptTrade {
+        flag: u32,
+    },
     /// `CMSG_UNACCEPT_TRADE`: drop our accept, stay in the trade.
     UnacceptTrade,
     /// `CMSG_CANCEL_TRADE`.
@@ -1901,6 +1893,10 @@ pub(crate) enum ClientCommand {
     GroupUninvite {
         name: String,
     },
+    /// `CMSG_GROUP_UNINVITE_GUID`, leader only: the kick for a player whose object is not held.
+    GroupUninviteGuid {
+        guid: u64,
+    },
     /// `CMSG_GROUP_SET_LEADER`, leader only.
     GroupSetLeader {
         guid: u64,
@@ -1925,6 +1921,9 @@ pub(crate) enum ClientCommand {
         icon: u8,
         guid: u64,
     },
+    /// `MSG_RAID_TARGET_UPDATE` with the byte 0xff alone, the request for every icon, which a raid
+    /// list sends on finding no roster held (`0x4babf4`-`0x4bac33`).
+    RequestRaidTargets,
     /// `MSG_MINIMAP_PING`, raw world `(x, y)`. The server relays it to the rest of the group and
     /// ignores it solo, so our own marker is drawn locally.
     MinimapPing {
@@ -1949,9 +1948,9 @@ pub(crate) enum ClientCommand {
     },
     /// `MSG_RAID_READY_CHECK` with an empty body, leader only.
     ReadyCheckStart,
-    /// `MSG_RAID_READY_CHECK` with one byte.
+    /// `MSG_RAID_READY_CHECK` with one byte, the status.
     ReadyCheckAnswer {
-        ready: bool,
+        status: u8,
     },
     /// `CMSG_REQUEST_RAID_INFO`.
     RequestRaidInfo,
@@ -2011,6 +2010,32 @@ pub(crate) enum ClientCommand {
     ToggleHelm,
     /// `CMSG_TOGGLE_CLOAK`, as [`Self::ToggleHelm`].
     ToggleCloak,
+    // ── The console's own sends ── (vmangos acts on them for administrators alone)
+    /// `MSG_MOVE_TELEPORT_CHEAT`: the `port x y` command.
+    TeleportCheat {
+        pos: [f32; 3],
+        facing: f32,
+    },
+    /// `CMSG_TELEPORT_TO_UNIT`: the `port <name>` command's whole argument text.
+    TeleportToUnit {
+        text: String,
+    },
+    /// `CMSG_MOVE_SET_RAW_POSITION`: the `setrawpos` command.
+    SetRawPosition {
+        pos: [f32; 3],
+        facing: f32,
+    },
+    /// `CMSG_WORLD_TELEPORT`: the `worldport` command, with the client's millisecond clock.
+    WorldTeleport {
+        time_ms: u32,
+        map: u32,
+        pos: [f32; 3],
+        facing: f32,
+    },
+    /// `CMSG_WHOIS`: the `whois` command's whole argument text.
+    Whois {
+        text: String,
+    },
     // ── Guild ──
     // Members by name; rank 0 is the guild master. A change is answered by a fresh
     // `SMSG_GUILD_ROSTER`, never applied at the send; a refusal by `SMSG_GUILD_COMMAND_RESULT`.
@@ -2471,7 +2496,8 @@ pub(crate) struct PetDismissSoundMessage {
 mod tests {
     use super::*;
 
-    /// A re-create of a live object notifies like a delta.
+    /// The write's edges: one per moved dword, none for a first create; a re-create replaces the
+    /// store, clearing what it omits (`0x466582`).
     #[test]
     fn the_merge_emits_one_edge_per_moved_dword_and_none_for_a_first_create() {
         use benilla_protocol::field::{FIELD_UNIT_HEALTH, FIELD_UNIT_LEVEL};
@@ -2501,9 +2527,11 @@ mod tests {
             unit,
             ObjectFields::from_pairs(&[(FIELD_UNIT_LEVEL, 9), (FIELD_UNIT_HEALTH, 0)]),
         );
+        let edges = drain(&mut world);
         assert_eq!(
-            drain(&mut world),
+            edges,
             vec![FieldChanged {
+                at: edges[0].at,
                 entity: unit,
                 guid: 0xF130_0000_0000_0042,
                 kind: ObjectType::Unit,

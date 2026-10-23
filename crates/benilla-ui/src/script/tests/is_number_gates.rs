@@ -38,6 +38,7 @@ fn action_has_range_answers_nil_for_a_non_number() {
 #[test]
 fn sign_petition_keeps_its_default_byte_for_a_non_number() {
     let mut s = gated();
+    s.keep_calls();
     for call in [
         "SignPetition('x')",
         "SignPetition({})",
@@ -46,15 +47,15 @@ fn sign_petition_keeps_its_default_byte_for_a_non_number() {
     ] {
         s.run(call).unwrap();
         assert_eq!(
-            s.take_petition_requests(),
-            vec![PetitionRequest::Sign(1)],
+            s.take_petition_calls(),
+            vec![PetitionCall::Sign(1)],
             "{call}"
         );
     }
     s.run("SignPetition('5') SignPetition(2.9)").unwrap();
     assert_eq!(
-        s.take_petition_requests(),
-        vec![PetitionRequest::Sign(5), PetitionRequest::Sign(2)]
+        s.take_petition_calls(),
+        vec![PetitionCall::Sign(5), PetitionCall::Sign(2)]
     );
 }
 
@@ -87,6 +88,7 @@ fn get_num_routes_reads_a_non_number_as_zero() {
                 pos: (0.5, 0.6),
                 cost: 0,
                 routes: vec![],
+                num_routes: 0,
             },
             TaxiUiNode {
                 name: "B".into(),
@@ -94,6 +96,7 @@ fn get_num_routes_reads_a_non_number_as_zero() {
                 pos: (0.55, 0.8),
                 cost: 110,
                 routes: vec![[0.5, 0.6, 0.55, 0.8]],
+                num_routes: 1,
             },
         ],
     }));

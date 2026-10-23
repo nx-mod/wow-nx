@@ -111,12 +111,55 @@ fn a_refused_cast_shows_its_line_and_fails_inside_the_call() {
     assert_eq!(reports(&mut f).len(), 2);
     f.app
         .world_mut()
-        .run_system_once(crate::ui_cast::feed_cast_reports)
+        .run_system_once(crate::ui_cast::signal_reports)
         .unwrap();
     assert_eq!(
         reports(&mut f),
         Vec::<String>::new(),
         "and the frame's feed signals nothing again"
+    );
+}
+
+/// The refusal's combat-log line is written inside the report as well: after `DisplayError`
+/// (`0x6e21dd`), `0x6e21fc` calls `LogCastFailure 0x62c360`, whose `AddCombatLogLine 0x626850`
+/// fires `CHAT_MSG_SPELL_FAILED_LOCALPLAYER` at once (`0x49b1b0` → `0x49b0b0`), ahead of the
+/// report's `SPELLCAST_FAILED` (`0x6e224a`). So the script's next line reads all three, and the
+/// chat feed is left only the line's tee to the log files.
+#[test]
+fn a_refused_casts_log_line_fires_inside_the_call_between_its_line_and_its_failure() {
+    let mut f = frame(true);
+    with_book_spell(
+        &mut f,
+        HEAL,
+        "Heal",
+        benilla_formats::SpellDisplay {
+            id: HEAL,
+            name: "Heal".into(),
+            ..Default::default()
+        },
+    );
+    dead(&mut f);
+    run(
+        &mut f,
+        r#"SPELLFAILCASTSELF = "You fail to cast %s: %s."
+        local c = CreateFrame("Frame")
+        c:RegisterEvent("CHAT_MSG_SPELL_FAILED_LOCALPLAYER")
+        c:SetScript("OnEvent", function() table.insert(REPORTS, event .. ":" .. arg1) end)"#,
+    );
+    run_hosted(&mut f, &format!(r#"CastSpellByName("Heal") {SNAPSHOT}"#));
+    assert_eq!(
+        seen(&mut f),
+        "SPELL_FAILED_CASTER_DEAD,\
+         CHAT_MSG_SPELL_FAILED_LOCALPLAYER:You fail to cast Heal: SPELL_FAILED_CASTER_DEAD.,\
+         SPELLCAST_FAILED"
+    );
+    assert_eq!(
+        f.app
+            .world()
+            .resource::<crate::ui_chat::ChatLog>()
+            .pending_kinds(),
+        ["tee"],
+        "no event waits for the chat feed"
     );
 }
 
@@ -318,13 +361,14 @@ fn an_attack_toggled_off_cancels_its_queued_strike_with_a_pair_then_stop() {
 
 /// A refusal whose report leaves before its line and its tail (`report_reaches_pop`): a form the
 /// spell needs with no name to show, "Must be in %s" (0x56, `0x6e20c6`), refused by the attempt
-/// itself, shows nothing and fires nothing; with its form named the line shows, and the tail,
-/// nothing in flight, fires `SPELLCAST_FAILED`.
+/// itself, shows nothing and fires nothing; with its form named the line shows under errorId
+/// `0xd6` (`0x6e1be9`), whose string the recorder defines as its own key, and the tail, nothing
+/// in flight, fires `SPELLCAST_FAILED`.
 #[test]
 fn a_local_refusal_that_skips_its_text_skips_its_tail() {
     for (named, expected) in [
         (false, ""),
-        (true, "SPELL_FAILED_ONLY_SHAPESHIFT,SPELLCAST_FAILED"),
+        (true, "ERR_SPELL_FAILED_SHAPESHIFT_FORM_S,SPELLCAST_FAILED"),
     ] {
         let mut f = frame(true);
         with_book_spell(
@@ -353,4 +397,63 @@ fn a_local_refusal_that_skips_its_text_skips_its_tail() {
         assert_eq!(seen(&mut f), expected, "named {named}");
         assert_eq!(casts_and_cancels(&f), vec![], "named {named}");
     }
+}
+
+/// The auto-repeat toggle is `UseAction`'s alone (`0x4e60d1`-`0x4e60da`, `0x6e9fd0` against the
+/// slot's spell): `CastSpellByName` of the running repeat spell goes through `TryCast`, which never
+/// reads the key, so it casts again and the repeat runs on; the bar's press stops it (`0x6ea080`).
+#[test]
+fn only_the_bars_press_toggles_a_running_repeat_off() {
+    const SHOOT: u32 = 5019;
+    let mut f = frame(true);
+    with_book_spell(
+        &mut f,
+        SHOOT,
+        "Shoot",
+        benilla_formats::SpellDisplay {
+            targets: 0x2,
+            attributes_ex2: 0x20,
+            ..Default::default()
+        },
+    );
+    f.app
+        .world_mut()
+        .resource_mut::<crate::ui_action::PlayerActions>()
+        .buttons
+        .insert(
+            0,
+            ActionButton {
+                slot: 0,
+                action: SHOOT,
+                kind: ACTION_KIND_SPELL,
+            },
+        );
+    let key = |f: &Frame| f.app.world().resource::<crate::spell::AutoRepeatActive>().0;
+    run_hosted(&mut f, r#"CastSpellByName("Shoot")"#);
+    assert_eq!(key(&f), Some(SHOOT), "the first cast starts the repeat");
+    let _ = f.rx.try_iter().count();
+
+    run_hosted(&mut f, r#"CastSpellByName("Shoot")"#);
+    let sent: Vec<ClientCommand> = f.rx.try_iter().collect();
+    assert!(
+        !sent
+            .iter()
+            .any(|c| matches!(c, ClientCommand::CancelAutoRepeat)),
+        "{sent:?}"
+    );
+    assert!(sent.iter().any(|c| matches!(
+        c,
+        ClientCommand::CastSpell {
+            spell_id: SHOOT,
+            ..
+        }
+    )));
+    assert_eq!(key(&f), Some(SHOOT), "the repeat runs on");
+
+    run_hosted(&mut f, "UseAction(1)");
+    assert!(f
+        .rx
+        .try_iter()
+        .any(|c| matches!(c, ClientCommand::CancelAutoRepeat)));
+    assert_eq!(key(&f), None, "the bar's press stops it");
 }

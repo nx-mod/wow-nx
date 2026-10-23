@@ -27,6 +27,7 @@ fn player() -> UnitState {
 #[test]
 fn spell_target_unit_checks_in_the_references_order() {
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     let usage = |s: &mut UiScript, call: &str| {
         let err = s.run(call).expect_err(call).to_string();
         assert!(
@@ -160,6 +161,7 @@ fn unit_level_reads_minus_one_when_the_level_cant_be_told() {
         }),
     );
     assert_eq!(s.eval::<i64>(r#"return UnitLevel("target")"#).unwrap(), -1);
+    // A hostile player far above reads -1 too: the gate has no player test (`0x518057`-`0x51807b`).
     s.set_unit(
         "target",
         Some(UnitState {
@@ -170,7 +172,7 @@ fn unit_level_reads_minus_one_when_the_level_cant_be_told() {
             ..Default::default()
         }),
     );
-    assert_eq!(s.eval::<i64>(r#"return UnitLevel("target")"#).unwrap(), 60);
+    assert_eq!(s.eval::<i64>(r#"return UnitLevel("target")"#).unwrap(), -1);
     // An unstreamed level 0 answers 0, not -1: `0x517fc0` pushes the raw field.
     s.set_unit(
         "target",
@@ -182,6 +184,19 @@ fn unit_level_reads_minus_one_when_the_level_cant_be_told() {
         }),
     );
     assert_eq!(s.eval::<i64>(r#"return UnitLevel("target")"#).unwrap(), 0);
+    // But the rank test runs before the level's (`0x51807d`-`0x518087`, then `0x518092`): a world
+    // boss at level 0 reads -1.
+    s.set_unit(
+        "target",
+        Some(UnitState {
+            exists: true,
+            level: 0,
+            reaction: 4,
+            rank: 3,
+            ..Default::default()
+        }),
+    );
+    assert_eq!(s.eval::<i64>(r#"return UnitLevel("target")"#).unwrap(), -1);
 }
 
 #[test]
@@ -314,11 +329,10 @@ fn unit_is_trivial_is_the_grey_test_and_never_a_player() {
 fn target_unit_queues_the_token_for_the_app_to_resolve() {
     use crate::script::SelectionRequest;
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     assert!(s.take_selection_requests().is_empty());
-    // A nil token is not queued.
     s.eval::<()>(r#"TargetUnit("player")"#).unwrap();
     s.eval::<()>(r#"TargetUnit("target")"#).unwrap();
-    s.eval::<()>(r#"TargetUnit(nil)"#).unwrap();
     assert_eq!(
         s.take_selection_requests(),
         vec![
@@ -329,14 +343,45 @@ fn target_unit_queues_the_token_for_the_app_to_resolve() {
     assert!(s.take_selection_requests().is_empty());
 }
 
-/// A nil `AssistUnit` argument is dropped like `TargetUnit`'s.
+/// `TargetUnit` (`0x4899d0`) raises its usage for an argument `lua_isstring` refuses (`0x4899f1`,
+/// `0x4899f8` → `0x489a25`, the string at `0x842644`), nil and no argument included, and the
+/// resolver `0x515970` (`0x489a08`) raises `Unknown unit name` for a token it does not know, both
+/// before the select (`0x489a16`). A number passes `lua_isstring` and is read as its string.
+#[test]
+fn target_unit_raises_for_a_non_string_or_an_unknown_token() {
+    use crate::script::SelectionRequest;
+    let mut s = UiScript::new().unwrap();
+    s.keep_calls();
+    for call in ["TargetUnit()", "TargetUnit(nil)", "TargetUnit({})"] {
+        let err = s.run(call).expect_err(call).to_string();
+        assert!(
+            err.contains(r#"Usage: TargetUnit("unit")"#),
+            "{call}: {err}"
+        );
+    }
+    let err = s
+        .run(r#"TargetUnit("bogus")"#)
+        .expect_err("an unknown token")
+        .to_string();
+    assert!(err.contains("Unknown unit name: bogus"), "{err}");
+    assert!(s.take_selection_requests().is_empty(), "nothing selects");
+    s.run(r#"TargetUnit("")"#)
+        .expect("an empty token names nobody");
+    assert_eq!(
+        s.take_selection_requests(),
+        vec![SelectionRequest::Unit(String::new())]
+    );
+}
+
+/// A nil `AssistUnit` argument raises its usage (`0x489c22`) and queues nothing.
 #[test]
 fn the_selection_queue_carries_all_three_verbs_in_call_order() {
     use crate::script::SelectionRequest;
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.eval::<()>(r#"TargetUnit("party1")"#).unwrap();
     s.eval::<()>(r#"AssistUnit("target")"#).unwrap();
-    s.eval::<()>(r#"AssistUnit(nil)"#).unwrap();
+    assert!(s.eval::<()>(r#"AssistUnit(nil)"#).is_err());
     s.eval::<()>("TargetLastEnemy()").unwrap();
     assert_eq!(
         s.take_selection_requests(),
@@ -355,6 +400,7 @@ fn the_selection_queue_carries_all_three_verbs_in_call_order() {
 fn target_nearest_queues_its_mode_and_reverse_flag() {
     use crate::script::NearestMode::{Enemy, Friend, PartyMember, RaidMember};
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     assert!(s.take_target_nearest_requests().is_empty());
     s.eval::<()>("TargetNearestFriend()").unwrap();
     s.eval::<()>("TargetNearestFriend(1)").unwrap();
@@ -552,7 +598,7 @@ fn get_money_reads_the_pushed_purse() {
 }
 
 #[test]
-fn unit_xp_reads_the_player_globals_only_for_the_player_token() {
+fn unit_xp_reads_the_player_globals() {
     let mut s = UiScript::new().unwrap();
     assert_eq!(s.eval::<i64>(r#"return UnitXP("player")"#).unwrap(), 0);
     assert_eq!(s.eval::<i64>(r#"return UnitXPMax("player")"#).unwrap(), 0);
@@ -564,6 +610,45 @@ fn unit_xp_reads_the_player_globals_only_for_the_player_token() {
     );
     assert_eq!(s.eval::<i64>(r#"return UnitXP("target")"#).unwrap(), 0);
     assert_eq!(s.eval::<i64>(r#"return UnitXPMax("target")"#).unwrap(), 0);
+}
+
+/// `UnitXP` and `UnitXPMax` resolve their token (`0x51738e`) and answer for the active player's
+/// object by whatever token names it (`0x5173ad`-`0x5173c9`): `"target"` on yourself and
+/// `"PLAYER"` read the experience, another unit 0, and a token the resolver does not know raises
+/// (`0x515c14`).
+#[test]
+fn unit_xp_answers_any_token_naming_the_active_player() {
+    const ME: u64 = 0x10;
+    const OTHER: u64 = 0x20;
+    let mut s = UiScript::new().unwrap();
+    s.set_player_xp(4200, 6000);
+    let seat = |s: &mut UiScript, target: u64| {
+        s.set_unit_guids(&UnitGuids {
+            player: ME,
+            target,
+            held: [(ME, 0), (OTHER, 0)].into_iter().collect(),
+            ..Default::default()
+        });
+    };
+    seat(&mut s, ME);
+    for token in ["target", "PLAYER"] {
+        assert_eq!(
+            s.eval::<(i64, i64)>(&format!("return UnitXP({token:?}), UnitXPMax({token:?})"))
+                .unwrap(),
+            (4200, 6000),
+            "{token}"
+        );
+    }
+    seat(&mut s, OTHER);
+    assert_eq!(
+        s.eval::<(i64, i64)>(r#"return UnitXP("target"), UnitXPMax("target")"#)
+            .unwrap(),
+        (0, 0)
+    );
+    for call in [r#"UnitXP("bogus")"#, r#"UnitXPMax("npctarget")"#] {
+        let err = s.run(call).unwrap_err().to_string();
+        assert!(err.contains("Unknown unit name"), "{call}: {err}");
+    }
 }
 
 #[test]
@@ -825,6 +910,7 @@ fn unit_affecting_combat_raises_on_a_bad_argument() {
 #[test]
 fn target_by_name_queues_the_name_and_the_exact_flag() {
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     assert!(s.take_target_by_name_requests().is_empty());
 
     s.run(r#"TargetByName("Rag")"#).unwrap();
@@ -866,272 +952,25 @@ fn candidate(guid: u64, name: &str, dist2: f32) -> crate::script::NameCandidate 
             max_health: 50,
             ..Default::default()
         },
-        selectable: true,
         assistable_alive: true,
     }
 }
 
-/// [`candidate`] that `SetSelection` refuses (`UNIT_FLAG_NOT_SELECTABLE`, `0x4935ee`).
-fn unselectable(guid: u64, name: &str, dist2: f32) -> crate::script::NameCandidate {
-    crate::script::NameCandidate {
-        selectable: false,
-        ..candidate(guid, name, dist2)
+/// A seated selection that targets nobody.
+fn alone(guid: u64) -> crate::script::SeatedSelection {
+    crate::script::SeatedSelection {
+        guid,
+        held: true,
+        target: 0,
+        target_held: false,
     }
 }
 
-/// `TargetByName` (`0x489d60`) commits through `SetSelection` before it returns, so the rest of its
-/// chunk reads the pick as `"target"`; the call still queues for the app's commit, and the feed is
-/// told to re-push `"target"` from the committed selection.
+/// `0x515970` reads the target's `UNIT_FIELD_TARGET` as it resolves `"targettarget"`, so a seat
+/// carries the hop: a held unit as its snapshot, an unheld groupmate through its own token's push
+/// (the chain's roster arm), and nobody once the new target targets nobody.
 #[test]
-fn target_by_name_shows_its_pick_to_the_rest_of_the_chunk() {
-    const OLD: u64 = 0x21;
-    let mut s = UiScript::new().unwrap();
-    s.set_unit(
-        "target",
-        Some(UnitState {
-            exists: true,
-            has_object: true,
-            guid: OLD,
-            name: Some("Old Mob".into()),
-            ..Default::default()
-        }),
-    );
-    s.set_name_candidate(0x31, Some(candidate(0x31, "Red Affinity", 400.0)));
-    s.set_name_candidate(0x32, Some(candidate(0x32, "Red Affinity", 100.0)));
-    s.set_name_candidate(0x33, Some(candidate(0x33, "Redridge Gnoll", 4.0)));
-    s.set_name_candidate_dist2(0x31, 25.0);
-    assert!(!s.take_target_view_moved());
-
-    let named = |s: &UiScript, lua: &str| s.eval::<Option<String>>(lua).unwrap();
-    assert_eq!(
-        named(
-            &s,
-            "TargetByName('Red Affinity', true) return UnitName('target')"
-        )
-        .as_deref(),
-        Some("Red Affinity")
-    );
-    assert_eq!(
-        s.eval::<i64>("return UnitHealth('target')").unwrap(),
-        40,
-        "the pick's whole snapshot, not only its name"
-    );
-    assert_eq!(
-        s.model_ref().unit_guids.target,
-        0x31,
-        "the resolver's target guid moved with it, to the namesake nearer by the last distance"
-    );
-    assert_eq!(
-        s.take_target_by_name_requests(),
-        vec![("Red Affinity".to_string(), true)],
-        "the app still commits the call"
-    );
-    assert!(s.take_target_view_moved());
-    // The prefix tier needs no exact flag.
-    let guid = |s: &UiScript| {
-        s.model_ref()
-            .unit("target")
-            .map(|u| u.guid)
-            .expect("a target")
-    };
-    s.run("TargetByName('Red Affinity')").unwrap();
-    assert_eq!(guid(&s), 0x31);
-    // Two namesakes at one distance: the lower guid, whatever order the map walks in.
-    for (moved, at) in [(0x31, 100.0), (0x32, 100.0), (0x32, 25.0)] {
-        s.set_name_candidate_dist2(moved, at);
-    }
-    s.set_name_candidate(0x30, Some(candidate(0x30, "Red Affinity", 25.0)));
-    s.run("TargetByName('Red Affinity')").unwrap();
-    assert_eq!(guid(&s), 0x30, "a full tie goes to the lower guid");
-    s.set_name_candidate(0x30, None);
-    s.run("TargetByName('Red Affinity')").unwrap();
-    assert_eq!(guid(&s), 0x32, "the nearer namesake again");
-    s.run("TargetByName('redr')").unwrap();
-    assert_eq!(
-        guid(&s),
-        0x33,
-        "the longer prefix beats the nearer shorter one"
-    );
-    // A miss, an exact-only prefix and an empty name leave the view where it was.
-    for lua in [
-        "TargetByName('Nobody')",
-        "TargetByName('Red', 1)",
-        "TargetByName('  ')",
-    ] {
-        s.run(lua).unwrap();
-        assert_eq!(guid(&s), 0x33, "{lua}");
-    }
-}
-
-/// `ClearTarget` (`0x489ff0` → `0x493540(0,0)`) and `TargetUnit` (`0x4899d0`) commit before they
-/// return too; a token naming no held unit leaves the view alone, as the app's commit does.
-#[test]
-fn clear_target_and_target_unit_show_their_outcome_to_the_rest_of_the_chunk() {
-    let mut s = UiScript::new().unwrap();
-    s.set_unit_guids(&UnitGuids {
-        player: 0x10,
-        party: [0x22, 0x23, 0, 0],
-        target: 0x21,
-        ..Default::default()
-    });
-    let mut mate = candidate(0x22, "Bob", 9.0).state;
-    s.set_unit("party1", Some(mate.clone()));
-    // The by-name feed's snapshot of the same unit, which `TargetUnit` shows when it has one.
-    let mut fed = candidate(0x22, "Bob", 9.0);
-    fed.state.health = 45;
-    s.set_name_candidate(0x22, Some(fed));
-    mate.guid = 0x23;
-    mate.has_object = false;
-    s.set_unit("party2", Some(mate));
-    s.set_unit("target", Some(candidate(0x21, "Old Mob", 1.0).state));
-
-    assert!(s
-        .eval::<bool>("ClearTarget() return UnitExists('target') == nil")
-        .unwrap());
-    assert!(s.take_target_view_moved());
-    assert_eq!(
-        s.eval::<Option<String>>("TargetUnit('party2') return UnitName('target')")
-            .unwrap(),
-        None,
-        "party2 is not held: the view mirrors the app's commit, which selects no unheld unit"
-    );
-    assert!(!s.take_target_view_moved());
-    assert_eq!(
-        s.eval::<String>("TargetUnit('party1') return UnitName('target')")
-            .unwrap(),
-        "Bob"
-    );
-    assert!(s.take_target_view_moved());
-    assert_eq!(
-        s.eval::<i64>("return UnitHealth('target')").unwrap(),
-        45,
-        "party1 resolves to 0x22, and the feed's snapshot of 0x22 is the one shown"
-    );
-    assert_eq!(s.model_ref().unit_guids.target, 0x22);
-    s.set_name_candidate(0x22, None);
-    s.run("ClearTarget() TargetUnit('party1')").unwrap();
-    assert_eq!(
-        s.eval::<i64>("return UnitHealth('target')").unwrap(),
-        40,
-        "without a feed snapshot, the token's own push"
-    );
-}
-
-/// With the targeting cursor up `SelectTarget` binds the unit to the cast and returns before it
-/// selects (`0x4935ca`-`0x4935d5`), so `TargetUnit` and `TargetByName` show nothing moved to the rest
-/// of the chunk; with it down the same calls move the view.
-#[test]
-fn target_unit_and_by_name_leave_the_view_while_the_cursor_is_up() {
-    let script = |targeting| {
-        let mut s = UiScript::new().unwrap();
-        s.set_unit_guids(&UnitGuids {
-            player: 0x10,
-            party: [0x22, 0, 0, 0],
-            target: 0x21,
-            ..Default::default()
-        });
-        s.set_unit("party1", Some(candidate(0x22, "Bob", 9.0).state));
-        s.set_name_candidate(0x22, Some(candidate(0x22, "Bob", 9.0)));
-        s.set_unit("target", Some(candidate(0x21, "Old Mob", 1.0).state));
-        s.set_spell_targeting(targeting);
-        s
-    };
-    for lua in ["TargetUnit('party1')", "TargetByName('Bob')"] {
-        let mut up = script(true);
-        up.run(lua).unwrap();
-        assert_eq!(
-            up.eval::<String>("return UnitName('target')").unwrap(),
-            "Old Mob",
-            "{lua}"
-        );
-        assert!(!up.take_target_view_moved(), "{lua}");
-        assert_eq!(up.take_script_calls().len(), 1, "{lua}: still queued");
-
-        let down = script(false);
-        down.run(lua).unwrap();
-        assert_eq!(
-            down.eval::<String>("return UnitName('target')").unwrap(),
-            "Bob",
-            "{lua}"
-        );
-    }
-}
-
-/// A charmed player's `SelectTarget` returns before anything (`0x49359c`), a deselect included, so
-/// the three eager verbs show the rest of their chunk no change; an uncharmed player sees it.
-#[test]
-fn the_selection_verbs_leave_the_view_for_a_charmed_player() {
-    let script = |charmed| {
-        let mut s = UiScript::new().unwrap();
-        s.set_unit_guids(&UnitGuids {
-            player: 0x10,
-            party: [0x22, 0, 0, 0],
-            target: 0x21,
-            ..Default::default()
-        });
-        s.set_unit(
-            "player",
-            Some(UnitState {
-                exists: true,
-                charmed,
-                ..Default::default()
-            }),
-        );
-        s.set_unit("party1", Some(candidate(0x22, "Bob", 9.0).state));
-        s.set_name_candidate(0x22, Some(candidate(0x22, "Bob", 9.0)));
-        s.set_unit("target", Some(candidate(0x21, "Old Mob", 1.0).state));
-        s
-    };
-    for (lua, free) in [
-        (
-            "TargetUnit('party1') return UnitName('target')",
-            Some("Bob"),
-        ),
-        ("TargetByName('Bob') return UnitName('target')", Some("Bob")),
-        ("ClearTarget() return UnitName('target')", None),
-    ] {
-        let name = |charmed| script(charmed).eval::<Option<String>>(lua).unwrap();
-        assert_eq!(name(false).as_deref(), free, "{lua}: free");
-        assert_eq!(name(true).as_deref(), Some("Old Mob"), "{lua}: charmed");
-    }
-}
-
-/// `SetSelection` (`0x493540`) returns at its `IsSelectable` call (`0x4935ee`) and keeps the old
-/// target, while `TargetByName` ranks (`0x493aa0`, no selectable filter) before it: a
-/// non-selectable best pick leaves the view, though a selectable namesake farther off is ranked
-/// below it. The call still queues for the app's commit, which refuses it the same way.
-#[test]
-fn target_by_name_leaves_the_view_when_its_pick_is_not_selectable() {
-    const OLD: u64 = 0x21;
-    let mut s = UiScript::new().unwrap();
-    let old = candidate(OLD, "Old Mob", 1.0).state;
-    s.set_unit("target", Some(old));
-    s.set_name_candidate(0x31, Some(unselectable(0x31, "Red Affinity", 4.0)));
-    s.set_name_candidate(0x32, Some(candidate(0x32, "Red Affinity", 100.0)));
-    let guid = |s: &UiScript| s.model_ref().unit("target").map(|u| u.guid);
-
-    s.run("TargetByName('Red Affinity')").unwrap();
-    assert_eq!(
-        guid(&s),
-        Some(OLD),
-        "the nearer namesake is the pick, and it is refused"
-    );
-    assert!(!s.take_target_view_moved());
-    assert_eq!(
-        s.take_target_by_name_requests(),
-        vec![("Red Affinity".to_string(), false)],
-        "the call still queues for the app's commit"
-    );
-    // Once the nearer one is selectable the same walk shows it.
-    s.set_name_candidate(0x31, Some(candidate(0x31, "Red Affinity", 4.0)));
-    s.run("TargetByName('Red Affinity')").unwrap();
-    assert_eq!(guid(&s), Some(0x31));
-}
-
-/// `TargetUnit` (`0x4899d0` → `0x489a40`) selects through the same `SetSelection`: a held unit
-/// that is not selectable leaves the view, and does not fall back to the token's own push.
-#[test]
-fn target_unit_leaves_the_view_when_the_held_unit_is_not_selectable() {
+fn a_seated_selection_carries_its_target_of_target() {
     let mut s = UiScript::new().unwrap();
     s.set_unit_guids(&UnitGuids {
         player: 0x10,
@@ -1139,26 +978,149 @@ fn target_unit_leaves_the_view_when_the_held_unit_is_not_selectable() {
         target: 0x21,
         ..Default::default()
     });
-    s.set_unit("party1", Some(candidate(0x22, "Bob", 9.0).state));
-    s.set_unit("target", Some(candidate(0x21, "Old Mob", 1.0).state));
-    s.set_name_candidate(0x22, Some(unselectable(0x22, "Bob", 9.0)));
+    let mut mate = candidate(0x22, "Bob", 9.0).state;
+    mate.has_object = false;
+    s.set_unit("party1", Some(mate));
+    s.set_unit("targettarget", Some(candidate(0x50, "Stale", 1.0).state));
+    s.set_name_candidate(0x31, Some(candidate(0x31, "Red Affinity", 4.0)));
+    s.set_name_candidate(0x32, Some(candidate(0x32, "Blue Whelp", 4.0)));
+    let tot = |s: &UiScript| {
+        s.eval::<Option<String>>("return UnitName('targettarget')")
+            .unwrap()
+    };
 
-    s.run("TargetUnit('party1')").unwrap();
+    s.seat_selection(Some(crate::script::SeatedSelection {
+        guid: 0x31,
+        held: true,
+        target: 0x32,
+        target_held: true,
+    }));
+    assert_eq!(tot(&s).as_deref(), Some("Blue Whelp"), "a held hop");
+
+    s.seat_selection(Some(crate::script::SeatedSelection {
+        guid: 0x31,
+        held: true,
+        target: 0x22,
+        target_held: false,
+    }));
+    assert_eq!(tot(&s).as_deref(), Some("Bob"), "an unheld groupmate");
+
+    s.seat_selection(Some(alone(0x32)));
+    assert!(s
+        .eval::<bool>("return UnitExists('targettarget') == nil")
+        .unwrap());
+    s.seat_selection(None);
+    assert!(s
+        .eval::<bool>("return UnitExists('targettarget') == nil")
+        .unwrap());
+}
+
+/// Every selecting verb commits through `SetSelection 0x493540` before it returns, and the host
+/// seats the selection it committed as `"target"` for the rest of the chunk: the unit's by-name
+/// snapshot, else a pushed snapshot of its guid, else the unit as its guid alone, and nothing for a
+/// deselect. Each seat tells the feed to re-push `"target"` from the committed selection.
+#[test]
+fn a_seated_selection_is_the_target_for_the_rest_of_the_chunk() {
+    let mut s = UiScript::new().unwrap();
+    s.set_unit_guids(&UnitGuids {
+        player: 0x10,
+        party: [0x22, 0, 0, 0],
+        target: 0x21,
+        ..Default::default()
+    });
+    s.set_unit("target", Some(candidate(0x21, "Old Mob", 1.0).state));
+    let mut mate = candidate(0x22, "Bob", 9.0).state;
+    mate.health = 45;
+    s.set_unit("party1", Some(mate));
+    s.set_name_candidate(0x31, Some(candidate(0x31, "Red Affinity", 4.0)));
+    assert!(!s.take_target_view_moved());
+    let health = |s: &UiScript| s.eval::<i64>("return UnitHealth('target')").unwrap();
+
+    s.seat_selection(Some(alone(0x31)));
+    assert_eq!(
+        s.eval::<String>("return UnitName('target')").unwrap(),
+        "Red Affinity"
+    );
+    assert_eq!(
+        health(&s),
+        40,
+        "the pick's whole snapshot, not only its name"
+    );
+    assert_eq!(s.model_ref().unit_guids.target, 0x31);
+    assert!(s.take_target_view_moved());
+
+    s.seat_selection(Some(alone(0x22)));
+    assert_eq!(
+        health(&s),
+        45,
+        "no candidate: party1's push of the same guid"
+    );
+
+    s.seat_selection(Some(alone(0x40)));
+    assert!(s.eval::<bool>("return UnitExists('target') == 1").unwrap());
     assert_eq!(
         s.model_ref().unit("target").map(|u| u.guid),
-        Some(0x21),
-        "the old target stays"
+        Some(0x40),
+        "neither: the unit as its guid alone"
     );
-    assert_eq!(s.model_ref().unit_guids.target, 0x21);
+
+    s.seat_selection(None);
+    assert!(s
+        .eval::<bool>("return UnitExists('target') == nil")
+        .unwrap());
+    assert_eq!(s.model_ref().unit_guids.target, 0);
+    assert!(s.take_target_view_moved());
+}
+
+/// Seating the unit the feed's own `"target"` push already shows keeps that push (here, a health
+/// the candidate's does not share), and the view has not moved.
+#[test]
+fn seating_the_shown_target_keeps_the_feeds_push() {
+    let mut s = UiScript::new().unwrap();
+    s.set_unit_guids(&UnitGuids {
+        player: 0x10,
+        target: 0x21,
+        ..Default::default()
+    });
+    let mut fed = candidate(0x21, "Old Mob", 1.0).state;
+    fed.health = 12;
+    s.set_unit("target", Some(fed));
+    s.set_name_candidate(0x21, Some(candidate(0x21, "Old Mob", 1.0)));
+    s.seat_selection(Some(alone(0x21)));
+    assert_eq!(s.eval::<i64>("return UnitHealth('target')").unwrap(), 12);
     assert!(!s.take_target_view_moved());
-    assert_eq!(
-        s.take_script_calls().len(),
-        1,
-        "the call still queues for the app's commit"
-    );
+}
+
+/// With no host to commit them, the selecting verbs move nothing: the VM never guesses a
+/// selection, which only the host's commit seats ([`UiScript::seat_selection`]).
+#[test]
+fn a_selecting_verb_with_no_host_leaves_the_target_alone() {
+    let mut s = UiScript::new().unwrap();
+    s.keep_calls();
+    s.set_unit_guids(&UnitGuids {
+        player: 0x10,
+        party: [0x22, 0, 0, 0],
+        target: 0x21,
+        ..Default::default()
+    });
+    s.set_unit("party1", Some(candidate(0x22, "Bob", 9.0).state));
     s.set_name_candidate(0x22, Some(candidate(0x22, "Bob", 9.0)));
-    s.run("TargetUnit('party1')").unwrap();
-    assert_eq!(s.model_ref().unit("target").map(|u| u.guid), Some(0x22));
+    s.set_unit("target", Some(candidate(0x21, "Old Mob", 1.0).state));
+    for lua in [
+        "TargetUnit('party1')",
+        "TargetByName('Bob')",
+        "ClearTarget()",
+    ] {
+        assert_eq!(
+            s.eval::<Option<String>>(&format!("{lua} return UnitName('target')"))
+                .unwrap()
+                .as_deref(),
+            Some("Old Mob"),
+            "{lua}"
+        );
+        assert_eq!(s.take_script_calls().len(), 1, "{lua}: kept for a host");
+    }
+    assert!(!s.take_target_view_moved());
 }
 
 /// `0x516cf0` tests `UNIT_FIELD_CHARMEDBY` (fields 10-11) non-zero, not a `UNIT_FIELD_FLAGS` bit.
@@ -1961,9 +1923,10 @@ fn every_unit_predicate_is_one_or_nil_and_never_a_boolean() {
                 ..Default::default()
             },
         ),
+        // The GUID leg: the mouseover, seated on both legs, shares the live target's GUID.
         (
             "UnitIsUnit",
-            r#"UnitIsUnit("target", "target")"#,
+            r#"UnitIsUnit("target", "mouseover")"#,
             UnitState {
                 exists: true,
                 guid: 42,
@@ -1972,9 +1935,15 @@ fn every_unit_predicate_is_one_or_nil_and_never_a_boolean() {
         ),
     ];
 
+    let mouseover = || UnitState {
+        exists: true,
+        guid: 42,
+        ..Default::default()
+    };
     for (name, call, live) in table {
         let mut s = UiScript::new().unwrap();
         s.set_unit("player", Some(player()));
+        s.set_unit("mouseover", Some(mouseover()));
         s.set_unit("target", Some(live));
 
         assert_eq!(
@@ -2004,6 +1973,7 @@ fn every_unit_predicate_is_one_or_nil_and_never_a_boolean() {
         // The false leg: nil, one value. Clearing the token also covers the absent-unit arm.
         let mut s = UiScript::new().unwrap();
         s.set_unit("player", Some(player()));
+        s.set_unit("mouseover", Some(mouseover()));
         s.set_unit("target", None);
 
         assert!(

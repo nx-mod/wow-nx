@@ -8,15 +8,13 @@ use benilla_formats::{load_faction_catalog, FactionCatalog, Reaction};
 use benilla_protocol::EntityKind;
 use bevy::prelude::*;
 
-use crate::net::{Guid, NetEntity, ObjectStore, SelfPlayer};
+use crate::net::{Guid, NetEntity, ObjectStore};
 use benilla_assets::{LockRecover, WorldAssets};
 use benilla_world::decal::{DecalFrame, WorldDecal};
 use benilla_world::particles::buffer::EffectVertex;
 
-use super::click::{clear, deselect};
 use super::relations::{RelUnit, RelationWorld, Relations};
 use super::{CombatFlash, Selection, SelectionRadius};
-use crate::creature_anim::Engaged;
 use benilla_world::view::WorldCamera;
 
 /// The ring record: `verts` is rebuilt when the [`RingKey`] changes, `color` every frame.
@@ -234,7 +232,7 @@ pub(super) fn load_factions(mut commands: Commands, world_assets: Option<Res<Wor
 /// change live.
 #[allow(clippy::type_complexity)]
 pub(super) fn update_ring(
-    mut selection: ResMut<Selection>,
+    selection: Res<Selection>,
     world: RelationWorld,
     flash: Res<CombatFlash>,
     mut state: ResMut<RingState>,
@@ -243,10 +241,6 @@ pub(super) fn update_ring(
     // Kept so a straight-down camera holds the last fade angle.
     mut fade_angle: Local<f32>,
     mut logged_guid: Local<Option<u64>>,
-    // Last frame's (guid, dead), tracked every frame: a respawned creature reuses its guid, so
-    // state armed only on a selection change would miss its second death.
-    mut last_vitals: Local<Option<(u64, bool)>>,
-    mut seam: crate::creature_anim::AttackSeam,
     // Net entities are roots, so `Transform` is this frame's world position. `.0` filters on
     // `Guid`, which a torn-down unit sheds at the teardown while its model fades on. `.1` gives a
     // mounted target the mount model's footprint at its rendered scale, as the reference's ring
@@ -266,13 +260,10 @@ pub(super) fn update_ring(
         // The party roster: the selector's party table `0xbc6f48`.
         Res<crate::ui_party::GroupState>,
     ),
-    // Our auto-attack; both clear paths end it, as the reference's death and teardown edges do.
-    engaged: Query<(), (With<Engaged>, With<SelfPlayer>)>,
 ) {
     let state = &mut *state;
     let hide = match selection.target {
         None => {
-            *last_vitals = None;
             *logged_guid = None;
             true
         }
@@ -313,22 +304,6 @@ pub(super) fn update_ring(
                     .guid
                     .is_some_and(|g| targets.2.members.iter().any(|m| m.guid == g));
                 let is_dead = store.is_some_and(|s| s.0.unit_is_dead());
-                // The alive-to-dead edge clears the target, as the reference's health handler does
-                // (`0x6046f0` fires `0x605860`, which sends `CMSG_SET_SELECTION 0`); a corpse
-                // selected afterwards stays selected, gray.
-                let died = is_dead
-                    && selection
-                        .guid
-                        .is_some_and(|g| *last_vitals == Some((g, false)));
-                *last_vitals = selection.guid.map(|g| (g, is_dead));
-                if died {
-                    // `SetSelection(0,0)` at `0x605901`, so the dead target becomes the last one.
-                    deselect(&mut selection, &mut seam, !engaged.is_empty());
-                    *last_vitals = None;
-                    state.shown = false;
-                    state.verts.clear();
-                    return;
-                }
                 if selection.guid != *logged_guid {
                     *logged_guid = selection.guid;
                     info!(
@@ -357,12 +332,9 @@ pub(super) fn update_ring(
                 // No ground in the box hides the ring: the reference skips the draw (`0x6d74b5`).
                 !projected
             }
-            // No longer an object: clear and tell the server, as the reference's deactivate does on
-            // both removal paths (`0x5fbb60` → `0x493910`). This also drops a selected corpse at
-            // respawn, which the server destroys before the fresh create.
+            // No longer an object: nothing to draw. The selection's own teardown is the net stage's
+            // (`track::follow_selection_object`).
             Err(_) => {
-                clear(&mut selection, &mut seam, !engaged.is_empty());
-                *last_vitals = None;
                 *logged_guid = None;
                 true
             }
@@ -820,14 +792,17 @@ mod tests {
                 ))
                 .id();
             world.resource_mut::<GuidIndex>().0.insert(ME, me);
-            crate::net::handlers::dispatch(world, vec![create(MOB)]);
+            crate::net::handlers::dispatch(world, crate::net::wire(vec![create(MOB)]));
             let mob = world.resource::<GuidIndex>().0[&MOB];
             *world.resource_mut::<Selection>() = Selection {
                 target: Some(mob),
                 guid: Some(MOB),
                 ..Default::default()
             };
-            // Control: a live target keeps its selection through a ring pass.
+            // Control: a live target keeps its selection through the tracker and a ring pass.
+            world
+                .run_system_once(super::super::super::track::follow_selection_object)
+                .expect("the tracker runs on the built client");
             world
                 .run_system_once(super::super::update_ring)
                 .expect("the ring runs on the built client");
@@ -844,15 +819,15 @@ mod tests {
         fn selection_cleared_at(teardown: SessionEvent) {
             let (mut app, mob, rx) = client_with_selected_mob();
             let world = app.world_mut();
-            crate::net::handlers::dispatch(world, vec![teardown]);
+            crate::net::handlers::dispatch(world, crate::net::wire(vec![teardown]));
             assert!(
                 world.get_entity(mob).is_ok(),
                 "the model outlives the object"
             );
             assert!(world.get::<DespawnFade>(mob).is_some(), "…and fades");
             world
-                .run_system_once(super::super::update_ring)
-                .expect("the ring runs on the built client");
+                .run_system_once(super::super::super::track::follow_selection_object)
+                .expect("the tracker runs on the built client");
             let sel = world.resource::<Selection>();
             assert_eq!(
                 (sel.target, sel.guid),
@@ -889,8 +864,8 @@ mod tests {
                         |mut pick: AttackPick,
                          mut sel: ResMut<Selection>,
                          mut seam: crate::creature_anim::AttackSeam,
-                         mut errors: ResMut<crate::ui_action::UiErrorKeys>| {
-                            pick.target(None, true, &mut sel, &mut seam, &mut errors)
+                         errors: Res<crate::ui_action::UiErrorKeys>| {
+                            pick.target(None, true, &mut sel, &mut seam, &errors)
                         },
                     )
                     .expect("the scan runs on the built client")
@@ -900,7 +875,10 @@ mod tests {
                 Some(MOB),
                 "control: the live mob is acquired"
             );
-            crate::net::handlers::dispatch(world, vec![SessionEvent::ObjectsRemoved(vec![MOB])]);
+            crate::net::handlers::dispatch(
+                world,
+                crate::net::wire(vec![SessionEvent::ObjectsRemoved(vec![MOB])]),
+            );
             assert_eq!(acquire(world), None, "the fading model is not a candidate");
         }
 
@@ -912,7 +890,7 @@ mod tests {
             let world = app.world_mut();
             crate::net::handlers::dispatch(
                 world,
-                vec![SessionEvent::ObjectDestroyed(MOB), create(MOB)],
+                crate::net::wire(vec![SessionEvent::ObjectDestroyed(MOB), create(MOB)]),
             );
             let fresh = world.resource::<GuidIndex>().0[&MOB];
             assert_ne!(fresh, old, "a fresh entity for the fresh object");

@@ -118,6 +118,9 @@ pub(crate) struct Row {
     /// registration keeps it (`0x63dc6c`); else the first value the CVar's own console command
     /// stored (`0x63de23`); else none, and the default stands in.
     pub(crate) reset: Option<String>,
+    /// The engine's value shown over the player's, `(shown, held)` ([`Cvars::show`]): the save
+    /// writes `held` while `value` is still `shown`.
+    overlay: Option<(String, String)>,
 }
 
 /// What a write did.
@@ -212,6 +215,7 @@ impl Cvars {
                 latched: r.latched,
                 check: r.check,
                 reset: None,
+                overlay: None,
             });
         }
         cvars
@@ -556,6 +560,7 @@ impl Cvars {
             check: None,
             // The saved value is the reset text of the record its line made.
             reset: saved,
+            overlay: None,
         });
     }
 
@@ -721,7 +726,12 @@ impl Cvars {
                 .keys()
                 .find(|k| k.eq_ignore_ascii_case(&row.name))
                 .cloned();
-            let text = row.pending.as_ref().unwrap_or(&row.value);
+            let held = row
+                .overlay
+                .as_ref()
+                .filter(|(shown, _)| *shown == row.value)
+                .map(|(_, held)| held);
+            let text = row.pending.as_ref().or(held).unwrap_or(&row.value);
             // `SaveConfig` skips a value equal to its default case-blind (`0x63da4a`).
             if same_text(text, &row.default) {
                 if let Some(k) = existing {
@@ -732,6 +742,48 @@ impl Cvars {
             }
         }
         out
+    }
+
+    /// The engine's value [`Self::show`] put over a row, while the row still answers it.
+    pub(crate) fn shown(&self, name: &str) -> Option<&str> {
+        let row = self.row(name)?;
+        row.overlay
+            .as_ref()
+            .filter(|(shown, _)| *shown == row.value)
+            .map(|(shown, _)| shown.as_str())
+    }
+
+    /// Show the engine's own value for a row over the player's, or end it with `None`: what the
+    /// row answers (`GetCVar`, the console, a new VM's mirror) is the shown value, the save writes
+    /// the player's, and nothing fires, as the engine already applied it. A write that moves the
+    /// row off the shown value is the player's own and ends the overlay; the next show holds it.
+    pub(crate) fn show(&mut self, name: &str, shown: Option<&str>) {
+        let Some(i) = self.slot(name) else {
+            warn!("cvar {name}: not registered — shown value ignored");
+            return;
+        };
+        let row = &mut self.rows[i];
+        // An overlay a write has moved the row off holds nothing any more.
+        if row
+            .overlay
+            .as_ref()
+            .is_some_and(|(was, _)| *was != row.value)
+        {
+            row.overlay = None;
+        }
+        let next = match (shown, row.overlay.take()) {
+            (Some(shown), held) => {
+                let held = held.map_or_else(|| row.value.clone(), |(_, held)| held);
+                row.overlay = Some((shown.to_string(), held));
+                shown.to_string()
+            }
+            (None, Some((_, held))) => held,
+            (None, None) => return,
+        };
+        if row.value != next {
+            row.value = next;
+            self.outbox.push((row.name.clone(), row.value.clone()));
+        }
     }
 
     /// The account name earlier builds kept in a file of its own
@@ -808,8 +860,15 @@ impl Plugin for CvarPlugin {
             )
             // After the tick, so a `SetCVar` from this frame reaches the registry and its observers
             // before the frame's drains; `video::drain_restart_gx` orders after this so the commit
-            // finds the stage.
-            .add_systems(Update, sync_cvars.after(crate::ui_script::UiInput))
+            // finds the stage. Before the world's input stage, so the observers run ahead of the
+            // camera's controller: the reference calls the change callback inside the call
+            // (`CVar::Set` `0x63df50`, `0x63df7d`).
+            .add_systems(
+                Update,
+                sync_cvars
+                    .in_set(crate::ui_script::UiDrain)
+                    .before(benilla_world::schedule::WorldStage::Input),
+            )
             // In `Last`, after every `Update` writer of the registry, so the save reads the frame's
             // settled state; before the exit flush, which finds it clean on a quiet exit frame.
             .add_systems(
@@ -978,92 +1037,94 @@ pub(crate) fn boot_cvar(name: &str) -> Option<String> {
 /// Per frame: seed a new VM's mirror, drain its registrations and writes into the registry, push
 /// the registry's writes into the mirror, and trigger every accepted move.
 pub(crate) fn sync_cvars(
-    script: Option<NonSendMut<UiScript>>,
+    mut hosted_vm: crate::script_calls::HostedVm,
     mut cvars: ResMut<Cvars>,
     adapter: Option<Res<bevy::render::renderer::RenderAdapterInfo>>,
     msaa_formats: Option<Res<benilla_world::view::MsaaFormats>>,
     mut seeded: Local<VmMemo<bool>>,
     mut commands: Commands,
 ) {
-    // The live render backend; absent headless, where the registered `""` stands.
-    if let Some(adapter) = adapter.as_deref() {
-        let backend = adapter.backend.to_str();
-        if cvars.get("gxApi") != Some(backend) {
-            cvars.own_for_session("gxApi", Some(backend));
+    hosted_vm.run(|script| {
+        // The live render backend; absent headless, where the registered `""` stands.
+        if let Some(adapter) = adapter.as_deref() {
+            let backend = adapter.backend.to_str();
+            if cvars.get("gxApi") != Some(backend) {
+                cvars.own_for_session("gxApi", Some(backend));
+            }
         }
-    }
-    if cvars.has_console_lines() {
-        cvars.log_console_lines();
-    }
-    let Some(mut script) = script else {
-        // Nothing to mirror into; a later VM is seeded from the table, which carries it all.
+        if cvars.has_console_lines() {
+            cvars.log_console_lines();
+        }
+        let Some(script) = script else {
+            // Nothing to mirror into; a later VM is seeded from the table, which carries it all.
+            if cvars.has_outbox() {
+                cvars.take_outbox();
+            }
+            if cvars.has_events() {
+                for event in cvars.take_events() {
+                    commands.trigger(event);
+                }
+            }
+            return;
+        };
+        // The VM's writes before the seed: an addon's `SetCVar` at load is already queued, and
+        // seeding first would overwrite the mirror with the older value. Read before taking, so a
+        // quiet frame never deref-muts the registry.
+        if script.has_cvar_traffic() || script.cvar_lua_created() != cvars.lua_created {
+            cvars.drain_vm(script);
+            cvars.log_console_lines();
+        }
+        if seeded.claim(script) {
+            cvars.seed_vm(script);
+            if cvars.has_outbox() {
+                cvars.take_outbox(); // the seed just carried everything
+            }
+            // The Video dropdown's menu: what this device accepts, enumerated by
+            // `view::MsaaSupportPlugin`.
+            script.set_multisample_formats(
+                msaa_formats
+                    .as_deref()
+                    .map(|f| {
+                        f.formats
+                            .iter()
+                            .map(|&(color_bits, depth_bits, samples)| {
+                                benilla_ui::script::MultisampleFormat {
+                                    color_bits,
+                                    depth_bits,
+                                    samples,
+                                }
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            );
+            // `GetVideoCaps`, the seven values `OptionsFrame_Load` destructures. Shaders,
+            // trilinear, anisotropy and the hardware cursor are always there (`crate::cursor`
+            // composites the reference's cursors into an OS cursor); `max_anisotropy` is reported
+            // raw because `OptionsFrame.lua:122` matches it against `ANISOTROPIC_VALUES`. Triple
+            // buffering is false: wgpu owns the surface's buffering, so the stock frame hides check
+            // button 13 (`OptionsFrame.lua:163-165`).
+            script.set_video_caps(benilla_ui::script::VideoCaps {
+                anisotropic: true,
+                pixel_shaders: true,
+                vertex_shaders: true,
+                trilinear: true,
+                triple_buffering: false,
+                max_anisotropy: *benilla_assets::ANISO_RANGE.end(),
+                hardware_cursor: true,
+            });
+        }
         if cvars.has_outbox() {
-            cvars.take_outbox();
+            for (name, value) in cvars.take_outbox() {
+                script.set_cvar_host(&name, &value);
+            }
         }
         if cvars.has_events() {
             for event in cvars.take_events() {
                 commands.trigger(event);
             }
         }
-        return;
-    };
-    // The VM's writes before the seed: an addon's `SetCVar` at load is already queued, and seeding
-    // first would overwrite the mirror with the older value. Read before taking, so a quiet frame
-    // never deref-muts the registry.
-    if script.has_cvar_traffic() || script.cvar_lua_created() != cvars.lua_created {
-        cvars.drain_vm(&mut script);
-        cvars.log_console_lines();
-    }
-    if seeded.claim(&script) {
-        cvars.seed_vm(&mut script);
-        if cvars.has_outbox() {
-            cvars.take_outbox(); // the seed just carried everything
-        }
-        // The Video dropdown's menu: what this device accepts, enumerated by
-        // `view::MsaaSupportPlugin`.
-        script.set_multisample_formats(
-            msaa_formats
-                .as_deref()
-                .map(|f| {
-                    f.formats
-                        .iter()
-                        .map(|&(color_bits, depth_bits, samples)| {
-                            benilla_ui::script::MultisampleFormat {
-                                color_bits,
-                                depth_bits,
-                                samples,
-                            }
-                        })
-                        .collect()
-                })
-                .unwrap_or_default(),
-        );
-        // `GetVideoCaps`, the seven values `OptionsFrame_Load` destructures. Shaders, trilinear,
-        // anisotropy and the hardware cursor are always there (`crate::cursor` composites the
-        // reference's cursors into an OS cursor); `max_anisotropy` is reported raw because
-        // `OptionsFrame.lua:122` matches it against `ANISOTROPIC_VALUES`. Triple buffering is
-        // false: wgpu owns the surface's buffering, so the stock frame hides check button 13
-        // (`OptionsFrame.lua:163-165`).
-        script.set_video_caps(benilla_ui::script::VideoCaps {
-            anisotropic: true,
-            pixel_shaders: true,
-            vertex_shaders: true,
-            trilinear: true,
-            triple_buffering: false,
-            max_anisotropy: *benilla_assets::ANISO_RANGE.end(),
-            hardware_cursor: true,
-        });
-    }
-    if cvars.has_outbox() {
-        for (name, value) in cvars.take_outbox() {
-            script.set_cvar_host(&name, &value);
-        }
-    }
-    if cvars.has_events() {
-        for event in cvars.take_events() {
-            commands.trigger(event);
-        }
-    }
+    })
 }
 
 /// Fold the dying VM's last writes into the registry. Called from
@@ -1576,6 +1637,11 @@ mod tests {
         let mut app = cvar_app();
         apply(&mut app, "MusicVolume", "0.7");
         assert_eq!(res::<SoundConfig>(&app).music, 0.7);
+        // `widescreen`'s integer, as `0x48bcac` and `0x4901e0` read it.
+        apply(&mut app, "widescreen", "0");
+        assert!(!res::<crate::video::Widescreen>(&app).0);
+        apply(&mut app, "widescreen", "2");
+        assert!(res::<crate::video::Widescreen>(&app).0);
         // A string row reaches its knob; a value that is not an address leaves the knob alone.
         apply(&mut app, "realmList", "logon.example.org:3724");
         assert_eq!(
@@ -2302,6 +2368,32 @@ mod tests {
         assert_eq!(out.get("FutureKnob").map(String::as_str), Some("3"));
     }
 
+    /// `gamma` registers `"1.0"` (`0x402d70`, string `0x82e92c`): a fresh `GetCVar` and
+    /// `GetCVarDefault` answer that text. `SetGamma` writes `"%f"` of `1 - v` (`0x4891f0`), so a
+    /// slider left at its centre reads `"1.000000"`, which `SaveConfig` (`0x63da4a`) finds unequal
+    /// to the default and writes, as the reference does.
+    #[test]
+    fn gamma_answers_the_registered_string_until_the_setter_spells_it_with_six_decimals() {
+        let mut cvars = Cvars::default();
+        assert_eq!(cvars.get("gamma"), Some("1.0"));
+        let mut script = UiScript::new().expect("VM");
+        script.seed_cvars(cvars.vm_seed());
+        let text = |script: &UiScript, code: &str| script.eval::<String>(code).unwrap();
+        assert_eq!(text(&script, r#"return GetCVar("gamma")"#), "1.0");
+        assert_eq!(text(&script, r#"return GetCVarDefault("gamma")"#), "1.0");
+        assert_eq!(script.eval::<f64>("return GetGamma()").unwrap(), 0.0);
+        script.run("SetGamma(0)").unwrap();
+        assert_eq!(text(&script, r#"return GetCVar("gamma")"#), "1.000000");
+        assert_eq!(text(&script, r#"return GetCVarDefault("gamma")"#), "1.0");
+        for (name, value) in script.take_cvar_changes() {
+            cvars.set_from_vm(&name, &value);
+        }
+        assert_eq!(
+            cvars.compose().get("gamma").map(String::as_str),
+            Some("1.000000")
+        );
+    }
+
     /// A reference CVar nothing here reads (pfUI's afkcam sets `cameraCustomViewSmoothing`,
     /// `0x50bad0`) is found by Lua's lookup, so `SetCVar` neither raises nor warns; it persists as
     /// a diff like any row, and its flag-bit1 neighbour stays latched.
@@ -2590,6 +2682,7 @@ mod tests {
             .init_resource::<benilla_world::weather::WeatherState>()
             .init_resource::<benilla_world::particles::ParticleTuning>()
             .init_resource::<crate::video::SpellEffectLevel>()
+            .init_resource::<crate::video::Widescreen>()
             .init_resource::<crate::ui_gamma::DisplayGamma>()
             .init_resource::<ClickConfig>()
             .init_resource::<crate::target::AssistAttack>()
@@ -2711,6 +2804,65 @@ mod tests {
             world.trigger(event);
         }
         outcome
+    }
+
+    /// An engine value shown over a row (`gxResolution` in fullscreen, the screen's own size) is
+    /// what `GetCVar`, the console and a new VM read, fires nothing, and leaves the player's value
+    /// for the save; a player write replaces the held value, and ending the overlay brings the
+    /// held value back.
+    #[test]
+    fn a_shown_value_answers_and_the_held_one_saves() {
+        let mut cvars = registry(&[("gxResolution", "1280x720")]);
+        cvars.take_events();
+        cvars.show("gxResolution", Some("2880x1800"));
+        assert_eq!(cvars.get("gxResolution"), Some("2880x1800"));
+        assert!(!cvars.has_events(), "the engine's value fires no callback");
+        assert_eq!(
+            cvars.compose().get("gxResolution").map(String::as_str),
+            Some("1280x720")
+        );
+        let mut script = UiScript::new().unwrap();
+        cvars.seed_vm(&mut script);
+        assert_eq!(script.cvar("gxResolution").as_deref(), Some("2880x1800"));
+        assert_eq!(cvars.set("gxResolution", "1024x768"), SetOutcome::Staged);
+        assert_eq!(cvars.commit_latched(), 1);
+        assert_eq!(cvars.get("gxResolution"), Some("1024x768"));
+        cvars.show("gxResolution", Some("2880x1800"));
+        assert_eq!(
+            cvars.compose().get("gxResolution").map(String::as_str),
+            Some("1024x768"),
+            "the player's write is what saves"
+        );
+        cvars.show("gxResolution", None);
+        assert_eq!(cvars.get("gxResolution"), Some("1024x768"));
+        cvars.show("gxResolution", None);
+        assert_eq!(cvars.get("gxResolution"), Some("1024x768"));
+    }
+
+    /// `ffx`, `ffxGlow`, `ffxDeath` and `ffxRectangle` share the change callback `0x6cde30`: the
+    /// value's `atoi` (`0x41449c`), "enabled" (`0x853764`) when nonzero, else "disabled"
+    /// (`0x853758`), and the write taken (`mov al,1`), on the console write, `SetCVar` and the
+    /// host's own writes alike.
+    #[test]
+    fn the_ffx_rows_echo_their_state() {
+        let mut cvars = registry(&[]);
+        let mut script = UiScript::new().unwrap();
+        cvars.seed_vm(&mut script);
+        script
+            .run(
+                r#"ConsoleExec("ffxGlow 0") SetCVar("ffxDeath", " +2") ConsoleExec("ffx abc")
+                   SetCVar("ffxRectangle", "0")"#,
+            )
+            .unwrap();
+        assert_eq!(script.cvar("ffxGlow").as_deref(), Some("0"));
+        assert_eq!(script.cvar("ffx").as_deref(), Some("abc"));
+        cvars.drain_vm(&mut script);
+        assert_eq!(cvars.get("ffxDeath"), Some(" +2"));
+        cvars.set("ffxGlow", "1");
+        assert_eq!(
+            cvars.take_console_lines(),
+            ["disabled", "enabled", "disabled", "disabled", "enabled"]
+        );
     }
 
     /// `ConsoleExec(line)` as the typed `/console` runs it: on a VM seeded from the app's registry,
@@ -3017,7 +3169,7 @@ mod tests {
         // A latched row outside the gx set is not the video restart's to commit.
         assert_eq!(cvars.set("SoundBufferSize", "200"), SetOutcome::Staged);
         assert_eq!(cvars.commit_latched(), 0);
-        assert_eq!(cvars.get("SoundBufferSize"), Some("100"));
+        assert_eq!(cvars.get("SoundBufferSize"), Some("50"));
         assert_eq!(
             cvars.row("SoundBufferSize").unwrap().pending.as_deref(),
             Some("200")
@@ -3326,10 +3478,6 @@ mod tests {
             (
                 "statusBarText",
                 "TextStatusBar.lua reads it on each CVAR_UPDATE",
-            ),
-            (
-                "UberTooltips",
-                "GameTooltip's binding-line gate, stock and pfUI",
             ),
             ("gxApi", "pfUI's system tooltip names the backend"),
             (

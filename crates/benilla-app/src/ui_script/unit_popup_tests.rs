@@ -88,6 +88,7 @@ fn bake_strings(s: &UiScript) {
 fn chat_name_right_click_opens_the_invite_menu() {
     let _data = benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     bake_strings(&s);
     load_popup_frames(&s);
@@ -172,6 +173,7 @@ fn ally(s: &mut UiScript) {
 fn solo_target_right_click_invites_a_player() {
     let _data = benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     bake_strings(&s);
     load_popup_frames(&s);
@@ -203,6 +205,12 @@ fn solo_target_right_click_invites_a_player() {
         }),
     );
     ally(&mut s);
+    // The resolver's inputs, which `InviteToParty` reads the token through (`0x48a3ed`).
+    s.set_unit_guids(&benilla_ui::script::UnitGuids {
+        player: 1,
+        target: 2,
+        ..Default::default()
+    });
     s.fire_event("PLAYER_TARGET_CHANGED", vec![]);
     s.resolve();
     assert!(s.errors().is_empty(), "load errors: {:?}", s.errors());
@@ -250,7 +258,7 @@ fn solo_target_right_click_invites_a_player() {
         "Duel"
     );
 
-    // Click Invite → UnitPopup_OnClick → InviteToParty("target") → InviteUnit.
+    // Click Invite → UnitPopup_OnClick → InviteToParty("target") → the target's guid.
     let (ix, iy) = s
         .eval::<(f64, f64)>("return DropDownList1Button4:GetCenter()")
         .unwrap();
@@ -258,8 +266,8 @@ fn solo_target_right_click_invites_a_player() {
     s.mouse_button(ix as f32, iy as f32, "LeftButton", false);
     assert_eq!(
         s.take_party_requests(),
-        vec![PartyRequest::InviteUnit("target".into())],
-        "Invite on a player target queues an invite by unit"
+        vec![PartyRequest::InviteGuid(2)],
+        "Invite on a player target queues an invite by its guid"
     );
     assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
 }
@@ -269,6 +277,12 @@ fn solo_target_right_click_invites_a_player() {
 fn solo_target_trade_click_queues_an_initiate() {
     let _data = benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
+    s.set_unit_guids(&benilla_ui::script::UnitGuids {
+        player: 1,
+        target: 2,
+        ..Default::default()
+    });
     s.set_screen_size(1024.0, 768.0);
     bake_strings(&s);
     load_popup_frames(&s);
@@ -323,9 +337,9 @@ fn solo_target_trade_click_queues_an_initiate() {
     s.mouse_button(tx as f32, ty as f32, "LeftButton", true);
     s.mouse_button(tx as f32, ty as f32, "LeftButton", false);
     assert_eq!(
-        s.take_trade_initiates(),
-        vec!["target".to_string()],
-        "clicking Trade queues an initiate against the target token"
+        s.take_trade_calls(),
+        [benilla_ui::script::TradeCall::Initiate(2)],
+        "clicking Trade initiates with the guid the target token names"
     );
     assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
 }
@@ -336,6 +350,7 @@ fn solo_target_trade_click_queues_an_initiate() {
 fn solo_target_follow_click_queues_an_exact_by_name_follow() {
     let _data = benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     bake_strings(&s);
     load_popup_frames(&s);
@@ -405,6 +420,7 @@ fn solo_target_follow_click_queues_an_exact_by_name_follow() {
 fn solo_target_inspect_click_reaches_inspect_unit() {
     let _data = benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     bake_strings(&s);
     load_popup_frames(&s);
@@ -595,6 +611,7 @@ fn right_click_the_pet_frame(s: &mut UiScript) {
 fn the_pet_menu_forks_between_abandon_and_dismiss() {
     let _data = benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     bake_pet_strings(&s);
     load_pet_menu_frames(&s);
@@ -663,6 +680,7 @@ fn the_pet_menu_forks_between_abandon_and_dismiss() {
 fn dismiss_sends_immediately_and_abandon_waits_for_the_confirm() {
     let _data = benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     bake_pet_strings(&s);
     load_pet_menu_frames(&s);
@@ -715,6 +733,7 @@ fn dismiss_sends_immediately_and_abandon_waits_for_the_confirm() {
 fn renaming_a_pet_reads_the_name_back_before_sending_it() {
     let _data = benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     bake_pet_strings(&s);
     load_pet_menu_frames(&s);
@@ -738,7 +757,7 @@ fn renaming_a_pet_reads_the_name_back_before_sending_it() {
     click_frame(&mut s, "StaticPopup1Button1");
     assert_eq!(
         s.take_pet_renames(),
-        Vec::<String>::new(),
+        Vec::<Option<String>>::new(),
         "accepting the NAME dialog sends nothing — it only asks again"
     );
     assert!(
@@ -755,7 +774,7 @@ fn renaming_a_pet_reads_the_name_back_before_sending_it() {
     click_frame(&mut s, "StaticPopup2Button1");
     assert_eq!(
         s.take_pet_renames(),
-        vec!["Rexxar".to_string()],
+        vec![Some("Rexxar".to_string())],
         "only the CONFIRM sends, and it sends the name from the box"
     );
     assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
@@ -766,6 +785,7 @@ fn renaming_a_pet_reads_the_name_back_before_sending_it() {
 fn the_pet_details_row_opens_the_pet_paper_doll() {
     let _data = benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     bake_pet_strings(&s);
     load_pet_menu_frames(&s);

@@ -17,6 +17,25 @@ pub(crate) const ACTION_KIND_SPELL: u8 = 0x00;
 pub(crate) const ACTION_KIND_MACRO: u8 = 0x40;
 pub(crate) const ACTION_KIND_ITEM: u8 = 0x80;
 
+/// The icon directory a macro's basename is formatted after (`0x84c988`, the string at
+/// `0x84ca64`).
+const MACRO_ICON_DIR: &str = "Interface\\Icons\\";
+
+/// The macro id a slot word holds, if it is a macro's: the word with bit 30 cleared when its top
+/// nibble is 4 (`0x4e5030`, `0x4e5ba0`, `0x4e7086`; `0x4e7090 and ecx,0xbfffffff`). A character
+/// macro's id has bit 24 set, so its slot's kind byte is 0x41 (vmangos `ACTION_BUTTON_CMACRO`).
+pub fn macro_slot_id(kind: u8, action: u32) -> Option<u32> {
+    const TAG: u32 = (ACTION_KIND_MACRO as u32) << 24;
+    let word = (u32::from(kind) << 24) | (action & 0x00ff_ffff);
+    (word & 0xf000_0000 == TAG).then_some(word & !TAG)
+}
+
+/// The slot `(kind, action)` that holds macro `id` (`macroId | 0x40000000`, `0x4e62e0`).
+pub fn macro_slot_word(id: u32) -> (u8, u32) {
+    let word = id | (u32::from(ACTION_KIND_MACRO) << 24);
+    ((word >> 24) as u8, word & 0x00ff_ffff)
+}
+
 /// What one action slot shows; the app resolves the icon before pushing.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ActionSlot {
@@ -63,9 +82,17 @@ pub struct ActionState {
     pub is_attack: bool,
     /// `IsEquippedAction`: an item action currently worn.
     pub equipped: bool,
+    /// The entry an item slot holds, which `IsCurrentAction`'s item arm compares with the in-flight
+    /// cast's item (`0x4e53fc`-`0x4e5428`); `None` for any other slot.
+    pub item: Option<u32>,
     /// `(start_ms, duration_ms, enabled)`, the start absolute on the `GetTime` clock, so a running
     /// cooldown re-pushes the same triple and a re-arm a new one (`0x6e13e0` returns the start).
     pub cooldown: Option<(i64, u32, bool)>,
+    /// The slot reaches no cooldown query (`0x4e6ca0`): a macro that casts nothing or is gone
+    /// (`0x4e6cfe`), or an item with no cached on-use spell (`0x6e2f34`). Only the query writes
+    /// the enable flag (`0x6e1406`), so `GetActionCooldown` answers the binding's `(0, 0, 0)`
+    /// (`0x4e6f0d`), as for an empty slot.
+    pub no_cooldown_query: bool,
 }
 
 /// The profession window a spell opens (`Effect[0]` 47, `TRADE_SKILL`, tested at `0x4e54fe`): a
@@ -89,13 +116,17 @@ pub struct OpenProfessions {
 }
 
 impl ActionState {
-    /// `ActionSlotIsCurrent 0x4e53a0` against the cast state as it stands: the Attack slot while
-    /// attacking (`0x4e5467`), else the slot's spell when it is in flight or awaiting its target
-    /// (`0x4e54c1`, `0x4e54d0`), when it opens the profession window that is open
-    /// (`0x4e54fe`-`0x4e5549`), or when its form is the player's (`0x4e558b`). It reads no
+    /// `ActionSlotIsCurrent 0x4e53a0` against the cast state as it stands: an item slot while the
+    /// in-flight cast's item has its entry, and by that arm alone (`0x4e53c8`-`0x4e5428`); the
+    /// Attack slot while attacking (`0x4e5467`), else the slot's spell when it is in flight or
+    /// awaiting its target (`0x4e54c1`, `0x4e54d0`), when it opens the profession window that is
+    /// open (`0x4e54fe`-`0x4e5549`), or when its form is the player's (`0x4e558b`). It reads no
     /// channel: a channel leaves the in-flight slot at its cast result, so its button unchecks as
     /// it begins.
     pub fn is_current(&self, view: &CastView, open: OpenProfessions) -> bool {
+        if let Some(entry) = self.item {
+            return view.item == Some(entry);
+        }
         if self.is_attack {
             return view.attacking;
         }
@@ -135,6 +166,10 @@ pub struct CastView {
     pub attacking: bool,
     /// The player's form byte (`UNIT_FIELD_BYTES_1` byte 2).
     pub form: u8,
+    /// The entry of the item the in-flight cast came from (`0xcecab0`, read through `0x6e3d20`),
+    /// its object looked up live (`0x4e53ef`): `None` with no item cast in flight or with its
+    /// object gone.
+    pub item: Option<u32>,
 }
 
 impl CastView {
@@ -250,6 +285,12 @@ impl super::UiScript {
         std::mem::take(&mut self.model_mut().action_sets)
     }
 
+    /// Queue `(lua action id, packed)` writes behind the ones a placement queued, for the app's
+    /// drain to store and send the same way: a write the host makes to the bar, not a script's.
+    pub fn queue_action_sets(&mut self, writes: impl IntoIterator<Item = (u32, u32)>) {
+        self.model_mut().action_sets.extend(writes);
+    }
+
     /// Drain the GlobalStrings keys of engine-side refusals; the app fires `UI_ERROR_MESSAGE` for
     /// each, where the reference calls `CGGameUI::DisplayError` inline.
     pub fn take_ui_errors(&mut self) -> Vec<&'static str> {
@@ -297,16 +338,12 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                 .ok()
                 .filter(|s| (1..=120).contains(s))
                 .and_then(|s| model.actions.get(&s))
-                .and_then(|a| match a.kind & 0xf0 {
-                    ACTION_KIND_MACRO => model.macros.get(a.action as usize).map(|_| {
-                        let b = model
-                            .macro_bindings
-                            .get(&a.action)
-                            .copied()
-                            .unwrap_or_default();
+                .and_then(|a| match macro_slot_id(a.kind, a.action) {
+                    Some(id) => model.macros.by_id(id).map(|_| {
+                        let b = model.macro_bindings.get(&id).copied().unwrap_or_default();
                         (b.spell as u32, b.pet_book)
                     }),
-                    _ => Some((a.action, false)),
+                    None => Some((a.action, false)),
                 })
                 .unwrap_or((0, true));
             let autocast = match resolved {
@@ -328,9 +365,23 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         lua.create_function(|lua, action: Value| {
             // `is-number` else `Usage: GetActionTexture(slot)` (`0x84bf78`, `0x4e6e5a`).
             let action = binding_abi::index_arg32(lua, action, "Usage: GetActionTexture(slot)")?;
+            // A macro slot reads its macro's icon live (`0x4e6bf9` into `0x4f0fd0`), so a handler
+            // of the edit's own slot signal sees the new one. The arm formats the icon directory
+            // and the basename (`0x4f0ffa`) and the binding pushes the buffer (`0x4e6e42`), so a
+            // macro with no icon gives the directory alone.
             let tex = {
                 let model = lua.app_data_ref::<Model>().expect("model app_data");
-                model.actions.get(&action).and_then(|s| s.texture.clone())
+                model
+                    .actions
+                    .get(&action)
+                    .and_then(|s| match macro_slot_id(s.kind, s.action) {
+                        Some(id) => model.macros.by_id(id).map(|m| {
+                            m.texture
+                                .clone()
+                                .unwrap_or_else(|| MACRO_ICON_DIR.to_string())
+                        }),
+                        None => s.texture.clone(),
+                    })
             };
             match tex {
                 Some(t) => Ok(Value::String(lua.create_string(&t)?)),
@@ -344,8 +395,8 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     // non-number slot raises `Usage: GetActionText(slot)` (`0x84bff4`); the slot is 1-based
     // (`0x4e7072` `dec eax`). An empty name answers "": it is an inline buffer at `+0x24`, so
     // `0x6f3890`'s null guard never fires.
-    // The reference's macro payload (`raw & 0x3fffffff`) is a hash key into `[0xbdcc54]`; ours is
-    // the 1..36 index, the lookup the app's macro icon makes too, so text and icon agree.
+    // The macro payload (`raw & 0xbfffffff`) is the id, the key of the hash table `[0xbdcc54]`
+    // (`0x4f0f40`), as here.
     // Deviation: an out-of-range slot answers nil, because the reference indexes `0xbc6980` with
     // no bounds check and reads the memory beside its 120 slots.
     g.set(
@@ -357,8 +408,8 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                 u32::try_from(slot)
                     .ok()
                     .and_then(|s| model.actions.get(&s))
-                    .filter(|s| s.kind & 0xf0 == ACTION_KIND_MACRO)
-                    .and_then(|s| model.macros.get(s.action as usize))
+                    .and_then(|s| macro_slot_id(s.kind, s.action))
+                    .and_then(|id| model.macros.by_id(id))
                     .map(|m| m.name.clone())
             };
             match name {
@@ -401,7 +452,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                         item_locks,
                         may_cast,
                     }),
-                );
+                )?;
             }
             Ok(())
         })?,
@@ -557,9 +608,11 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         })?,
     )?;
 
-    // GetActionCooldown(action) → start, duration, enable, in `GetTime` seconds. An absent or
-    // elapsed enabled cooldown answers `(0, 0, 1)`, or a later `CooldownFrame_SetTimer` would
-    // replay the sweep and its finish flash.
+    // GetActionCooldown(action) → start, duration, enable, in `GetTime` seconds. The enable starts
+    // at 0 (`0x4e6f0d`) and only the cooldown query writes it, to 1 before any leg (`0x6e1406`):
+    // a slot that reaches no query, an empty one included, answers `(0, 0, 0)`, and one that
+    // reaches it with nothing running `(0, 0, 1)`, so a later `CooldownFrame_SetTimer` replays no
+    // sweep and no finish flash.
     g.set(
         "GetActionCooldown",
         lua.create_function(|lua, action: Value| {
@@ -567,16 +620,21 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             let action = binding_abi::index_arg32(lua, action, "Usage: GetActionCooldown(slot)")?;
             let now = crate::script::clock::now(lua);
             let model = lua.app_data_ref::<Model>().expect("model app_data");
-            Ok(
-                match model.action_states.get(&action).and_then(|s| s.cooldown) {
-                    Some((start, duration, enabled)) if start + duration > now || !enabled => (
-                        crate::script::clock::held_start(start, enabled, now),
-                        duration,
-                        i32::from(enabled),
-                    ),
-                    _ => (0.0, 0.0, 1),
-                },
-            )
+            let Some(state) = model
+                .action_states
+                .get(&action)
+                .filter(|s| !s.state.no_cooldown_query)
+            else {
+                return Ok((0.0, 0.0, 0));
+            };
+            Ok(match state.cooldown {
+                Some((start, duration, enabled)) if start + duration > now || !enabled => (
+                    crate::script::clock::held_start(start, enabled, now),
+                    duration,
+                    i32::from(enabled),
+                ),
+                _ => (0.0, 0.0, 1),
+            })
         })?,
     )?;
 
@@ -587,6 +645,47 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
 mod tests {
     use super::ActionSlot;
     use crate::script::UiScript;
+
+    /// A slot word whose top nibble is 4 holds a macro, its id the word without bit 30
+    /// (`0x4e5030`, `0x4e7090`): the account scope's ids fit the 24-bit action field, and a
+    /// character macro's, which carry bit 24, make the kind byte 0x41.
+    #[test]
+    fn a_slot_word_holds_the_macro_id_with_bit_30_cleared() {
+        use super::{macro_slot_id, macro_slot_word};
+        assert_eq!(macro_slot_id(0x40, 5), Some(5));
+        assert_eq!(macro_slot_id(0x41, 7), Some(0x100_0007));
+        assert_eq!(macro_slot_word(5), (0x40, 5));
+        assert_eq!(macro_slot_word(0x100_0007), (0x41, 7));
+        for (kind, action) in [(0x00, 5), (0x80, 5), (0x01, 5), (0xC0, 5)] {
+            assert_eq!(macro_slot_id(kind, action), None, "kind {kind:#04x}");
+        }
+    }
+
+    /// `GetActionText` finds a character macro by its slot's kind 0x41 too.
+    #[test]
+    fn get_action_text_reads_a_character_macros_slot() {
+        use crate::script::{MacroState, MacroView};
+        let mut s = UiScript::new().unwrap();
+        s.set_macros(MacroState::from_scopes(
+            Vec::new(),
+            vec![MacroView {
+                name: "Charge".into(),
+                ..Default::default()
+            }],
+        ));
+        s.set_action(
+            1,
+            Some(ActionSlot {
+                kind: 0x41,
+                action: 1,
+                ..Default::default()
+            }),
+        );
+        assert_eq!(
+            s.eval::<String>("return GetActionText(1)").unwrap(),
+            "Charge"
+        );
+    }
 
     /// `GetActionAutocast` answers a pet spell's two bits only for a macro bound out of the pet's
     /// book (`0x4e6fcb`), never for a spell slot of the same id, and always two values.
@@ -602,8 +701,8 @@ mod tests {
                 ..Default::default()
             }],
         });
-        s.set_macros(MacroState {
-            account: vec![
+        s.set_macros(MacroState::from_scopes(
+            vec![
                 MacroView {
                     name: "claw".into(),
                     body: "/cast Claw".into(),
@@ -615,8 +714,8 @@ mod tests {
                     ..Default::default()
                 },
             ],
-            character: Vec::new(),
-        });
+            Vec::new(),
+        ));
         s.set_macro_bindings(std::collections::HashMap::from([
             (
                 1,
@@ -678,6 +777,7 @@ mod tests {
     #[test]
     fn use_actions_third_argument_is_the_self_cast_modifier() {
         let mut s = UiScript::new().unwrap();
+        s.keep_calls();
         s.run("UseAction(1)").unwrap();
         s.run("UseAction(2, 0)").unwrap();
         s.run("UseAction(3, 0, 0)").unwrap();
@@ -711,6 +811,7 @@ mod tests {
     #[test]
     fn action_snapshot_reads_and_use_queues() {
         let mut s = UiScript::new().unwrap();
+        s.keep_calls();
         assert!(!s.eval::<bool>("return HasAction(73)").unwrap());
         assert!(s
             .eval::<bool>("return GetActionTexture(73) == nil")
@@ -769,6 +870,8 @@ mod tests {
         use crate::script::cursor::{CursorAction, CursorPayload};
 
         let mut s = UiScript::new().unwrap();
+
+        s.keep_calls();
         s.set_cursor_for_test(CursorPayload::Action(CursorAction {
             src_slot: 1,
             kind: 0x00,
@@ -799,8 +902,8 @@ mod tests {
         use crate::script::{MacroState, MacroView};
 
         let mut s = UiScript::new().unwrap();
-        s.set_macros(MacroState {
-            account: vec![
+        s.set_macros(MacroState::from_scopes(
+            vec![
                 MacroView {
                     name: "Pull".into(),
                     ..Default::default()
@@ -810,8 +913,8 @@ mod tests {
                     ..Default::default()
                 },
             ],
-            character: Vec::new(),
-        });
+            Vec::new(),
+        ));
         let slot = |kind: u8, action: u32| {
             Some(ActionSlot {
                 texture: Some("Interface\\Icons\\Spell_A".into()),

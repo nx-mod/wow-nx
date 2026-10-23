@@ -9,11 +9,12 @@ use bevy::prelude::*;
 
 use benilla_protocol::{SessionEvent, SessionEventKind};
 
-use super::{GroupState, GROUPTYPE_RAID};
+use super::{GroupState, RosterRelease, GROUPTYPE_RAID};
 use crate::names::NameCache;
 use crate::net::{ClientCommand, GuidIndex, NetCommands, NetHandlerApp, ObjectStore, SelfGuid};
 use crate::query_cache::Ask;
 use crate::sound::MessageSounds;
+use crate::target::DeselectGuid;
 use crate::ui_action::{UiError, UiErrorKeys};
 use crate::ui_quest::QuestGiver;
 
@@ -37,72 +38,70 @@ pub(super) fn register(app: &mut App) {
         .net_handler(K::ReadyCheckAnswer, on_ready_check_answer)
         .net_handler(K::RaidInstanceInfo, on_raid_instance_info)
         .net_handler(K::PlayerName, on_player_name)
-        .net_handler(K::Disconnected, on_session_end);
+        .net_handler(K::Disconnected, on_session_end)
+        .add_message::<DeselectGuid>();
 }
 
-fn on_invite(
-    In(ev): In<SessionEvent>,
-    mut group: ResMut<GroupState>,
-    mut errors: ResMut<UiErrorKeys>,
-) {
+/// The popup's signal; the feed shows its line after the event ([`GroupState::apply_invited`]).
+fn on_invite(In(ev): In<SessionEvent>, mut group: ResMut<GroupState>) {
     if let SessionEvent::GroupInvite { inviter } = ev {
-        invited(&mut group, &mut errors, &inviter);
+        group.apply_invited(&inviter);
     }
 }
 
-fn on_decline(
-    In(ev): In<SessionEvent>,
-    mut group: ResMut<GroupState>,
-    mut errors: ResMut<UiErrorKeys>,
-) {
+fn on_decline(In(ev): In<SessionEvent>, mut group: ResMut<GroupState>, errors: Res<UiErrorKeys>) {
     if let SessionEvent::GroupDecline { name } = ev {
-        declined(&mut group, &mut errors, &name);
+        declined(&mut group, &errors, &name);
     }
 }
 
 fn on_uninvited(
     In(ev): In<SessionEvent>,
     mut group: ResMut<GroupState>,
-    mut errors: ResMut<UiErrorKeys>,
+    errors: Res<UiErrorKeys>,
+    mut teardown: RosterTeardown,
 ) {
     if let SessionEvent::GroupUninvited = ev {
-        uninvited(&mut group, &mut errors);
+        uninvited(&mut group, &errors);
+        teardown.run(&mut group);
     }
 }
 
 fn on_leader_changed(
     In(ev): In<SessionEvent>,
     mut group: ResMut<GroupState>,
-    mut errors: ResMut<UiErrorKeys>,
+    errors: Res<UiErrorKeys>,
     self_guid: Res<SelfGuid>,
     names: Res<NameCache>,
 ) {
     if let SessionEvent::GroupLeaderChanged { name } = ev {
-        leader_changed(&mut group, &mut errors, &name, &self_guid, &names);
+        leader_changed(&mut group, &errors, &name, &self_guid, &names);
     }
 }
 
 fn on_destroyed(
     In(ev): In<SessionEvent>,
     mut group: ResMut<GroupState>,
-    mut errors: ResMut<UiErrorKeys>,
+    errors: Res<UiErrorKeys>,
+    mut teardown: RosterTeardown,
 ) {
     if let SessionEvent::GroupDestroyed = ev {
-        destroyed(&mut group, &mut errors);
+        destroyed(&mut group, &errors);
+        teardown.run(&mut group);
     }
 }
 
 fn on_list(
     In(ev): In<SessionEvent>,
     mut group: ResMut<GroupState>,
-    mut errors: ResMut<UiErrorKeys>,
-    mut sounds: ResMut<MessageSounds>,
+    sounds: Res<MessageSounds>,
     mut quest: ResMut<QuestGiver>,
     self_guid: Res<SelfGuid>,
     names: Res<NameCache>,
     index: Res<GuidIndex>,
     commands: Res<NetCommands>,
     tutorials: Option<MessageWriter<crate::tutorial::TutorialEvent>>,
+    mut teardown: RosterTeardown,
 ) {
     if let SessionEvent::GroupList {
         group_type,
@@ -122,27 +121,18 @@ fn on_list(
             }
         }
         list(
-            &mut group,
-            &mut errors,
-            &mut sounds,
-            &mut quest,
-            group_type,
-            own_flags,
-            members,
-            leader,
-            loot,
-            &self_guid,
-            &names,
-            &index,
-            &commands,
+            &mut group, &sounds, &mut quest, group_type, own_flags, members, leader, loot,
+            &self_guid, &names, &index, &commands,
         );
+        teardown.run(&mut group);
     }
 }
 
 fn on_command_result(
     In(ev): In<SessionEvent>,
     mut group: ResMut<GroupState>,
-    mut errors: ResMut<UiErrorKeys>,
+    errors: Res<UiErrorKeys>,
+    mut teardown: RosterTeardown,
 ) {
     if let SessionEvent::PartyCommandResult {
         operation,
@@ -150,7 +140,53 @@ fn on_command_result(
         result,
     } = ev
     {
-        command_result(&mut group, &mut errors, operation, &member, result);
+        command_result(&mut group, &errors, operation, &member, result);
+        teardown.run(&mut group);
+    }
+}
+
+/// The selection teardowns (`0x493910(guid, 1)`) a list or an ending raised
+/// ([`GroupState::take_released`]), resolved while the objects stand as the packet found them and
+/// handed to the guid-scoped deselect ([`DeselectGuid`]). A harness with no object index holds no
+/// object, and one with no selection drops them.
+#[derive(bevy::ecs::system::SystemParam)]
+struct RosterTeardown<'w, 's> {
+    index: Option<Res<'w, GuidIndex>>,
+    stores: Query<'w, 's, &'static ObjectStore>,
+    deselect: Option<MessageWriter<'w, DeselectGuid>>,
+}
+
+impl RosterTeardown<'_, '_> {
+    fn run(&mut self, group: &mut GroupState) {
+        let released = group.take_released();
+        let guids: Vec<u64> = released
+            .into_iter()
+            .filter_map(|release| self.released_guid(release))
+            .collect();
+        if let Some(deselect) = &mut self.deselect {
+            deselect.write_batch(guids.into_iter().map(DeselectGuid));
+        }
+    }
+
+    /// The guid a release tears down. Each lookup asks for a unit (typemask 8: the member at
+    /// `0x4e84d7` and `0x5e6d50`, the pet at `0x4e8523`, `0x5e6da1` and `0x4baa64`), but the raid's
+    /// for its member asks for a player (`0x4baa18`), which a row's member is.
+    fn released_guid(&self, release: RosterRelease) -> Option<u64> {
+        let held = |guid: u64| {
+            self.index
+                .as_deref()
+                .and_then(|index| index.0.get(&guid))
+                .and_then(|&e| self.stores.get(e).ok())
+                .filter(|s| s.is_unit())
+        };
+        match release {
+            RosterRelease::Offline(guid) => Some(guid),
+            RosterRelease::Departed(member) => match held(member) {
+                None => Some(member),
+                // `CHARM`, else `SUMMON` (`0x4e84e6`-`0x4e84f3`, `0x5e6d60`-`0x5e6d6d`).
+                Some(store) => store.0.unit_pet_guid().filter(|&pet| held(pet).is_none()),
+            },
+        }
     }
 }
 
@@ -159,7 +195,7 @@ fn on_command_result(
 fn on_member_stats(
     In(ev): In<SessionEvent>,
     mut group: ResMut<GroupState>,
-    mut notices: MessageWriter<crate::field_watch::FieldNotice>,
+    mut notices: ResMut<crate::field_watch::NoticeLane>,
 ) {
     if let SessionEvent::PartyMemberStats { guid, full, info } = ev {
         let old = group.stats.get(&guid).cloned().unwrap_or_default();
@@ -181,11 +217,11 @@ fn on_raid_target(In(ev): In<SessionEvent>, mut group: ResMut<GroupState>) {
 fn on_ready_check_request(
     In(ev): In<SessionEvent>,
     mut group: ResMut<GroupState>,
-    mut errors: ResMut<UiErrorKeys>,
+    errors: Res<UiErrorKeys>,
     self_guid: Res<SelfGuid>,
 ) {
     if let SessionEvent::ReadyCheckRequest = ev {
-        ready_check_request(&mut group, &mut errors, &self_guid);
+        ready_check_request(&mut group, &errors, &self_guid);
     }
 }
 
@@ -202,10 +238,16 @@ fn on_raid_instance_info(In(ev): In<SessionEvent>, mut group: ResMut<GroupState>
 }
 
 /// `SMSG_NAME_QUERY_RESPONSE`, found or refused: the roster's lookups that waited on it run
-/// ([`GroupState::apply_player_name`]).
-fn on_player_name(In(ev): In<SessionEvent>, mut group: ResMut<GroupState>) {
-    if let SessionEvent::PlayerName { guid, .. } = ev {
-        group.apply_player_name(guid);
+/// ([`GroupState::apply_player_name`]). The name cache's handler, registered ahead of every other
+/// (`names::net::register`), has filed the answer by then, and a found answer's notices read that
+/// record with no callback (`0x4bad6b`).
+fn on_player_name(In(ev): In<SessionEvent>, mut group: ResMut<GroupState>, names: Res<NameCache>) {
+    if let SessionEvent::PlayerName { guid, name, .. } = ev {
+        let filed = (!name.is_empty())
+            .then(|| names.resolve_player(guid, Ask::Read))
+            .flatten();
+        // Its lines fire from the party lane, each in its place among its signals.
+        group.apply_player_name(guid, filed);
     }
 }
 
@@ -215,36 +257,32 @@ fn on_session_end(In(_): In<SessionEvent>, mut group: ResMut<GroupState>) {
 }
 
 /// Queue the messages an `apply_*` named; `ui_action::feed_actions` resolves and shows them.
-fn push_group_lines(errors: &mut UiErrorKeys, lines: Vec<UiError>) {
-    errors.0.extend(lines);
+fn push_group_lines(errors: &UiErrorKeys, lines: Vec<UiError>) {
+    errors.extend(lines);
 }
 
 /// We lead when our guid is the leader's, the reference's test at `0x4ba3a0`.
-fn ready_check_request(group: &mut GroupState, errors: &mut UiErrorKeys, self_guid: &SelfGuid) {
+fn ready_check_request(group: &mut GroupState, errors: &UiErrorKeys, self_guid: &SelfGuid) {
     let we_lead = self_guid.0 == Some(group.leader);
     push_group_lines(errors, group.apply_ready_check_request(we_lead));
 }
 
-fn invited(group: &mut GroupState, errors: &mut UiErrorKeys, inviter: &str) {
-    push_group_lines(errors, group.apply_invited(inviter));
-}
-
-fn declined(group: &mut GroupState, errors: &mut UiErrorKeys, name: &str) {
+fn declined(group: &mut GroupState, errors: &UiErrorKeys, name: &str) {
     push_group_lines(errors, group.apply_declined(name));
 }
 
-fn uninvited(group: &mut GroupState, errors: &mut UiErrorKeys) {
+fn uninvited(group: &mut GroupState, errors: &UiErrorKeys) {
     push_group_lines(errors, group.apply_uninvited());
 }
 
-fn destroyed(group: &mut GroupState, errors: &mut UiErrorKeys) {
+fn destroyed(group: &mut GroupState, errors: &UiErrorKeys) {
     push_group_lines(errors, group.apply_destroyed());
 }
 
 /// Our own name, cached from login (`session::connected`), picks the line; this never queries.
 fn leader_changed(
     group: &mut GroupState,
-    errors: &mut UiErrorKeys,
+    errors: &UiErrorKeys,
     name: &str,
     self_guid: &SelfGuid,
     names: &NameCache,
@@ -255,16 +293,16 @@ fn leader_changed(
     push_group_lines(errors, group.apply_leader_changed(name, own.as_deref()));
 }
 
-/// `SMSG_GROUP_LIST`: apply the roster, seat new members' records and re-ask the questgiver sweep
-/// (shared-quest availability follows the roster). Every member is name-queried once: the
+/// `SMSG_GROUP_LIST`: apply the roster, seat new members' records, ask for every raid-target icon
+/// when a raid list finds no roster held, and re-ask the questgiver sweep (shared-quest
+/// availability follows the roster). Every member is name-queried once: the
 /// answer's race, class and gender are the only source of them for a member we never see streamed.
 /// The party seats (`0x4e8477`) and a raid's rows (`0x4ba9c7`), ours among them once others are
 /// listed (`0x5e6e73`), each look their name up with a callback, which [`GroupState`] keeps for
 /// the answer ([`on_player_name`]).
 fn list(
     group: &mut GroupState,
-    errors: &mut UiErrorKeys,
-    sounds: &mut MessageSounds,
+    sounds: &MessageSounds,
     quest: &mut QuestGiver,
     group_type: u8,
     own_flags: u8,
@@ -283,6 +321,8 @@ fn list(
             .resolve_player(guid, Ask::Event(net_commands))
             .map(str::to_string)
     };
+    // The loot master's name as the setter reads it, from the cache with no callback (`0x4e878f`).
+    let cached_name = |guid: u64| names.resolve_player(guid, Ask::Read).map(str::to_string);
     // Taken before `apply_list` consumes the list; `seat_new_records` then treats a member with
     // no record as new, the reference's `srcRec == 0`.
     let seats: Vec<(u64, bool)> = members
@@ -297,12 +337,17 @@ fn list(
         loot,
         self_guid.0,
         &lookup,
+        &cached_name,
     );
-    push_group_lines(errors, shown.lines);
+    // The lines fire from the party lane, each in its place among the list's signals.
     if shown.invite_accept {
         sounds.push_cue(INVITE_ACCEPT_SOUND);
     }
     seat_new_records(group, &seats, index, net_commands);
+    // The roster writer's last send, after its stats requests (`0x4bac33`).
+    if shown.ask_raid_targets {
+        let _ = net_commands.0.send(ClientCommand::RequestRaidTargets);
+    }
     quest.bump_reask();
 }
 
@@ -406,15 +451,13 @@ pub(crate) fn roster_deactivated(
 
 fn command_result(
     group: &mut GroupState,
-    errors: &mut crate::ui_action::UiErrorKeys,
+    errors: &crate::ui_action::UiErrorKeys,
     operation: u32,
     member: &str,
     result: u32,
 ) {
     // By key, so the catalog row picks the surface; `None` is the reference's silence.
-    errors
-        .0
-        .extend(group.apply_command_result(operation, member, result));
+    errors.extend(group.apply_command_result(operation, member, result));
 }
 
 #[cfg(test)]
@@ -440,18 +483,13 @@ mod tests {
     fn a_refused_member_is_asked_again_by_the_next_list() {
         let (tx, rx) = crossbeam_channel::unbounded();
         let net = NetCommands(tx);
-        let (mut group, mut errors, mut quest) = (
-            GroupState::default(),
-            UiErrorKeys::default(),
-            QuestGiver::default(),
-        );
+        let (mut group, mut quest) = (GroupState::default(), QuestGiver::default());
         let mut names = NameCache::default();
         let far = 8 | (u64::from(guid::HIGH_PLAYER) << 48);
         let mut send = |names: &NameCache| {
             list(
                 &mut group,
-                &mut errors,
-                &mut MessageSounds::default(),
+                &MessageSounds::default(),
                 &mut quest,
                 0,
                 0,
@@ -480,11 +518,7 @@ mod tests {
     fn the_roster_warms_every_member_into_the_name_cache_once() {
         let (tx, rx) = crossbeam_channel::unbounded();
         let net = NetCommands(tx);
-        let (mut group, mut errors, mut quest) = (
-            GroupState::default(),
-            UiErrorKeys::default(),
-            QuestGiver::default(),
-        );
+        let (mut group, mut quest) = (GroupState::default(), QuestGiver::default());
         let mut names = NameCache::default();
         // A player guid, `counter | (high << 48)`, the shape `NameCache::resolve` routes on.
         let player_guid = |counter: u64| counter | (u64::from(guid::HIGH_PLAYER) << 48);
@@ -492,8 +526,7 @@ mod tests {
 
         list(
             &mut group,
-            &mut errors,
-            &mut MessageSounds::default(),
+            &MessageSounds::default(),
             &mut quest,
             0,
             0,
@@ -523,8 +556,7 @@ mod tests {
         names.insert_player(leader, "Aldwyn".into(), Some((1, 4, 1)));
         list(
             &mut group,
-            &mut errors,
-            &mut MessageSounds::default(),
+            &MessageSounds::default(),
             &mut quest,
             0,
             0,
@@ -550,19 +582,14 @@ mod tests {
     fn a_raid_list_signals_the_roster_only_once_every_name_is_held() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let net = NetCommands(tx);
-        let (mut group, mut errors, mut quest) = (
-            GroupState::default(),
-            UiErrorKeys::default(),
-            QuestGiver::default(),
-        );
+        let (mut group, mut quest) = (GroupState::default(), QuestGiver::default());
         let mut names = NameCache::default();
         let player_guid = |counter: u64| counter | (u64::from(guid::HIGH_PLAYER) << 48);
         let (me, a, b) = (player_guid(1), player_guid(7), player_guid(8));
         let mut raid = |group: &mut GroupState, names: &NameCache, group_type: u8| {
             list(
                 group,
-                &mut errors,
-                &mut MessageSounds::default(),
+                &MessageSounds::default(),
                 &mut quest,
                 group_type,
                 0,
@@ -615,17 +642,15 @@ mod tests {
     fn a_join_queues_the_invite_accept_chime_and_a_resync_does_not() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let net = NetCommands(tx);
-        let (mut group, mut errors, mut sounds, mut quest) = (
+        let (mut group, sounds, mut quest) = (
             GroupState::default(),
-            UiErrorKeys::default(),
             MessageSounds::default(),
             QuestGiver::default(),
         );
         let names = NameCache::default();
-        let mut send = |sounds: &mut MessageSounds, members: Vec<GroupMemberEntry>| {
+        let mut send = |sounds: &MessageSounds, members: Vec<GroupMemberEntry>| {
             list(
                 &mut group,
-                &mut errors,
                 sounds,
                 &mut quest,
                 0,
@@ -640,15 +665,15 @@ mod tests {
             );
         };
 
-        send(&mut sounds, vec![member(7, "Aldwyn")]);
+        send(&sounds, vec![member(7, "Aldwyn")]);
         assert_eq!(
             sounds.queued_cues(),
             ["igPlayerInviteAccept"],
             "our first party"
         );
-        send(&mut sounds, vec![member(7, "Aldwyn")]);
+        send(&sounds, vec![member(7, "Aldwyn")]);
         assert_eq!(sounds.queued_cues().len(), 1, "a resync is silent");
-        send(&mut sounds, vec![member(7, "Aldwyn"), member(8, "Brisca")]);
+        send(&sounds, vec![member(7, "Aldwyn"), member(8, "Brisca")]);
         assert_eq!(sounds.queued_cues().len(), 2, "a member joining our party");
         assert_eq!(
             benilla_ui::messages::by_key("ERR_JOINED_GROUP_S").and_then(|r| r.sound),
@@ -930,7 +955,12 @@ mod tests {
                 },
             )
             .expect("the group-list handler");
-        let signals = |app: &mut App| app.world_mut().resource_mut::<GroupState>().signals.take();
+        let signals = |app: &mut App| {
+            app.world_mut()
+                .resource_mut::<GroupState>()
+                .signals
+                .take_events()
+        };
         assert_eq!(
             signals(&mut app),
             [GroupSignal::MembersChanged, GroupSignal::LeaderChanged],
@@ -961,6 +991,212 @@ mod tests {
             signals(&mut app),
             [GroupSignal::RaidRosterUpdate, GroupSignal::MembersChanged]
         );
+    }
+
+    /// The group handlers on a session holding us as [`SelfGuid`] `ME`, our name cached.
+    fn handler_app(me: u64) -> (App, crossbeam_channel::Receiver<ClientCommand>) {
+        let mut app = App::new();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        app.insert_resource(NetCommands(tx))
+            .init_resource::<GroupState>()
+            .init_resource::<UiErrorKeys>()
+            .init_resource::<MessageSounds>()
+            .init_resource::<QuestGiver>()
+            .insert_resource(SelfGuid(Some(me)))
+            .init_resource::<NameCache>()
+            .init_resource::<GuidIndex>();
+        app.world_mut()
+            .resource_mut::<NameCache>()
+            .insert_player(me, "Me".into(), None);
+        (app, rx)
+    }
+
+    /// `SMSG_GROUP_LIST` through its handler.
+    fn list_event(app: &mut App, group_type: u8, members: Vec<GroupMemberEntry>, leader: u64) {
+        use bevy::ecs::system::RunSystemOnce;
+        app.world_mut()
+            .run_system_once_with(
+                on_list,
+                SessionEvent::GroupList {
+                    group_type,
+                    own_flags: 0,
+                    members,
+                    leader,
+                    loot: None,
+                },
+            )
+            .expect("the group-list handler");
+    }
+
+    /// `SMSG_NAME_QUERY_RESPONSE` through the name cache's handler, then the group's, as the
+    /// table runs them; an empty name is a refusal.
+    fn name_event(app: &mut App, guid: u64, name: &str) {
+        use bevy::ecs::system::RunSystemOnce;
+        app.world_mut()
+            .resource_mut::<NameCache>()
+            .insert_player(guid, name.into(), None);
+        app.world_mut()
+            .run_system_once_with(
+                on_player_name,
+                SessionEvent::PlayerName {
+                    guid,
+                    name: name.into(),
+                    race: 1,
+                    class: 1,
+                    gender: 0,
+                },
+            )
+            .expect("the name handler");
+    }
+
+    /// The name cache files a found answer before any callback of it runs: `0x55f310` copies the
+    /// record, sets its valid byte (`0x55f413`), then walks the callbacks (`0x55f426`-`0x55f452`).
+    /// So the cache's handler runs ahead of the roster's, which reads the filed record, whichever
+    /// plugin registers first.
+    #[test]
+    fn the_name_cache_files_an_answer_ahead_of_the_rosters_callbacks() {
+        let mut app = App::new();
+        register(&mut app);
+        crate::names::net::register(&mut app);
+        let table = app
+            .world()
+            .resource::<crate::net::handlers::NetHandlers>()
+            .census();
+        let order: Vec<&str> = table[&SessionEventKind::PlayerName]
+            .iter()
+            .map(|name| name.trim_start_matches("benilla_app::"))
+            .collect();
+        assert_eq!(
+            order,
+            [
+                "names::net::on_player_name",
+                "ui_party::net::on_player_name"
+            ]
+        );
+    }
+
+    /// The lines the handlers showed, in order, off the party lane.
+    fn shown(app: &mut App) -> Vec<UiError> {
+        app.world_mut()
+            .resource_mut::<GroupState>()
+            .signals
+            .take()
+            .into_iter()
+            .filter_map(|s| match s {
+                GroupSignal::Line(line) => Some(line),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A raid list onto a held roster looks each arrival up with the callback `0x4bacd0`
+    /// (`0x4ba72e`-`0x4ba744`) and each departure with `0x4bad30` (`0x4ba7c6`-`0x4ba7e3`): a
+    /// cached name shows its line at once, the cache's spelling (`0x4ba74e`, `0x4ba7f8`), and a
+    /// miss shows it when the answer finds the name (`0x4bad15`, `0x4bad75`); a refusal shows
+    /// nothing (`0x4bad50`).
+    #[test]
+    fn a_raid_notice_for_a_name_still_to_come_waits_for_its_answer() {
+        const ME: u64 = 0x10;
+        let (mut app, _rx) = handler_app(ME);
+        let (a, b, c, d, e) = (0x21, 0x22, 0x23, 0x24, 0x25);
+        for (guid, name) in [(a, "Aldwyn"), (b, "Brisca"), (d, "Dorn")] {
+            app.world_mut()
+                .resource_mut::<NameCache>()
+                .insert_player(guid, name.into(), None);
+        }
+        // Joining Aldwyn's raid: no roster held, so no notices (`0x4ba725`); Eira's name never
+        // lands.
+        list_event(
+            &mut app,
+            GROUPTYPE_RAID,
+            vec![member(a, "Aldwyn"), member(b, "Brisca"), member(e, "Eira")],
+            a,
+        );
+        assert_eq!(shown(&mut app), [UiError::key("ERR_RAID_YOU_JOINED")]);
+
+        // Cyra (uncached) and Dorn (cached, listed under another spelling) arrive; Brisca
+        // (cached) and Eira (uncached) leave.
+        list_event(
+            &mut app,
+            GROUPTYPE_RAID,
+            vec![member(a, "Aldwyn"), member(c, "Cyra"), member(d, "Dornish")],
+            a,
+        );
+        assert_eq!(
+            shown(&mut app),
+            [
+                UiError::s("ERR_RAID_MEMBER_ADDED_S", "Dorn"),
+                UiError::s("ERR_RAID_MEMBER_REMOVED_S", "Brisca"),
+            ],
+            "the cached names at once"
+        );
+        name_event(&mut app, c, "Cyra");
+        assert_eq!(
+            shown(&mut app),
+            [UiError::s("ERR_RAID_MEMBER_ADDED_S", "Cyra")],
+            "the arrival's answer"
+        );
+        name_event(&mut app, e, "");
+        assert_eq!(shown(&mut app), [], "the departure's name refused");
+        name_event(&mut app, c, "Cyra");
+        assert_eq!(shown(&mut app), [], "nothing left waiting");
+    }
+
+    /// A party list's leaver is looked up with no callback (`0x5e6d15`-`0x5e6d2b`), so a name
+    /// the cache lacks shows no leave line, then or when it lands.
+    #[test]
+    fn an_uncached_party_leaver_shows_no_line_then_or_later() {
+        const ME: u64 = 0x10;
+        let (mut app, _rx) = handler_app(ME);
+        let (a, f) = (0x21, 0x26);
+        app.world_mut()
+            .resource_mut::<NameCache>()
+            .insert_player(a, "Aldwyn".into(), None);
+        list_event(&mut app, 0, vec![member(a, "Aldwyn"), member(f, "Fen")], a);
+        shown(&mut app);
+        list_event(&mut app, 0, vec![member(a, "Aldwyn")], a);
+        assert_eq!(shown(&mut app), [], "Fen's name is still to come");
+        name_event(&mut app, f, "Fen");
+        assert_eq!(shown(&mut app), [], "and its answer shows nothing");
+    }
+
+    /// The raid roster writer ends with `MSG_RAID_TARGET_UPDATE` 0xff, the request for every
+    /// icon, when the roster held no rows on entry (`0x4ba61c` keeps that, `0x4babf4` tests it,
+    /// `0x4bac01`-`0x4bac33` send), after the rebuild's own sends, whatever the new list holds; a
+    /// raid list onto a held roster and a list that is not a raid (`0x4ba550`) send none.
+    #[test]
+    fn a_raid_list_with_no_roster_held_asks_for_every_raid_target() {
+        const ME: u64 = 0x10;
+        let (mut app, rx) = handler_app(ME);
+        let raid = vec![member(0x21, "Aldwyn"), member(0x22, "Brisca")];
+        let sent = |rx: &crossbeam_channel::Receiver<ClientCommand>| -> Vec<ClientCommand> {
+            rx.try_iter().collect()
+        };
+        let asks = |sent: &[ClientCommand]| {
+            sent.iter()
+                .filter(|c| matches!(c, ClientCommand::RequestRaidTargets))
+                .count()
+        };
+
+        list_event(&mut app, 0, raid.clone(), ME);
+        assert_eq!(asks(&sent(&rx)), 0, "a party's list");
+        list_event(&mut app, GROUPTYPE_RAID, raid.clone(), ME);
+        let joined = sent(&rx);
+        assert_eq!(asks(&joined), 1, "the party becomes a raid");
+        assert!(
+            matches!(joined.last(), Some(ClientCommand::RequestRaidTargets)),
+            "the last send: {joined:?}"
+        );
+        list_event(&mut app, GROUPTYPE_RAID, raid.clone(), ME);
+        assert_eq!(asks(&sent(&rx)), 0, "a roster held");
+        list_event(&mut app, GROUPTYPE_RAID, Vec::new(), ME);
+        assert_eq!(
+            asks(&sent(&rx)),
+            0,
+            "a list naming nobody, onto a roster held"
+        );
+        list_event(&mut app, GROUPTYPE_RAID, Vec::new(), ME);
+        assert_eq!(asks(&sent(&rx)), 1, "and again, onto none");
     }
 
     #[test]
@@ -1002,11 +1238,7 @@ mod tests {
     fn a_roster_new_member_is_seated_at_one_one_and_asked_for_only_when_unseen() {
         let (tx, rx) = crossbeam_channel::unbounded();
         let net = NetCommands(tx);
-        let (mut group, mut errors, mut quest) = (
-            GroupState::default(),
-            UiErrorKeys::default(),
-            QuestGiver::default(),
-        );
+        let (mut group, mut quest) = (GroupState::default(), QuestGiver::default());
         let names = NameCache::default();
         let (near, far) = (0x11u64, 0x22u64);
 
@@ -1019,8 +1251,7 @@ mod tests {
         let mut send = |group: &mut GroupState, members: Vec<GroupMemberEntry>| {
             list(
                 group,
-                &mut errors,
-                &mut MessageSounds::default(),
+                &MessageSounds::default(),
                 &mut quest,
                 0,
                 0,
@@ -1077,11 +1308,7 @@ mod tests {
     fn a_resent_list_moves_a_known_members_online_bit_and_keeps_its_record() {
         let (tx, rx) = crossbeam_channel::unbounded();
         let net = NetCommands(tx);
-        let (mut group, mut errors, mut quest) = (
-            GroupState::default(),
-            UiErrorKeys::default(),
-            QuestGiver::default(),
-        );
+        let (mut group, mut quest) = (GroupState::default(), QuestGiver::default());
         let names = NameCache::default();
         let far = 0x22u64;
         let mut send = |group: &mut GroupState, status: u8| {
@@ -1091,8 +1318,7 @@ mod tests {
             };
             list(
                 group,
-                &mut errors,
-                &mut MessageSounds::default(),
+                &MessageSounds::default(),
                 &mut quest,
                 0,
                 0,
@@ -1134,7 +1360,7 @@ mod tests {
     }
 
     /// The group feed's mapping reaches the chat gate: `SMSG_GROUP_LIST` through its handler, the
-    /// roster feed into the VM, then `SendChatMessage` through the drain. We lead a raid, so RAID
+    /// roster feed into the VM, then `SendChatMessage` through its applier. We lead a raid, so RAID
     /// goes out as RAID_LEADER (`0x49f3bf`); led by another member it goes out plain; ungrouped it
     /// is refused (`0x49f379`).
     #[test]
@@ -1162,8 +1388,7 @@ mod tests {
                     .init_resource::<MessageSounds>()
                     .init_resource::<QuestGiver>()
                     .init_resource::<crate::ui_chat::AfkMirror>()
-                    .init_resource::<crate::cvars::Cvars>()
-                    .init_resource::<crate::ui_chat::ChannelState>()
+                    .init_resource::<crate::target::Selection>()
                     .insert_resource(SelfGuid(Some(ME)));
                 let me = app
                     .world_mut()
@@ -1188,13 +1413,8 @@ mod tests {
                     )
                     .expect("the group-list handler");
                 app.update();
-                app.world_mut()
-                    .non_send_resource_mut::<UiScript>()
-                    .run(r#"SendChatMessage("go", "RAID")"#)
+                crate::ui_chat::run_chat(app.world_mut(), r#"SendChatMessage("go", "RAID")"#)
                     .expect("lua");
-                app.world_mut()
-                    .run_system_once(crate::ui_chat::drain_addon_chat_sends)
-                    .expect("drain");
                 let sent = rx
                     .try_iter()
                     .filter_map(|c| match c {
@@ -1205,7 +1425,7 @@ mod tests {
                 let refused = app
                     .world()
                     .resource::<UiErrorKeys>()
-                    .0
+                    .snapshot()
                     .iter()
                     .map(|e| e.key)
                     .collect();
@@ -1236,7 +1456,7 @@ mod tests {
         const MATE: u64 = 0x2001;
         let mut app = App::new();
         app.init_resource::<GroupState>()
-            .add_message::<FieldNotice>();
+            .init_resource::<crate::field_watch::NoticeLane>();
         let mut packet = |full: bool, info: PartyMemberStatsInfo| -> Vec<FieldNotice> {
             app.world_mut()
                 .run_system_once_with(
@@ -1249,7 +1469,7 @@ mod tests {
                 )
                 .unwrap();
             app.world_mut()
-                .resource_mut::<Messages<FieldNotice>>()
+                .resource_mut::<crate::field_watch::NoticeLane>()
                 .drain()
                 .collect()
         };
@@ -1296,6 +1516,97 @@ mod tests {
                 }
             ),
             [signal(28)]
+        );
+    }
+
+    /// A login's group list lands while the VM in hand is not the loaded interface's (the glue's,
+    /// the parked one, a bare entry VM), which defines none of `ITEM_QUALITY<n>_DESC`: the
+    /// threshold line keeps the global's key and takes the word from the VM that shows it
+    /// (`0x4e87c9`, `0x703bf0`). The master's name is read as the packet lands, from the player
+    /// cache with no callback, which a miss leaves unasked (`0x4e878f`).
+    #[test]
+    fn a_login_lists_loot_threshold_reads_its_word_from_the_vm_that_shows_it() {
+        use super::super::pets::tests::{app_with, ME};
+        use bevy::ecs::system::RunSystemOnce;
+
+        // The bare VM the packet lands on: no GlobalStrings at all.
+        let mut app = app_with(benilla_ui::script::UiScript::new().unwrap());
+        let (tx, rx) = crossbeam_channel::unbounded();
+        app.insert_resource(NetCommands(tx));
+        app.init_resource::<UiErrorKeys>()
+            .init_resource::<MessageSounds>()
+            .init_resource::<QuestGiver>()
+            .insert_resource(SelfGuid(Some(ME)));
+        let aldwyn = 0x1001;
+        let brisca = 0x1002;
+        // Listed nowhere: a lookup with a callback would ask for it.
+        let stranger = 0x1003;
+        app.world_mut()
+            .resource_mut::<NameCache>()
+            .insert_player(aldwyn, "Aldwyn".into(), None);
+        let mut send = |master: u64| {
+            app.world_mut()
+                .run_system_once_with(
+                    on_list,
+                    SessionEvent::GroupList {
+                        group_type: 0,
+                        own_flags: 0,
+                        members: vec![member(aldwyn, "Aldwyn"), member(brisca, "Brisca")],
+                        leader: aldwyn,
+                        loot: Some(GroupLootInfo {
+                            method: 2,
+                            master,
+                            threshold: 3,
+                        }),
+                    },
+                )
+                .expect("the group-list handler");
+            app.world_mut()
+                .resource_mut::<GroupState>()
+                .signals
+                .take()
+                .into_iter()
+                .filter_map(|s| match s {
+                    GroupSignal::Line(line) => Some(line),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let lines = send(aldwyn);
+        assert_eq!(lines.len(), 3, "{lines:?}");
+
+        // The interface comes up; the party lane resolves the logged lines against it.
+        let real = benilla_ui::script::UiScript::new().unwrap();
+        real.run(
+            r#"
+            ERR_SET_LOOT_MASTER = "Looting changed to master looter."
+            ERR_NEW_LOOT_MASTER_S = "%s is now the loot master."
+            ERR_SET_LOOT_THRESHOLD_S = "Loot threshold set to %s"
+            ITEM_QUALITY3_DESC = "Rare"
+            "#,
+        )
+        .unwrap();
+        let shown: Vec<Option<String>> = lines
+            .iter()
+            .map(|e| {
+                crate::ui_action::ui_error_text(e, &|k| real.lua().globals().get::<String>(k).ok())
+            })
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                Some("Looting changed to master looter.".to_string()),
+                Some("Aldwyn is now the loot master.".to_string()),
+                Some("Loot threshold set to Rare".to_string()),
+            ]
+        );
+
+        // A master the cache does not hold is no line, and no query from this lookup.
+        let _ = crate::query_cache::queries(&rx);
+        assert_eq!(send(stranger), []);
+        assert!(
+            crate::query_cache::queries(&rx).is_empty(),
+            "the loot lookup carries no callback, so it asks nothing"
         );
     }
 }

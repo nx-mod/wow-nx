@@ -112,7 +112,8 @@ const RTT_RING: usize = 15;
 /// [`Self::avg_latency_ms`].
 #[derive(Default)]
 pub(crate) struct PingClock {
-    /// Sequence of the latest ping sent, counting from 1 per connection.
+    /// Sequence of the latest ping sent, counting from 1 for the process: `+0x1a68` is zeroed only
+    /// when the one `NetClient` is built (`0x53745e`), never per link.
     pub(crate) sequence: u32,
     /// When that ping went out.
     pub(crate) sent_at: Option<Instant>,
@@ -120,6 +121,9 @@ pub(crate) struct PingClock {
     pub(crate) last_rtt_ms: Option<u32>,
     /// The latest [`RTT_RING`] round trips (ms), oldest first.
     rtt_ring: std::collections::VecDeque<u32>,
+    /// The last world link's byte counts and connect time (`conn+0x1ab4`-`+0x1abc`), set when
+    /// it connects: `GetNetStats`' rates.
+    pub(crate) traffic: Option<Arc<benilla_protocol::LinkTraffic>>,
 }
 
 impl PingClock {
@@ -152,9 +156,15 @@ impl PingClock {
         Some((sum / self.rtt_ring.len() as u64) as u32)
     }
 
-    /// Forgets this connection's measurements.
+    /// Forgets this connection's round trips. The ping sequence goes on, as nothing resets
+    /// `+0x1a68`; the traffic stays, as the reference resets its counts only when a link connects
+    /// (`0x537b90`), where the next one replaces it.
     pub(crate) fn clear(&mut self) {
-        *self = Self::default();
+        *self = Self {
+            sequence: self.sequence,
+            traffic: self.traffic.take(),
+            ..Self::default()
+        };
     }
 }
 
@@ -299,7 +309,7 @@ pub(super) fn spawn_net(connect: bool) -> NetHandles {
                 // Opcodes already reported for trailing bytes, once per process.
                 let mut tails_announced = std::collections::HashSet::new();
                 loop {
-                    // A cycle starts with no measurements. `writer_loop` clears again on the new
+                    // A cycle starts with no round trips. `writer_loop` clears again on the new
                     // writer, since the keepalive can still fire on the stale one until then.
                     read_clock.lock_recover().clear();
                     match run(
@@ -676,6 +686,8 @@ fn world(
                 return fail(None, format!("world handshake with {world_addr}: {e:#}"));
             }
         };
+        // The new link's counts from its connect, for `GetNetStats` (`0x537b90`).
+        ping_clock.lock_recover().traffic = Some(session.traffic());
         // A cancel during the queue must not be overtaken by the roster.
         if canceled() {
             return Ok(WorldEnd::Failed);
@@ -1107,7 +1119,7 @@ fn apply_swap(
         } => {
             *writer = Some(w);
             *warned = 0;
-            // Sequence 1 is the new socket's first ping, so an old socket's pong cannot match.
+            // With no send stamp an old socket's pong cannot match; the sequence goes on.
             if fresh_link {
                 ping_clock.lock_recover().clear();
             }
@@ -1152,7 +1164,9 @@ pub(super) fn writer_loop(
                     ping_tick = crossbeam_channel::after(PING_INTERVAL);
                     let (sequence, last_rtt) = {
                         let mut c = ping_clock.lock_recover();
-                        c.sequence += 1;
+                        // Incremented before the send, so a failed one counts too, as `0x537e69`
+                        // comes before the state test at `0x537e74`; a dword that wraps.
+                        c.sequence = c.sequence.wrapping_add(1);
                         c.sent_at = Some(Instant::now());
                         // `lastRtt` is the latest sample, not the mean (`ring[write-1]`, at
                         // `0x537e87`). Deviation: the reference's guard at `0x537e85` sends 0
@@ -1380,6 +1394,11 @@ pub(super) fn writer_loop(
                         packed,
                         target_guid,
                     } => w.pet_action(pet_guid, packed, target_guid),
+                    ClientCommand::PetCastSpell {
+                        caster_guid,
+                        spell_id,
+                        target,
+                    } => w.pet_cast_spell(caster_guid, spell_id, target),
                     ClientCommand::PetSetAction { pet_guid, entries } => {
                         w.pet_set_action(pet_guid, &entries)
                     }
@@ -1399,12 +1418,14 @@ pub(super) fn writer_loop(
                     ClientCommand::SetSheathed { state } => w.set_sheathed(state),
                     ClientCommand::StandStateChange { state } => w.stand_state_change(state),
                     ClientCommand::MountSpecial => w.mount_special(),
+                    ClientCommand::Emote { emote } => w.emote(emote),
                     ClientCommand::TextEmote { text_id, target } => w.text_emote(text_id, target),
                     ClientCommand::GossipHello { guid } => w.gossip_hello(guid),
-                    ClientCommand::GossipSelectOption { guid, option } => {
-                        // No code is sent: coded options are greyed, never selected.
-                        w.gossip_select_option(guid, option, None)
-                    }
+                    ClientCommand::GossipSelectOption {
+                        guid,
+                        option,
+                        code,
+                    } => w.gossip_select_option(guid, option, code.as_deref()),
                     ClientCommand::NpcTextQuery { text_id, guid } => w.npc_text_query(text_id, guid),
                     ClientCommand::ListInventory { guid } => w.list_inventory(guid),
                     ClientCommand::BuyItem {
@@ -1552,6 +1573,9 @@ pub(super) fn writer_loop(
                         spell_id,
                         item_guid,
                     } => w.cast_spell_item(spell_id, item_guid),
+                    ClientCommand::CastSpellTradeItem { spell_id, slot } => {
+                        w.cast_spell_trade_item(spell_id, slot)
+                    }
                     ClientCommand::LootMasterGive { guid, slot, target } => {
                         w.loot_master_give(guid, slot, target)
                     }
@@ -1620,9 +1644,11 @@ pub(super) fn writer_loop(
                     ClientCommand::MailDelete { mailbox, mail_id } => {
                         w.mail_delete(mailbox, mail_id)
                     }
-                    ClientCommand::MailCreateTextItem { mailbox, mail_id } => {
-                        w.mail_create_text_item(mailbox, mail_id)
-                    }
+                    ClientCommand::MailCreateTextItem {
+                        mailbox,
+                        mail_id,
+                        template_id,
+                    } => w.mail_create_text_item(mailbox, mail_id, template_id),
                     ClientCommand::ItemTextQuery { text_id, mail_id } => {
                         w.item_text_query(text_id, mail_id)
                     }
@@ -1686,7 +1712,7 @@ pub(super) fn writer_loop(
                     ClientCommand::BeginTrade => w.begin_trade(),
                     ClientCommand::BusyTrade => w.busy_trade(),
                     ClientCommand::IgnoreTrade => w.ignore_trade(),
-                    ClientCommand::AcceptTrade => w.accept_trade(),
+                    ClientCommand::AcceptTrade { flag } => w.accept_trade(flag),
                     ClientCommand::UnacceptTrade => w.unaccept_trade(),
                     ClientCommand::CancelTrade => w.cancel_trade(),
                     ClientCommand::SetTradeGold { copper } => w.set_trade_gold(copper),
@@ -1733,6 +1759,7 @@ pub(super) fn writer_loop(
                     ClientCommand::GroupAccept => w.group_accept(),
                     ClientCommand::GroupDecline => w.group_decline(),
                     ClientCommand::GroupUninvite { name } => w.group_uninvite(&name),
+                    ClientCommand::GroupUninviteGuid { guid } => w.group_uninvite_guid(guid),
                     ClientCommand::GroupSetLeader { guid } => w.group_set_leader(guid),
                     ClientCommand::GroupLeave => w.group_disband(),
                     ClientCommand::GroupRaidConvert => w.group_raid_convert(),
@@ -1745,6 +1772,7 @@ pub(super) fn writer_loop(
                         threshold,
                     } => w.loot_method(method, master, threshold),
                     ClientCommand::SetRaidTarget { icon, guid } => w.raid_target_set(icon, guid),
+                    ClientCommand::RequestRaidTargets => w.raid_target_request(),
                     ClientCommand::MinimapPing { x, y } => w.minimap_ping(x, y),
                     ClientCommand::GroupChangeSubGroup { name, group } => {
                         w.group_change_sub_group(&name, group)
@@ -1756,7 +1784,7 @@ pub(super) fn writer_loop(
                         w.group_assistant_leader(guid, grant)
                     }
                     ClientCommand::ReadyCheckStart => w.ready_check_start(),
-                    ClientCommand::ReadyCheckAnswer { ready } => w.ready_check_answer(ready),
+                    ClientCommand::ReadyCheckAnswer { status } => w.ready_check_answer(status),
                     ClientCommand::RequestRaidInfo => w.request_raid_info(),
                     ClientCommand::ResetInstances => w.reset_instances(),
                     ClientCommand::DuelAccepted { arbiter } => w.duel_accepted(arbiter),
@@ -1764,6 +1792,18 @@ pub(super) fn writer_loop(
                     ClientCommand::TogglePvp => w.toggle_pvp(),
                     ClientCommand::ToggleHelm => w.toggle_helm(),
                     ClientCommand::ToggleCloak => w.toggle_cloak(),
+                    ClientCommand::TeleportCheat { pos, facing } => w.teleport_cheat(pos, facing),
+                    ClientCommand::TeleportToUnit { text } => w.teleport_to_unit(&text),
+                    ClientCommand::SetRawPosition { pos, facing } => {
+                        w.set_raw_position(pos, facing)
+                    }
+                    ClientCommand::WorldTeleport {
+                        time_ms,
+                        map,
+                        pos,
+                        facing,
+                    } => w.world_teleport(time_ms, map, pos, facing),
+                    ClientCommand::Whois { text } => w.whois(&text),
                     ClientCommand::FriendListRequest => w.friend_list(),
                     ClientCommand::AddFriend { name } => w.add_friend(&name),
                     ClientCommand::SetLookingForGroup { slots, comment } => {
@@ -1922,5 +1962,38 @@ mod rtt_tests {
             "the dead socket's echo is dropped"
         );
         assert_eq!(clock.avg_latency_ms(), None);
+    }
+
+    /// `CMSG_PING`'s sequence `+0x1a68` is zeroed once, when the one `NetClient` is built
+    /// (`0x53745e`), and only incremented after (`0x537e69`), so a new link's first ping goes on
+    /// from the last link's; the stale pong is still dropped, its send stamp gone.
+    #[test]
+    fn the_ping_sequence_carries_across_a_reconnect() {
+        let mut clock = PingClock::default();
+        sent(&mut clock, 3);
+        clock.clear();
+        assert_eq!(clock.sequence, 3, "the next link's first ping is 4");
+        assert_eq!(
+            clock.record_pong(3),
+            None,
+            "the dead socket's echo is dropped"
+        );
+    }
+
+    /// The byte counts belong to the link: only the next connect replaces them (`0x537b90`), so the
+    /// world entry's reset of the round trips keeps them, and `GetNetStats` reads the link's rates
+    /// from its connect.
+    #[test]
+    fn clearing_the_round_trips_keeps_the_links_traffic() {
+        let mut clock = PingClock::default();
+        let traffic = std::sync::Arc::new(benilla_protocol::LinkTraffic::new());
+        clock.traffic = Some(std::sync::Arc::clone(&traffic));
+        clock.file_rtt(40);
+        clock.clear();
+        assert_eq!(clock.avg_latency_ms(), None);
+        assert!(clock
+            .traffic
+            .as_ref()
+            .is_some_and(|t| std::sync::Arc::ptr_eq(t, &traffic)));
     }
 }

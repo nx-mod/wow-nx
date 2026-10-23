@@ -5,8 +5,6 @@
 
 use bevy::prelude::*;
 
-use benilla_ui::script::UiScript;
-
 use crate::creature_anim::Engaged;
 use crate::net::{ClientCommand, Guid, NetCommands, ObjectStore, SelfPlayer};
 use crate::ui_script::InspectMode;
@@ -19,10 +17,13 @@ mod by_name;
 pub(crate) mod click;
 // `pub(crate)` for the hover inspector, which runs the cursor's `cursor_mode::go_highlightable`.
 pub(crate) mod cursor_mode;
+mod died;
 mod flash;
 mod front;
 #[cfg(test)]
 mod front_tests;
+#[cfg(test)]
+mod gate_tests;
 mod highlight;
 pub(crate) mod hover;
 mod hover_probe;
@@ -45,6 +46,9 @@ pub(crate) mod ring;
 mod scan;
 mod script;
 pub(crate) use script::ScriptSelect;
+mod track;
+#[cfg(test)]
+mod unheld_tests;
 
 pub(crate) use cursor_mode::{
     corpse_mouseover_eligible, CursorKind, WorldCursor, GO_TYPE_GENERIC, SERVICE_RANGE_SQ,
@@ -72,8 +76,9 @@ pub(crate) use scan::{AttackNearestRequest, AttackPick, CreatureTypes};
 pub(crate) use by_name::{
     assistable_alive, AssistRequest, Candidacy, NameSearch, PlayerLookup, TargetByNameRequest,
 };
-// The one SetSelection path, for the loot response's select (`0x48f3a0`).
-pub(crate) use by_name::SelectCommit;
+// The one SetSelection path, for the loot response's select (`0x48f3a0`), and what a selecting
+// call owes after its signals.
+pub(crate) use by_name::{SelectCommit, SelectDebt};
 // The selector's colour and the faction catalog it and the model read.
 #[cfg(test)]
 pub(crate) use ring::{ring_variant, PlayerPath, SelectorInput};
@@ -82,13 +87,20 @@ pub(crate) use ring::{selection_variant, Factions, RingVariant};
 pub use click::Interact;
 pub(crate) use click::{clear_selection_on_world_teardown, deselect_on_ui_shutdown, DeselectGuid};
 
-/// Our target, set the instant we click, as the 1.12 client does without waiting for the server,
-/// and cleared on deselect or when it streams out. `CMSG_SET_SELECTION` carries the guid, which the
-/// server records in our `UNIT_FIELD_TARGET`.
-#[derive(Resource, Default)]
+/// Our target, set the instant we click, as the 1.12 client does without waiting for the server.
+/// The selection is the guid `[0xb4e2d8]`: `SetSelection 0x493540` stores it whether or not the
+/// object manager holds its object (`0x4935bf` → `0x493605`), and the client reads the object by
+/// that guid where it needs one. `CMSG_SET_SELECTION` carries the guid, which the server records in
+/// our `UNIT_FIELD_TARGET`. [`track::follow_selection_object`] keeps [`Self::target`] on the guid's
+/// object and ends the selection where the client's teardowns do.
+#[derive(Resource, Default, Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Selection {
+    /// The object [`Self::guid`] names while the object manager holds it.
     pub(crate) target: Option<Entity>,
     pub(crate) guid: Option<u64>,
+    /// The object `SetSelection` lit as the target (`SetLight` bit 0, `0x493701`) and the teardown
+    /// unlights (`0x4939a7`): an object that streams in after the select is not lit.
+    pub(crate) lit: Option<Entity>,
     /// The last-target pair `[0xb4e2e0]` that `TargetLastTarget` reads: `SetSelection` stamps the
     /// outgoing selection, none included, on every change it makes, a select or a deselect
     /// (`0x49361d`-`0x493628`); a teardown clear (`0x493910` alone) leaves it.
@@ -185,6 +197,13 @@ pub(crate) struct PressPick {
 }
 
 impl PressPick {
+    /// The router's pick state is an object (`[this+0x350]` 2, `0x481fb8`): a unit, a corpse, a
+    /// unit the `IsSelectable` grader refused (an object hit that selects nothing) or a
+    /// GameObject. Anything else is the ground or the sky.
+    pub(crate) fn over_object(&self) -> bool {
+        self.hovered.any().is_some() || self.hovered.refused || self.object.target.is_some()
+    }
+
     /// Whether the press was an Attack-cursor press, for `0x5ecb70`'s new-target validation.
     pub(crate) fn attack(&self) -> bool {
         self.cursor.kind == cursor_mode::CursorKind::Attack
@@ -298,6 +317,7 @@ impl Plugin for TargetPlugin {
             .add_message::<TargetByNameRequest>()
             .add_message::<AssistRequest>()
             .add_message::<click::DeselectGuid>()
+            .add_message::<click::PlateRightClick>()
             .add_message::<Interact>()
             .add_systems(
                 Startup,
@@ -323,7 +343,12 @@ impl Plugin for TargetPlugin {
                     // the press frame already reads both modes cleared.
                     (
                         crate::spell::targeting::cancel_targeting_on_right_press,
-                        crate::ui_merchant::end_repair_mode_on_right_press,
+                        // It lends the call host, whose casts read the player's outdoors answer:
+                        // here this frame's re-place's. A key or action-button cast runs in
+                        // `UiInput`, before `WorldStage::Input`, and reads the last re-place's, as
+                        // the client's bit does.
+                        crate::ui_merchant::end_repair_mode_on_right_press
+                            .after(crate::player::publish_caster_outdoors),
                     ),
                     // Overwrites the classifier's verdict while the targeting cursor is up, as the
                     // reference's dispatcher runs this branch before the object classifier.
@@ -331,28 +356,34 @@ impl Plugin for TargetPlugin {
                     // Reads that verdict: `WorldCursor.unable` is the frame's range state, as the
                     // reference's one `CheckGroundPointInRange` caller feeds both.
                     reticle::update_reticle,
+                    // It lends the call host too, after the repair-mode reset, so its casts read
+                    // this frame's outdoors answer as well.
                     click::world_right_click_payload,
-                    // A plate click replayed as a click, then the select that reads it.
-                    (click::select_on_plate_click, click::select_on_click).chain(),
+                    // The world click's trade leg, ahead of the select in the same click
+                    // (`0x4925d0`); then a plate click replayed as a click, then the select that
+                    // reads it.
+                    (
+                        crate::ui_action::drop_item::trade_on_world_click,
+                        click::select_on_plate_click,
+                        click::select_on_click,
+                    )
+                        .chain(),
                     // After the gated select, which must read the targeting mode before a commit
                     // clears it. The pending spell feeds only one of the two legs, so their mutual
                     // order is free.
                     crate::spell::targeting::commit_ground_cast_on_click,
                     crate::spell::targeting::commit_object_cast_on_click,
                     // The verb a walk owes runs at its stop, ahead of this frame's click.
-                    (
-                        click::act_on_arrival,
-                        click::act_on_right_click,
-                        click::act_on_interact,
-                    )
-                        .chain(),
+                    (click::act_on_arrival, click::act_on_right_click).chain(),
                     // The loot close's guid-scoped deselect.
                     click::clear_target_requests,
-                    // The script calls that touch the selection, the cast or the targeting cursor
-                    // (`TargetUnit`, `/target`, `ClearTarget`, `/cast`, `UseAction`, …), applied
-                    // in the order the script made them; then `DropItemOnUnit`'s pet leg.
+                    // The units the writers above parked with the targeting cursor up, bound to its
+                    // cast; then the unit interact of a nameplate's right-click and a crate's
+                    // `Interact`, so the cast goes out ahead of the interact it came with; then
+                    // `DropItemOnUnit`'s pet leg.
                     (
-                        crate::script_calls::apply_script_calls,
+                        crate::script_calls::bind_parked_picks,
+                        click::act_on_interact,
                         crate::ui_action::drop_item::drop_item_on_unit,
                     )
                         .chain(),
@@ -361,27 +392,36 @@ impl Plugin for TargetPlugin {
                     (
                         by_name::target_by_name_requests,
                         by_name::assist_requests,
-                        // After the pet bar's and pet book's drains, which write `PetBar`. The
-                        // two commute: the `FollowUnit` resolver reads only the pet's guid
-                        // (`spells.pet_guid`), which neither writes; the order keeps them declared.
-                        by_name::follow_requests
-                            .after(crate::ui_pet::drain_pet_actions)
-                            .after(crate::ui_pet_book::drain_pet_book),
+                        // After the follow drain, so a `FollowUnit` starts the frame it is made.
+                        by_name::follow_requests.after(crate::ui_follow::drain_follow),
                     )
                         .chain(),
-                    scan::auto_acquire_attacker,
+                    scan::auto_acquire,
                     // The melee probe's press, the player's Attack; the TAB keys and ATTACKTARGET
                     // run their bodies' `TargetNearestEnemy` and `AttackTarget` as script calls.
                     crate::ui_action::attack_nearest_probe,
                     flash::drive_flash,
-                    // The last-enemy stamp before the ring's death-clear, so a hostile that dies
-                    // selected is still remembered (the reference's `TargetLastEnemy` has no
-                    // liveness gate).
-                    (scan::remember_last_enemy, ring::update_ring).chain(),
+                    // The last-enemy stamp before the death handler's deselect, so a hostile that
+                    // dies selected is still remembered (the reference's `TargetLastEnemy` has no
+                    // liveness gate); the ring after both, off the frame's final selection.
+                    (
+                        scan::remember_last_enemy,
+                        died::on_unit_died,
+                        ring::update_ring,
+                    )
+                        .chain(),
                 )
                     .chain()
                     .in_set(TargetUpdate)
                     .after(WorldStage::Input),
+            )
+            // The selection's object, as the objects that streamed in and out applied and the
+            // active player is tagged, before any reader of the frame.
+            .add_systems(
+                Update,
+                track::follow_selection_object
+                    .after(WorldStage::Net)
+                    .before(WorldStage::Input),
             )
             // PostUpdate: the brighten sets MeshTag bit 31 after every Update writer that
             // overwrites the whole tag.

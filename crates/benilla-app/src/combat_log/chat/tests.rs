@@ -47,6 +47,8 @@ fn a_spell_with_no_record_writes_no_line() {
         names: None,
         skill_lines: None,
         enchants: None,
+        items: None,
+        gameobjects: None,
         ranges: &ranges,
         periodic: true,
     };
@@ -74,8 +76,8 @@ fn a_standing_packet_prints_its_first_entry_only_and_never_a_hidden_one() {
     let factions = Factions::from_catalog(catalog);
     let packet = [(booty, 100), (gadget, 50), (ratchet, 50)];
     let kinds = |reps: &Reputations, deltas: &[(u32, i32)]| {
-        let mut log = ChatLog::default();
-        super::faction_standing(deltas, reps, Some(&factions), &mut log);
+        let log = ChatLog::default();
+        super::faction_standing(deltas, reps, Some(&factions), &log);
         log.pending_kinds()
     };
 
@@ -117,6 +119,10 @@ mod emitters {
 
     use super::super::ChatCtx;
 
+    mod dispel;
+    mod lines;
+    mod words;
+
     const ME: u64 = 1;
     const MOB: u64 = 2;
     const FIREBALL: u32 = 133;
@@ -137,6 +143,8 @@ mod emitters {
     const HIDDEN: u32 = 20_001;
     /// `Attributes & 0x80` alone: no line, but its `UNIT_COMBAT` fires.
     const UNDISPLAYED: u32 = 20_002;
+    /// `Targets & 0x80`, the enemy flag: `GetSpellHostility` answers 2.
+    const HOSTILE: u32 = 20_003;
 
     /// Fireball with no duration row, the two heals with theirs, and the casts.
     fn spells() -> crate::ui_action::Spells {
@@ -183,6 +191,15 @@ mod emitters {
                     cast(PICK_LOCK, "Pick Lock", 0, 0, 33),
                     cast(HIDDEN, "Hidden", 0x100, 0, 0),
                     cast(UNDISPLAYED, "Undisplayed", 0x80, 0, 0),
+                    (
+                        HOSTILE,
+                        benilla_formats::SpellDisplay {
+                            id: HOSTILE,
+                            name: "Venom".into(),
+                            targets: 0x80,
+                            ..Default::default()
+                        },
+                    ),
                 ]
                 .into_iter()
                 .collect(),
@@ -198,6 +215,15 @@ mod emitters {
     /// No pose held: every endpoint is in range.
     struct NoPoses;
 
+    /// Each unit's place, by entity.
+    struct At(HashMap<Entity, Vec3>);
+
+    impl Poses for At {
+        fn pose(&self, entity: Entity) -> Option<Vec3> {
+            self.0.get(&entity).copied()
+        }
+    }
+
     impl Poses for NoPoses {
         fn pose(&self, _: Entity) -> Option<Vec3> {
             None
@@ -212,6 +238,8 @@ mod emitters {
         factions: Factions,
         spells: crate::ui_action::Spells,
         enchants: benilla_formats::EnchantCatalog,
+        items: crate::items::Items,
+        gameobjects: crate::go_templates::GameObjectTemplates,
     }
 
     impl Bench {
@@ -227,6 +255,8 @@ mod emitters {
                     [(CRUSADER, "Crusader".to_string())].into(),
                     [(CRUSADER, 0), (ROCKBITER, 0x2)].into(),
                 ),
+                items: crate::items::Items::default(),
+                gameobjects: crate::go_templates::GameObjectTemplates::default(),
             };
             bench.hold(&player(ME, HUMAN));
             bench.hold(&creature(MOB, ORC));
@@ -243,7 +273,7 @@ mod emitters {
         /// ([`ChatLog::pending_combat_order`]).
         fn order(
             &self,
-            emit: impl FnOnce(&ChatCtx, &HashMap<Entity, ObjectStore>, &NoPoses, &mut ChatLog),
+            emit: impl FnOnce(&ChatCtx, &HashMap<Entity, ObjectStore>, &NoPoses, &ChatLog),
         ) -> Vec<String> {
             self.run(emit).pending_combat_order()
         }
@@ -251,7 +281,7 @@ mod emitters {
         /// The `UNIT_COMBAT`s `emit` parks, as `(guid, action, descriptor, amount)`.
         fn flashes(
             &self,
-            emit: impl FnOnce(&ChatCtx, &HashMap<Entity, ObjectStore>, &NoPoses, &mut ChatLog),
+            emit: impl FnOnce(&ChatCtx, &HashMap<Entity, ObjectStore>, &NoPoses, &ChatLog),
         ) -> Vec<(u64, &'static str, &'static str, u32)> {
             self.run(emit)
                 .pending_unit_combat()
@@ -263,19 +293,24 @@ mod emitters {
         /// The lines `emit` parks, with their words.
         fn lines(
             &self,
-            emit: impl FnOnce(&ChatCtx, &HashMap<Entity, ObjectStore>, &NoPoses, &mut ChatLog),
+            emit: impl FnOnce(&ChatCtx, &HashMap<Entity, ObjectStore>, &NoPoses, &ChatLog),
         ) -> Vec<PendingCombat> {
-            self.run(emit)
-                .pending_combat()
-                .into_iter()
-                .cloned()
-                .collect()
+            self.run(emit).pending_combat()
         }
 
         /// The log `emit` leaves.
         fn run(
             &self,
-            emit: impl FnOnce(&ChatCtx, &HashMap<Entity, ObjectStore>, &NoPoses, &mut ChatLog),
+            emit: impl FnOnce(&ChatCtx, &HashMap<Entity, ObjectStore>, &NoPoses, &ChatLog),
+        ) -> ChatLog {
+            self.run_posed(&NoPoses, emit)
+        }
+
+        /// [`Self::run`] with the units at `poses`.
+        fn run_posed<P: Poses>(
+            &self,
+            poses: &P,
+            emit: impl FnOnce(&ChatCtx, &HashMap<Entity, ObjectStore>, &P, &ChatLog),
         ) -> ChatLog {
             let (self_guid, reputations, ranges) = (
                 SelfGuid(Some(ME)),
@@ -292,11 +327,13 @@ mod emitters {
                 names: None,
                 skill_lines: None,
                 enchants: Some(&self.enchants),
+                items: Some(&self.items),
+                gameobjects: Some(&self.gameobjects),
                 ranges: &ranges,
                 periodic: true,
             };
             let mut log = ChatLog::default();
-            emit(&ctx, &self.stores, &NoPoses, &mut log);
+            emit(&ctx, &self.stores, poses, &mut log);
             log
         }
     }

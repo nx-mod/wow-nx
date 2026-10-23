@@ -13,9 +13,10 @@
 //! guid, so the chunk shows the unit the commit picks. The reference's walk follows the object
 //! list's order (a tail append, `0x4646c3`-`0x4646d4`), the deviation documented there.
 //!
-//! Not built for these selecting callers: the roster passes (party `0x493b20`, raid `0x493b9d`),
-//! because the selection holds an entity, not a guid, and `0x493540` stores a guid with no object
-//! (`0x493605`). `DoEmote`'s [`PlayerLookup`] needs only a guid and runs them.
+//! Every caller runs the roster passes (party `0x493b22`, raid `0x493ba7`), which offer a member
+//! the object manager does not hold: `TargetByName` selects it by guid (`0x493540` stores a guid
+//! with no object, `0x493605`), and `/assist` and `/follow`, which then look the pick up as a unit
+//! (`0x489c9b`, `0x489f46`), find none and say so.
 
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
@@ -23,6 +24,7 @@ use bevy::prelude::*;
 use benilla_protocol::guid;
 use benilla_ui::script::by_name::{resolve, Filter, Held, Kinds, Match, RosterEntry, Search};
 
+use crate::creature_anim::StartTarget;
 use crate::names::NameCache;
 use crate::net::{Guid, GuidIndex, ObjectStore, SelfPlayer};
 use crate::query_cache::Ask;
@@ -100,7 +102,7 @@ pub(crate) struct AssistRequest {
 /// | `CanCooperate` with the followee (`0x606ba0`) | `0x60ff6a` | `0x128`, the same line |
 /// | we are alive | `0x60ff7c` | `0x7e` `ERR_PLAYER_DEAD` |
 /// | we are not stunned (`UNIT_FIELD_FLAGS & 0x40000`) | `0x60ff95` | `0x191` `ERR_GENERIC_STUNNED` |
-/// | we are not casting | `0x60ffb9` | `0x134` `ERR_TOOBUSYTOFOLLOW` |
+/// | we are not channelling (`UNIT_CHANNEL_SPELL`, the unit block's `+0x228`) | `0x60ffb9` | `0x134` `ERR_TOOBUSYTOFOLLOW` |
 ///
 /// There is no followee-alive check (the per-tick death test ends a follow) and no distance check:
 /// follow's row in `0x860a58` has a `0.0` threshold, so `ERR_AUTOFOLLOW_TOO_FAR` (`0x6110a0`)
@@ -110,7 +112,7 @@ fn follow_refusal_key(
     we_cooperate: bool,
     we_are_dead: bool,
     we_are_stunned: bool,
-    we_are_casting: bool,
+    we_are_channelling: bool,
 ) -> Option<&'static str> {
     if !followee_is_player || !we_cooperate {
         return Some("ERR_INVALID_FOLLOW_TARGET");
@@ -121,7 +123,7 @@ fn follow_refusal_key(
     if we_are_stunned {
         return Some("ERR_GENERIC_STUNNED");
     }
-    if we_are_casting {
+    if we_are_channelling {
         return Some("ERR_TOOBUSYTOFOLLOW");
     }
     None
@@ -159,6 +161,10 @@ pub(crate) struct ByNameScan<'w, 's> {
     /// The relation inputs behind `CanAssist`, for [`Filter::AssistableAlive`], and
     /// `CanCooperate`, for the follow gate.
     relations: super::RelationWorld<'w, 's>,
+    /// The roster passes' party slots and raid rows, absent in a harness without groups.
+    group: Option<Res<'w, crate::ui_party::GroupState>>,
+    /// Whether the object manager holds a member, which keeps it out of the roster passes.
+    index: Option<Res<'w, GuidIndex>>,
 }
 
 impl ByNameScan<'_, '_> {
@@ -191,13 +197,14 @@ impl ByNameScan<'_, '_> {
     ///
     /// The gate's two other silent arms, a `this` that is not the active mover (`0x60fef7`) and a
     /// followee with no object (`0x60ff25`), never fire from these callers: both found those
-    /// objects first.
+    /// objects first. Its channel test reads the mover's own `UNIT_CHANNEL_SPELL` (`0x60ffb9`),
+    /// not the cast slot: a hard cast in flight does not refuse, a channel does for as long as it
+    /// lasts.
     fn follow_refusal(
         &self,
         mover: Option<(u64, &ObjectStore)>,
         followee: Option<(u64, &ObjectStore)>,
         missing: &'static str,
-        casting: bool,
     ) -> Option<FollowRefusal> {
         let Some((guid, store)) = followee else {
             return Some(FollowRefusal::Line(missing));
@@ -219,19 +226,18 @@ impl ByNameScan<'_, '_> {
             self.relations.get().can_cooperate(&mover, &unit),
             mover_store.0.unit_is_dead(),
             mover_store.0.unit_flags() & crate::player::UNIT_FLAG_STUNNED != 0,
-            casting,
+            mover_store.0.unit_channel_spell() != 0,
         )
         .map(FollowRefusal::Line)
     }
 
-    /// Resolve a name to a unit through [`scan_units`], the mode argument deciding the filter.
-    fn resolve(
-        &self,
-        query: &str,
-        search: NameSearch,
-        filter: Filter,
-        mode: Match,
-    ) -> Option<(Entity, u64, String)> {
+    /// Resolve a name to a guid through [`scan_units`], the mode argument deciding the filter: a
+    /// held unit, or a party or raid member the object manager does not hold.
+    fn resolve(&self, query: &str, search: NameSearch, filter: Filter, mode: Match) -> Option<u64> {
+        let roster = match (self.group.as_deref(), self.index.as_deref()) {
+            (Some(group), Some(index)) => Roster::of(group, index),
+            _ => Roster::default(),
+        };
         scan_units(
             self.units
                 .iter()
@@ -242,11 +248,10 @@ impl ByNameScan<'_, '_> {
             search,
             filter,
             mode,
-            Roster::default(),
+            roster,
             |guid, store| self.assistable_alive(guid, store),
         )
-        // With no roster every pick is a held unit.
-        .and_then(|(e, g, n)| Some((e?, g, n)))
+        .map(|(_, guid, _)| guid)
     }
 }
 
@@ -278,12 +283,34 @@ type UnitQuery<'w, 's> = Query<
 >;
 
 /// The roster passes' input (`0x493b22`, `0x493ba7`): the party slots and the raid members, by the
-/// name the wire gave and whether the object manager holds them. Empty for the callers that
-/// select ([`Selection::target`] is an entity); a pick from it has a guid and no entity.
+/// name the wire gave and whether the object manager holds them. A pick from it has a guid and no
+/// entity.
 #[derive(Default)]
 pub(super) struct Roster<'a> {
     party: Vec<RosterEntry<'a>>,
     raid: Vec<RosterEntry<'a>>,
+}
+
+impl<'a> Roster<'a> {
+    /// The party slots, then the raid rows while a raid is held, each marked held when the object
+    /// manager holds its object.
+    fn of(group: &'a crate::ui_party::GroupState, index: &GuidIndex) -> Self {
+        let entry = |m: &'a benilla_protocol::messages::GroupMemberEntry| RosterEntry {
+            name: &m.name,
+            guid: m.guid,
+            held: index.0.contains_key(&m.guid),
+        };
+        let in_raid = group.group_type == crate::ui_party::GROUPTYPE_RAID;
+        Roster {
+            party: group.party_slots().map(entry).collect(),
+            raid: group
+                .members
+                .iter()
+                .filter(|_| in_raid)
+                .map(entry)
+                .collect(),
+        }
+    }
 }
 
 /// The resolver's walk (`0x493aa0`): a name to a unit, logging one `by-name:` line per call,
@@ -382,26 +409,7 @@ impl PlayerLookup<'_, '_> {
         name: &str,
     ) -> Option<u64> {
         let origin = self.self_q.single().ok().map(|tf| tf.translation());
-        fn entry<'a>(
-            m: &'a benilla_protocol::messages::GroupMemberEntry,
-            index: &GuidIndex,
-        ) -> RosterEntry<'a> {
-            RosterEntry {
-                name: &m.name,
-                guid: m.guid,
-                held: index.0.contains_key(&m.guid),
-            }
-        }
-        let in_raid = group.group_type == crate::ui_party::GROUPTYPE_RAID;
-        let roster = Roster {
-            party: group.party_slots().map(|m| entry(m, index)).collect(),
-            raid: group
-                .members
-                .iter()
-                .filter(|_| in_raid)
-                .map(|m| entry(m, index))
-                .collect(),
-        };
+        let roster = Roster::of(group, index);
         scan_units(
             self.units
                 .iter()
@@ -421,17 +429,20 @@ impl PlayerLookup<'_, '_> {
 
 /// `/target <name>` and the Lua `TargetByName(name, exactMatch)` through [`scan::commit`], the
 /// stop, select, re-swing path a click takes. `exact` is the Lua second argument, which `0x489d8e`
-/// reads with default 0 as the resolver's exact-only flag (consumed at `0x493cab`). A miss leaves
-/// the target alone, as neither failure edge in `0x489db4` calls `SetSelection`, and prints
-/// nothing; the reference prints message `0x127` `ERR_UNIT_NOT_FOUND` there, or `0xb8`
-/// `ERR_GENERIC_NO_TARGET` for an empty name.
+/// reads with default 0 as the resolver's exact-only flag (consumed at `0x493cab`). The pick goes
+/// to `SetSelection` as it is (`0x489daa`), so a party member out of range is selected by guid. A
+/// miss leaves the target alone, as neither failure edge in `0x489db4` calls `SetSelection`, and
+/// shows message `0x127` `ERR_UNIT_NOT_FOUND` for a name given (`0x489dbd`, tested on the raw
+/// string's first byte, so blanks count) or `0xb8` `ERR_GENERIC_NO_TARGET` for an empty one
+/// (`0x489dcf`).
 pub(super) fn target_named(
     scan_params: &ByNameScan,
     commit: &mut SelectCommit,
+    errors: &crate::ui_action::UiErrorKeys,
     name: &str,
     exact: bool,
 ) {
-    let Some((entity, guid, _)) = scan_params.resolve(
+    let Some(guid) = scan_params.resolve(
         name,
         NameSearch::AnyUnit,
         Filter::AcceptAll,
@@ -441,33 +452,49 @@ pub(super) fn target_named(
             Match::PrefixOk
         },
     ) else {
+        errors.push(crate::ui_action::UiError::key(missing_line(name)));
         return;
     };
-    commit.commit(entity, guid);
+    commit.set(guid);
 }
 
-/// `/assist [name]` and the Lua `AssistByName`: the basis is a named player, or bare the current
-/// selection (`AssistUnit("target")`, `ChatFrame.lua:744`), and [`SelectCommit::assist`] selects
-/// its target.
+/// The line a by-name verb shows when its pick names no unit: `0x127` `ERR_UNIT_NOT_FOUND` for a
+/// name given, `0xb8` `ERR_GENERIC_NO_TARGET` for an empty one, each tested on the raw string's
+/// first byte (`0x489db8`, `0x489d12`, `0x489fa0`).
+fn missing_line(name: &str) -> &'static str {
+    if name.is_empty() {
+        "ERR_GENERIC_NO_TARGET"
+    } else {
+        "ERR_UNIT_NOT_FOUND"
+    }
+}
+
+/// `AssistByName(name)` (`0x489c40`) and `/assist [name]`: the basis is the player a nonempty name
+/// resolves to (typemask 0x10, mode 0, `0x489c82`), else the selection (`0x489c89`), looked up as a
+/// unit (`0x489c9b`, typemask 8); [`SelectCommit::assist`] then selects its target. A basis the
+/// object manager does not hold, a party member out of range included, shows
+/// [`missing_line`]'s line (`0x489d17`, `0x489d2b`). A bare `/assist` is `AssistUnit("target")`,
+/// which resolves the selection's unit and shows the same `0xb8` (`0x489c0e`).
 pub(super) fn assist_named(
     scan_params: &ByNameScan,
     commit: &mut SelectCommit,
-    name: Option<&str>,
+    errors: &crate::ui_action::UiErrorKeys,
+    name: &str,
     how: &str,
 ) {
-    let basis = match name {
-        Some(name) => scan_params
-            .resolve(
-                name,
-                NameSearch::PlayerOnly,
-                Filter::AcceptAll,
-                Match::PrefixOk,
-            )
-            .map(|(e, _, _)| e),
-        None => commit.selection.target,
+    let guid = if name.is_empty() {
+        commit.selection.guid
+    } else {
+        scan_params.resolve(
+            name,
+            NameSearch::PlayerOnly,
+            Filter::AcceptAll,
+            Match::PrefixOk,
+        )
     };
-    let Some(basis) = basis else {
+    let Some(basis) = guid.and_then(|guid| commit.held_unit(guid)) else {
         info!("assist ({how}): no basis unit; nothing to assist");
+        errors.push(crate::ui_action::UiError::key(missing_line(name)));
         return;
     };
     // From here on this is `AssistUnit`'s tail too, one function as in the reference.
@@ -479,9 +506,10 @@ pub(super) fn target_by_name_requests(
     mut requests: MessageReader<TargetByNameRequest>,
     scan_params: ByNameScan,
     mut commit: SelectCommit,
+    errors: Res<crate::ui_action::UiErrorKeys>,
 ) {
     for request in requests.read() {
-        target_named(&scan_params, &mut commit, &request.name, false);
+        target_named(&scan_params, &mut commit, &errors, &request.name, false);
     }
 }
 
@@ -490,12 +518,14 @@ pub(super) fn assist_requests(
     mut requests: MessageReader<AssistRequest>,
     scan_params: ByNameScan,
     mut commit: SelectCommit,
+    errors: Res<crate::ui_action::UiErrorKeys>,
 ) {
     for request in requests.read() {
         assist_named(
             &scan_params,
             &mut commit,
-            request.name.as_deref(),
+            &errors,
+            request.name.as_deref().unwrap_or_default(),
             "/assist",
         );
     }
@@ -510,8 +540,7 @@ pub(super) fn follow_requests(
     selection: Res<Selection>,
     tokens: crate::ui_unit::UnitTokens,
     mover: Query<(&Guid, &ObjectStore), With<crate::net::ActiveMover>>,
-    cast: Res<crate::spell::PendingCast>,
-    mut errors: ResMut<crate::ui_action::UiErrorKeys>,
+    errors: Res<crate::ui_action::UiErrorKeys>,
     mut follow: ResMut<crate::player::FollowState>,
     mut approach: ResMut<crate::player::Approach>,
 ) {
@@ -523,18 +552,16 @@ pub(super) fn follow_requests(
             // which finds nobody as `ERR_UNIT_NOT_FOUND` (`0x489fa5`); an empty one the
             // selection (`0x489f2a`), whose miss is `ERR_GENERIC_NO_TARGET` (`0x489fbd`).
             FollowRequest::Name { name, exact } if !name.is_empty() => (
-                scan_params
-                    .resolve(
-                        name,
-                        NameSearch::PlayerOnly,
-                        Filter::AssistableAlive,
-                        if *exact {
-                            Match::ExactOnly
-                        } else {
-                            Match::PrefixOk
-                        },
-                    )
-                    .map(|(_, guid, _)| guid),
+                scan_params.resolve(
+                    name,
+                    NameSearch::PlayerOnly,
+                    Filter::AssistableAlive,
+                    if *exact {
+                        Match::ExactOnly
+                    } else {
+                        Match::PrefixOk
+                    },
+                ),
                 "ERR_UNIT_NOT_FOUND",
             ),
             FollowRequest::Name { .. } => (selection.guid, "ERR_GENERIC_NO_TARGET"),
@@ -550,12 +577,11 @@ pub(super) fn follow_requests(
             Some((guid, store.filter(|s| s.is_unit())?))
         });
         let mover = mover.iter().next().map(|(guid, store)| (guid.0, store));
-        let casting = cast.in_flight();
-        match scan_params.follow_refusal(mover, followee, missing, casting) {
+        match scan_params.follow_refusal(mover, followee, missing) {
             // A refusal leaves a follow in progress alone: the gate returns before `0x611130`.
             Some(FollowRefusal::Line(key)) => {
                 info!("follow: refused — {key}");
-                errors.0.push(crate::ui_action::UiError::key(key));
+                errors.push(crate::ui_action::UiError::key(key));
             }
             Some(FollowRefusal::Silent) => info!("follow: the mover itself — nothing"),
             None => {
@@ -572,6 +598,48 @@ pub(super) fn follow_requests(
             }
         }
     }
+}
+
+/// The cue `SetSelection` plays for a guid whose object it does not find (`0x843328`).
+const UNHELD_SELECT_SOUND: &str = "igCharacterSelect";
+
+/// A swing a selecting verb owes after `SetSelection`'s `PLAYER_TARGET_CHANGED` (`0x49389c`),
+/// whose listeners run first: the re-swing (`0x4938c8`), or the assist tail's StartAttack at the
+/// unit it selected (`0x489bfc`-`0x489c02`, a copy of that guid), when `assistAttack` is on then
+/// (`0x489bd0`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OwedSwing {
+    Again(scan::OwedSwing),
+    Assist { guid: u64 },
+}
+
+/// What a selecting verb owes after its signals, for its caller to pay once their listeners ran
+/// ([`SelectCommit::owing`]): the send after the teardown's `PET_BAR_UPDATE`, then the swings after
+/// `PLAYER_TARGET_CHANGED`, in the order owed.
+#[must_use]
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct SelectDebt {
+    send: Option<scan::OwedSend>,
+    swings: Vec<OwedSwing>,
+}
+
+impl SelectDebt {
+    /// The send owed after the teardown's signal.
+    pub(crate) fn take_send(&mut self) -> Option<scan::OwedSend> {
+        self.send.take()
+    }
+
+    /// Whether swings are owed after the selection's signal.
+    pub(crate) fn owes_swings(&self) -> bool {
+        !self.swings.is_empty()
+    }
+}
+
+/// Where [`SelectCommit`] keeps what its verb owes while [`SelectCommit::owing`] runs.
+#[derive(Default)]
+pub(super) struct Owing {
+    on: bool,
+    debt: SelectDebt,
 }
 
 /// Everything [`scan::commit`], the one `SetSelection` path, needs.
@@ -599,14 +667,128 @@ pub(crate) struct SelectCommit<'w, 's> {
     assist_attack: Res<'w, super::AssistAttack>,
     /// The returns ahead of every selection `SetSelection` makes: charmed, and the cursor's bind.
     pub(super) front: super::front::SelectFront<'w, 's>,
+    /// The roster `IsRaidMemberOrPet` reads (`0x491900`), absent in a harness without groups.
+    group: Option<Res<'w, crate::ui_party::GroupState>>,
+    /// The 2D cues `PlaySoundByName` (`0x458030`) plays, absent in a harness without sound.
+    sounds: Option<Res<'w, crate::sound::MessageSounds>>,
+    /// What the verb owes while [`Self::owing`] runs.
+    owing: Local<'s, Owing>,
 }
 
 impl SelectCommit<'_, '_> {
+    /// Run `f`, keeping what its selections owe after their signals in place of sending it, for a
+    /// caller that runs the signals' listeners first and then pays it ([`Self::pay_send`],
+    /// [`Self::pay`]).
+    pub(super) fn owing(&mut self, f: impl FnOnce(&mut Self)) -> SelectDebt {
+        self.owing.on = true;
+        f(self);
+        self.owing.on = false;
+        std::mem::take(&mut self.owing.debt)
+    }
+
+    /// Owe what a commit owes while [`Self::owing`] runs; pay it now otherwise.
+    pub(super) fn owe_all(&mut self, owed: scan::Owed) {
+        if let Some(send) = owed.send {
+            self.owe_send(send);
+        }
+        if let Some(swing) = owed.swing {
+            self.owe(OwedSwing::Again(swing));
+        }
+    }
+
+    /// Owe `send` while [`Self::owing`] runs; send it now otherwise.
+    fn owe_send(&mut self, send: scan::OwedSend) {
+        if self.owing.on {
+            debug_assert!(self.owing.debt.send.is_none(), "one selection per verb");
+            self.owing.debt.send = Some(send);
+        } else {
+            self.pay_send(send);
+        }
+    }
+
+    /// Owe `swing` while [`Self::owing`] runs; send it now otherwise.
+    fn owe(&mut self, swing: OwedSwing) {
+        if self.owing.on {
+            self.owing.debt.swings.push(swing);
+        } else {
+            self.pay_one(swing);
+        }
+    }
+
+    /// Store and send the selection the teardown's signal held back.
+    pub(crate) fn pay_send(&mut self, send: scan::OwedSend) {
+        send.pay(&mut self.selection, &self.seam);
+    }
+
+    /// Pay what `debt` still owes, in order, now that the signals' listeners have run.
+    pub(crate) fn pay(&mut self, debt: SelectDebt) {
+        if let Some(send) = debt.send {
+            self.pay_send(send);
+        }
+        for swing in debt.swings {
+            self.pay_one(swing);
+        }
+    }
+
+    fn pay_one(&mut self, swing: OwedSwing) {
+        match swing {
+            OwedSwing::Again(owed) => {
+                let now = self
+                    .selection
+                    .guid
+                    .map_or(StartTarget::Unheld, |guid| self.start_target(guid));
+                owed.pay(&self.selection, &mut self.seam, now);
+            }
+            OwedSwing::Assist { guid } => {
+                if self.assist_attack.0 {
+                    info!("assist: assistAttack is on -> opening the swing at {guid:#x}");
+                    self.start_attack(guid);
+                }
+            }
+        }
+    }
+
+    /// What `StartAttack`'s target checks find of `guid` (`0x5ecbe6`-`0x5ecc35`): a unit the
+    /// object manager holds (typemask 8), then [`Self::attackable`].
+    fn start_target(&self, guid: u64) -> StartTarget {
+        match self.held_unit(guid) {
+            None => StartTarget::Unheld,
+            Some(entity) if self.attackable(entity, guid) => StartTarget::Attackable,
+            Some(_) => StartTarget::Refused,
+        }
+    }
+
+    /// StartAttack (`0x5ecb70`) at `guid`, its own select (`0x5ecca0`-`0x5eccaa` → `0x493540`)
+    /// between its checks and stand and its swing: [`Self::commit`], the setter's dedup for a guid
+    /// selected already, else the whole `SetSelection`, whose re-swing reaches StartAttack again
+    /// at the same guid and is deduped there.
+    pub(crate) fn start_attack(&mut self, guid: u64) {
+        let engaged = self.engaged();
+        let verdict = self.start_target(guid);
+        if !self.seam.start_head(engaged, verdict) {
+            return;
+        }
+        if let Some(entity) = self.held_unit(guid) {
+            self.commit(entity, guid);
+        }
+        self.seam.start_tail(guid, engaged);
+    }
+
+    /// `StartAttack`'s target legs (`0x5ecc16`, `0x5ecc2e`) on the held object `entity`, `guid`:
+    /// alive, then `CanAttack`, so a body is switched to and never swung at.
+    fn attackable(&self, entity: Entity, guid: u64) -> bool {
+        self.stores.get(entity).ok().is_some_and(|store| {
+            let unit = self.relations.unit_of(guid, store);
+            let rel = self.relations.get();
+            scan::attack_target_valid(&rel, self.relations.me().as_ref(), &unit, store)
+        })
+    }
+
     /// The shared assist tail (`0x489bb2`-`0x489c07`, byte-identical in `AssistByName` at
-    /// `0x489cae`-`0x489d07`): select the basis unit's `UNIT_FIELD_TARGET` if it is streamed.
-    /// Every miss is silent and deselects nothing: no basis, a basis targeting nothing, or an
-    /// unstreamed guid (`0x489a40`'s arm 3 is a bare `ret`). With `assistAttack` set, the tail then
-    /// opens the swing (`0x489c02`/`0x489d02` call `0x5ecb70`).
+    /// `0x489cae`-`0x489d07`): select the basis unit's `UNIT_FIELD_TARGET` through `0x489a40`
+    /// ([`Self::select`]), so a party member out of range is selected by guid. A basis targeting
+    /// nothing is silent (`0x489bc6`), as is a guid `0x489a40` passes over. With `assistAttack`
+    /// set, the tail then opens the swing (`0x489c02`/`0x489d02` call `0x5ecb70`).
     pub(super) fn assist(&mut self, basis: Entity, how: &str) {
         let Some(guid) = self
             .stores
@@ -618,33 +800,13 @@ impl SelectCommit<'_, '_> {
             info!("assist ({how}): the basis unit is targeting nothing; silent no-op");
             return;
         };
-        // Only a streamed unit can be selected; the reference's roster fallback for an unstreamed
-        // guid is not built (see the module doc).
-        let Some(entity) = self.index.0.get(&guid).copied() else {
-            info!("assist ({how}): the basis is targeting guid {guid:#x}, which is not streamed");
-            return;
-        };
         info!("assist ({how}) -> the basis unit's target, guid {guid:#x}");
-        // `engaged` and attackability are read before the selection: `SetSelection` may re-point
-        // a swing we already had (`0x4938c8`), and `0x5ecb70` then skips the send but still runs
-        // its tail, a sheath snap; not yet fighting, the second leg opens a fresh swing.
-        let me = self.me.single().ok();
-        let engaged = me.is_some_and(|(_, _, engaged)| engaged);
-        let attackable = (|| {
-            let target = self.relations.unit_of(guid, self.stores.get(entity).ok()?);
-            Some(
-                self.relations
-                    .get()
-                    .can_attack(&self.relations.me()?, &target),
-            )
-        })() == Some(true);
-        self.commit(entity, guid);
-        // The second leg. `0x5ecb70`'s attackability test is the caller's here, so a friendly
-        // target is selected, not swung at.
-        if self.assist_attack.0 && attackable {
-            info!("assist ({how}): assistAttack is on -> opening the swing");
-            self.seam.start(guid, engaged, false);
-        }
+        self.select(guid);
+        // The second leg, owed past the selection's signal: `assistAttack` is read after it
+        // (`0x489bd0`), and StartAttack judges the unit itself, so a friendly one is selected
+        // and refused, which stops a running swing (`0x5ecc48`). A swing the select re-pointed
+        // (`0x4938c8`) left `[+0xc54]` set, so this one goes out again (`0x5eccda`).
+        self.owe(OwedSwing::Assist { guid });
     }
 
     /// Whether we are mid-swing, which a deselect stops.
@@ -655,44 +817,115 @@ impl SelectCommit<'_, '_> {
     /// Deselect (`0x493540(0,0)`), a no-op with nothing selected; see [`super::click::clear`].
     pub(super) fn clear(&mut self) {
         let engaged = self.engaged();
-        super::click::deselect(&mut self.selection, &mut self.seam, engaged);
+        if let Some(send) =
+            super::click::deselect_owing(&mut self.selection, &mut self.seam, engaged)
+        {
+            self.owe_send(send);
+        }
     }
 
     /// `0x48f3a0`'s select on a looted object, which tests `TYPEMASK_UNIT` first (`0x48f3af`).
     pub(crate) fn select_unit(&mut self, guid: u64) {
-        let Some(&entity) = self.index.0.get(&guid) else {
-            return;
-        };
-        if self.stores.get(entity).is_ok_and(ObjectStore::is_unit) {
+        if let Some(entity) = self.held_unit(guid) {
             self.commit(entity, guid);
         }
     }
 
-    /// Select a resolved guid, `0x489a40`'s arm 1, through [`scan::commit`], unless
-    /// `SelectTarget`'s front returns first ([`super::front`]): with the targeting cursor up the unit
-    /// is bound to the cast and the selection stays.
+    /// The object manager's unit `guid` names (`0x468460`, typemask 8).
+    pub(super) fn held_unit(&self, guid: u64) -> Option<Entity> {
+        let entity = *self.index.0.get(&guid)?;
+        self.stores
+            .get(entity)
+            .is_ok_and(ObjectStore::is_unit)
+            .then_some(entity)
+    }
+
+    /// `IsRaidMemberOrPet` (`0x491900`) on `guid`, which needs no object of it.
+    fn member_or_pet(&self, guid: u64) -> bool {
+        let Some(group) = self.group.as_deref() else {
+            return false;
+        };
+        let fields = |g: u64| Some(&self.stores.get(*self.index.0.get(&g)?).ok()?.0);
+        // The active player is matched by guid before any object (`0x4e80b0`).
+        let me = self.relations.me_guid().map(|g| (g, fields(g)));
+        group.member_or_pet(guid, me, fields)
+    }
+
+    /// `CGGameUI::Target` (`0x489a40`), which `TargetUnit`, the assist tail, `TargetLastTarget`
+    /// and `TargetLastEnemy` share: `guid` goes to `SetSelection` ([`Self::set`], `0x489a74`) when
+    /// the object manager holds its unit (`0x489a59`, typemask 8) or `IsRaidMemberOrPet` names it
+    /// (`0x489a64`), so a party member out of range is selected by the guid alone; anything else,
+    /// a zero guid included, is a bare `ret` (`0x489a79`), never a deselect. Whether it reached
+    /// `SetSelection`.
+    pub(super) fn select(&mut self, guid: u64) -> bool {
+        if self.held_unit(guid).is_none() && !self.member_or_pet(guid) {
+            return false;
+        }
+        self.set(guid);
+        true
+    }
+
+    /// `SetSelection` on a guid as `TargetByName` hands it over (`0x489daa`): with its object when
+    /// the object manager holds one (`0x4935bf`, typemask 1), else the guid alone (`0x493605`).
+    pub(super) fn set(&mut self, guid: u64) {
+        match self.index.0.get(&guid).copied() {
+            Some(entity) => self.commit(entity, guid),
+            None => self.commit_unheld(guid),
+        }
+    }
+
+    /// `SetSelection` on a guid with no object: the charmed return (`0x49359c`) alone stands
+    /// ahead of it, and the guid is stored with no light (`0x493605`). Its object lookup finds
+    /// nothing, so it plays `igCharacterSelect` (`0x4936f7 je 0x493843`, `0x843328` through
+    /// `0x458030`), past the dedup (`0x493617`).
+    fn commit_unheld(&mut self, guid: u64) {
+        if self.front.charmed() {
+            return;
+        }
+        let me = self.me.single().ok();
+        let old_latches = scan::latches_on(&self.relations, self.selection.guid);
+        let (outcome, owed) = scan::commit_owing(
+            &mut self.selection,
+            &mut self.seam,
+            None,
+            guid,
+            None,
+            me.is_some_and(|(_, _, engaged)| engaged),
+            me.map(|(g, _, _)| g.0),
+            false,
+            old_latches,
+        );
+        self.owe_all(owed);
+        if outcome.changed {
+            if let Some(sounds) = &self.sounds {
+                sounds.push_cue(UNHELD_SELECT_SOUND);
+            }
+        }
+    }
+
+    /// Select the held object `entity`, `guid`, through [`scan::commit`], unless `SelectTarget`'s
+    /// front returns first ([`super::front`]): with the targeting cursor up the unit is bound to the
+    /// cast and the selection stays.
     pub(super) fn commit(&mut self, entity: Entity, guid: u64) {
         if self.front.takes(entity, guid, self.seam.slots.targeting()) {
             return;
         }
         let me = self.me.single().ok();
-        // The re-swing's gate is `StartAttack`'s on the new target (`0x5ecc16`): alive, then
-        // `CanAttack`, so a body is switched to and never swung at.
-        let attackable = self.stores.get(entity).ok().is_some_and(|store| {
-            let unit = self.relations.unit_of(guid, store);
-            let rel = self.relations.get();
-            scan::attack_target_valid(&rel, self.relations.me().as_ref(), &unit, store)
-        });
-        scan::commit(
+        // The re-swing's gate is `StartAttack`'s on the new target (`0x5ecc16`).
+        let attackable = self.attackable(entity, guid);
+        let old_latches = scan::latches_on(&self.relations, self.selection.guid);
+        let (_, owed) = scan::commit_owing(
             &mut self.selection,
             &mut self.seam,
-            entity,
+            Some(entity),
             guid,
             self.stores.get(entity).ok(),
             me.is_some_and(|(_, _, engaged)| engaged),
             me.map(|(g, _, _)| g.0),
             attackable,
+            old_latches,
         );
+        self.owe_all(owed);
     }
 }
 
@@ -961,7 +1194,9 @@ mod tests {
         world
             .run_system_cached(follow_requests)
             .expect("the drain runs");
-        let keys = std::mem::take(&mut world.resource_mut::<crate::ui_action::UiErrorKeys>().0)
+        let keys = world
+            .resource_mut::<crate::ui_action::UiErrorKeys>()
+            .take()
             .into_iter()
             .map(|e| e.key)
             .collect();
@@ -998,7 +1233,6 @@ mod tests {
                         Filter::AssistableAlive,
                         Match::ExactOnly,
                     )
-                    .map(|(_, guid, _)| guid)
                 })
                 .expect("the scan runs as a one-shot system")
         };
@@ -1116,6 +1350,56 @@ mod tests {
             .entity_mut(me_entity)
             .remove::<crate::net::ActiveMover>();
         assert_eq!(drain(&mut world, unit("target")), no_target, "no mover");
+    }
+
+    /// The start gate refuses a follow with `ERR_TOOBUSYTOFOLLOW` while the mover's
+    /// `UNIT_CHANNEL_SPELL` is set (`0x60ffb9`, the unit block's word at `+0x228`): a channel
+    /// refuses it for as long as it lasts, a hard cast in flight does not.
+    #[test]
+    fn a_channel_refuses_a_follow_and_a_cast_in_flight_does_not() {
+        use crate::target::relations::fixture::{player, HUMAN};
+        /// `UNIT_CHANNEL_SPELL`.
+        const CHANNEL_SPELL: u16 = 144;
+        const DRAIN_LIFE: u32 = 689;
+
+        // (channelling, a cast in flight, followed)
+        for (channel, cast, followed) in [
+            (false, false, true),
+            (true, false, false),
+            (false, true, true),
+        ] {
+            let (mut world, t) = follow_world(player(ME, HUMAN), player(THEM, HUMAN), false);
+            select(&mut world, Some((t, THEM)));
+            if channel {
+                let me = world.resource::<GuidIndex>().0[&ME];
+                world
+                    .entity_mut(me)
+                    .get_mut::<ObjectStore>()
+                    .expect("our descriptor")
+                    .0
+                    .merge(benilla_protocol::ObjectFields::from_pairs(&[(
+                        CHANNEL_SPELL,
+                        DRAIN_LIFE,
+                    )]));
+            }
+            if cast {
+                world.resource_mut::<crate::spell::PendingCast>().push(
+                    DRAIN_LIFE,
+                    None,
+                    std::time::Instant::now(),
+                );
+            }
+            let want: (Vec<&str>, Option<u64>) = if followed {
+                (Vec::new(), Some(THEM))
+            } else {
+                (vec!["ERR_TOOBUSYTOFOLLOW"], None)
+            };
+            assert_eq!(
+                drain(&mut world, unit("target")),
+                want,
+                "channel {channel}, cast in flight {cast}"
+            );
+        }
     }
 
     /// `DoEmote`'s search (`0x49fde9`, typemask 0x10, mode 0) runs the roster passes: a groupmate

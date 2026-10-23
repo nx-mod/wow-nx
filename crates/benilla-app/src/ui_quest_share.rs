@@ -12,14 +12,14 @@
 //! message on a miss, because benilla's cache may not hold a party member yet.
 
 use benilla_protocol::messages::{QuestConfirmAccept, QuestShareMsg};
-use benilla_ui::script::{ScriptValue, UiScript};
+use benilla_ui::script::ScriptValue;
 use bevy::prelude::*;
 
 use crate::names::NameCache;
-use crate::net::{ClientCommand, NetCommands};
+use crate::net::NetCommands;
 use crate::query_cache::Ask;
 use crate::ui_action::{show_messages, ui_error_text, MessageSink, Shown, UiError};
-use crate::ui_script::{UiFeed, UiInput};
+use crate::ui_script::UiFeed;
 
 /// Frames a queued line waits for its name: a name query is one round trip, and a guid the server
 /// will not name would otherwise hold its line all session.
@@ -40,9 +40,6 @@ pub(crate) struct QuestShare {
     pending_confirm: Option<QuestConfirmAccept>,
     /// The held confirm's name has been looked up once, as its packet's: the frames after read.
     confirm_asked: bool,
-    /// The quest `ConfirmAcceptQuest()` answers, latched when the event fires: the verb takes no
-    /// argument (`StaticPopup.lua:731-733`), so it answers the last confirm asked.
-    confirm_quest: Option<u32>,
 }
 
 impl QuestShare {
@@ -67,7 +64,6 @@ impl QuestShare {
     pub(crate) fn clear_session(&mut self) {
         self.verdicts.clear();
         self.pending_confirm = None;
-        self.confirm_quest = None;
     }
 }
 
@@ -114,8 +110,15 @@ mod net {
         }
     }
 
-    fn on_confirm_accept(In(ev): In<SessionEvent>, mut share: ResMut<QuestShare>) {
+    fn on_confirm_accept(
+        In(ev): In<SessionEvent>,
+        mut share: ResMut<QuestShare>,
+        mut giver: ResMut<crate::ui_quest::QuestGiver>,
+    ) {
         if let SessionEvent::QuestConfirmAccept(c) = ev {
+            // The quest `ConfirmAcceptQuest` answers, written at the packet (`0x5019c7`) and
+            // never cleared.
+            giver.confirm = c.quest_id;
             quest_confirm_accept(c, &mut share);
         }
     }
@@ -145,116 +148,95 @@ mod net {
     }
 }
 
-/// Owns [`QuestShare`] and its two systems; nothing here is bound to the questgiver window.
+/// Owns [`QuestShare`] and its feed; nothing here is bound to the questgiver window.
 pub(crate) struct QuestSharePlugin;
 
 impl Plugin for QuestSharePlugin {
     fn build(&self, app: &mut App) {
         net::register(app);
-        // Feed before the input pass, so a line shows the frame its packet lands; drain after
-        // it, so Yes goes out the frame it is clicked.
-        app.init_resource::<QuestShare>().add_systems(
-            Update,
-            (
-                feed_quest_share.in_set(UiFeed),
-                drain_quest_share.after(UiInput),
-            ),
-        );
+        // Feed before the input pass, so a line shows the frame its packet lands; the popup's Yes
+        // sends in its call (`QuestCall::ConfirmAccept`).
+        app.init_resource::<QuestShare>()
+            .add_systems(Update, feed_quest_share.in_set(UiFeed));
     }
 }
 
 /// Resolves the queued names and shows what they unlock: verdict lines and `QUEST_ACCEPT_CONFIRM`.
-fn feed_quest_share(
-    script: Option<NonSendMut<UiScript>>,
+pub(crate) fn feed_quest_share(
+    mut hosted_vm: crate::script_calls::HostedVm,
     mut share: ResMut<QuestShare>,
     names: Res<NameCache>,
     commands: Res<NetCommands>,
     mut sink: MessageSink,
 ) {
-    let Some(mut script) = script else {
-        return;
-    };
-
-    // The verdicts: one line per resolved name, the rest kept for the next frame.
-    let mut lines: Vec<Shown> = Vec::new();
-    let mut waiting = Vec::new();
-    for mut v in std::mem::take(&mut share.verdicts) {
-        let Some(key) = verdict_message(v.msg) else {
-            debug!(
-                "ui_quest_share: unmapped push verdict {} — no line",
-                v.msg.0
-            );
-            continue;
+    hosted_vm.run(|script| {
+        let Some(script) = script else {
+            return;
         };
-        // The packet's frame asks (the module's deviation); the retries ask only what the cache
-        // holds nothing for.
-        match names
-            .resolve_player(v.member, Ask::at(v.tries == 0, &commands))
-            .map(str::to_string)
-        {
-            Some(name) => {
-                let err = UiError::s(key, name);
-                let get = |k: &str| script.lua().globals().get::<String>(k).ok();
-                if let Some(text) = ui_error_text(&err, &get) {
-                    lines.push(Shown::keyed(err.key, text));
+
+        // The verdicts: one line per resolved name, the rest kept for the next frame.
+        let mut lines: Vec<Shown> = Vec::new();
+        let mut waiting = Vec::new();
+        for mut v in std::mem::take(&mut share.verdicts) {
+            let Some(key) = verdict_message(v.msg) else {
+                debug!(
+                    "ui_quest_share: unmapped push verdict {} — no line",
+                    v.msg.0
+                );
+                continue;
+            };
+            // The packet's frame asks (the module's deviation); the retries ask only what the cache
+            // holds nothing for.
+            match names
+                .resolve_player(v.member, Ask::at(v.tries == 0, &commands))
+                .map(str::to_string)
+            {
+                Some(name) => {
+                    let err = UiError::s(key, name);
+                    let get = |k: &str| script.lua().globals().get::<String>(k).ok();
+                    if let Some(text) = ui_error_text(&err, &get) {
+                        lines.push(Shown::keyed(err.key, text));
+                    }
                 }
-            }
-            None => {
-                v.tries += 1;
-                if v.tries < NAME_MAX_TRIES {
-                    waiting.push(v);
-                } else {
-                    debug!(
-                        "ui_quest_share: gave up naming {:#x} for verdict {}",
-                        v.member, v.msg.0
-                    );
+                None => {
+                    v.tries += 1;
+                    if v.tries < NAME_MAX_TRIES {
+                        waiting.push(v);
+                    } else {
+                        debug!(
+                            "ui_quest_share: gave up naming {:#x} for verdict {}",
+                            v.member, v.msg.0
+                        );
+                    }
                 }
             }
         }
-    }
-    share.verdicts = waiting;
-    show_messages(&mut script, &mut sink, "ui_quest_share", lines);
+        share.verdicts = waiting;
+        show_messages(script, &mut sink, "ui_quest_share", lines);
 
-    // The escort confirm, once the member's name lands: player first, then title, as
-    // `QUEST_ACCEPT` fills them.
-    let ask = Ask::at(
-        !std::mem::replace(&mut share.confirm_asked, true),
-        &commands,
-    );
-    if let Some(c) = share.pending_confirm.as_ref() {
-        if let Some(name) = names.resolve_player(c.sender, ask).map(str::to_string) {
-            let title = c.title.clone();
-            share.confirm_quest = Some(c.quest_id);
-            share.pending_confirm = None;
-            script.fire_event(
-                "QUEST_ACCEPT_CONFIRM",
-                vec![ScriptValue::Str(name), ScriptValue::Str(title)],
-            );
+        // The escort confirm, once the member's name lands: player first, then title, as
+        // `QUEST_ACCEPT` fills them.
+        let ask = Ask::at(
+            !std::mem::replace(&mut share.confirm_asked, true),
+            &commands,
+        );
+        if let Some(c) = share.pending_confirm.as_ref() {
+            if let Some(name) = names.resolve_player(c.sender, ask).map(str::to_string) {
+                let title = c.title.clone();
+                share.pending_confirm = None;
+                script.fire_event(
+                    "QUEST_ACCEPT_CONFIRM",
+                    vec![ScriptValue::Str(name), ScriptValue::Str(title)],
+                );
+            }
         }
-    }
-}
-
-/// `ConfirmAcceptQuest()`, the popup's Yes, answered with the latched quest id.
-fn drain_quest_share(
-    script: Option<NonSendMut<UiScript>>,
-    share: Res<QuestShare>,
-    commands: Res<NetCommands>,
-) {
-    let Some(mut script) = script else {
-        return;
-    };
-    for _ in 0..script.take_quest_confirms() {
-        let Some(quest) = share.confirm_quest else {
-            debug!("ui_quest_share: ConfirmAcceptQuest with no confirm held — ignored");
-            continue;
-        };
-        let _ = commands.0.send(ClientCommand::QuestConfirmAccept { quest });
-    }
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use benilla_ui::script::UiScript;
 
     /// A verdict's and a confirm's packet frame looks the member up once (the module's deviation);
     /// the frames they wait through ask only what the cache holds nothing for. A refused name is

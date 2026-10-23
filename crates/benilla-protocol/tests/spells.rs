@@ -92,6 +92,13 @@ fn spell_and_action_wire() {
         "item cast: u32 id + u16 mask 0x10 + packed item guid"
     );
 
+    // The partner's non-traded slot, 6, as `0x6e6900` binds it: mask 0x1000, packed guid {6, 0}.
+    assert_eq!(
+        messages::cast_spell_trade_item(7418, 6),
+        hx("fa1c000000100106"),
+        "trade-slot cast: u32 id + u16 mask 0x1000 + packed guid 6 (mask 0x01)"
+    );
+
     // CMSG_ATTACKSWING: one full 8-byte guid, not packed.
     assert_eq!(messages::attack_swing(victim), hx("2a000045000030f1"));
 
@@ -948,7 +955,7 @@ fn combat_log_wire_golden() {
     body.extend_from_slice(&250u32.to_le_bytes()); // total
     body.push(0); // xpType: kill
     body.extend_from_slice(&200u32.to_le_bytes()); // base xp (kept: rested bonus = total − base)
-    body.extend_from_slice(&1.25f32.to_le_bytes()); // group bonus (dropped)
+    body.extend_from_slice(&1.25f32.to_le_bytes()); // group float
     let packet = messages::parse_server(messages::opcode::SMSG_LOG_XPGAIN, &body).unwrap();
     match &packet {
         ServerPacket::XpGain(x) => {
@@ -959,6 +966,7 @@ fn combat_log_wire_golden() {
                     total: 250,
                     base: 200,
                     kill: true,
+                    group: 1.25,
                 }
             );
         }
@@ -982,6 +990,7 @@ fn combat_log_wire_golden() {
                     total: 50,
                     base: 50, // non-kill carries no base on the wire; base = total
                     kill: false,
+                    group: 1.0, // nor a float: the handler's own 1.0
                 }
             );
         }

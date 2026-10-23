@@ -64,7 +64,9 @@ fn harness_with_bags() -> UiScript {
 fn seed_items(s: &mut UiScript) {
     let mut inv: InventorySlots = Default::default();
     inv[1] = Some(InvSlotView {
+        uncached_link: None,
         duration_ms: None,
+        field_duration: 0,
         already_bound: false,
         occupied_seats: None,
         bonding: 0,
@@ -72,6 +74,7 @@ fn seed_items(s: &mut UiScript) {
         use_fork: Default::default(),
         bar_placeable: true,
         consumable: false,
+        spell_charges: [0; 5],
         durability: None,
         flags: 0,
         item_id: 1234,
@@ -79,6 +82,7 @@ fn seed_items(s: &mut UiScript) {
         count: 1,
         contents_count: None,
         quality: 2,
+        inventory_type: Some(1),
         name: Some("Test Helm".into()),
         link: Some("|cff1eff00|Hitem:1234:0:0:0|h[Test Helm]|h|r".into()),
         guid: 0x715,
@@ -120,9 +124,11 @@ fn seed_items(s: &mut UiScript) {
     slots.insert(
         1,
         ContainerSlot {
+            uncached_link: None,
             use_fork: Default::default(),
             item_class: None,
             duration_ms: None,
+            field_duration: 0,
             petition: None,
             already_bound: false,
             occupied_seats: None,
@@ -148,6 +154,7 @@ fn seed_items(s: &mut UiScript) {
             flags: 0,
             enchants: Vec::new(),
             spell_0: false,
+            spell_charges: [0; 5],
         },
     );
     s.set_container(
@@ -200,7 +207,9 @@ fn doll_hover_renders_the_live_instance() {
     // A broken helm: instance pair (0, 40), the template at full.
     let mut inv: InventorySlots = Default::default();
     inv[1] = Some(InvSlotView {
+        uncached_link: None,
         duration_ms: None,
+        field_duration: 0,
         already_bound: false,
         occupied_seats: None,
         bonding: 0,
@@ -208,6 +217,7 @@ fn doll_hover_renders_the_live_instance() {
         use_fork: Default::default(),
         bar_placeable: true,
         consumable: false,
+        spell_charges: [0; 5],
         durability: Some((0, 40)),
         flags: 0,
         item_id: 1234,
@@ -215,6 +225,7 @@ fn doll_hover_renders_the_live_instance() {
         count: 1,
         contents_count: None,
         quality: 2,
+        inventory_type: Some(1),
         name: Some("Test Helm".into()),
         link: Some("|cff1eff00|Hitem:1234:0:0:0|h[Test Helm]|h|r".into()),
         guid: 0x717,

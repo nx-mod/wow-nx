@@ -13,6 +13,16 @@ impl ObjectFields {
     pub fn item_owner(&self) -> Option<u64> {
         self.get_guid(6)
     }
+    /// `ITEM_FIELD_CONTAINED` (field 8): the bag holding the item, or its owner for an item in
+    /// one of the player's own seats.
+    pub fn item_contained(&self) -> Option<u64> {
+        self.get_guid(8)
+    }
+    /// `OBJECT_FIELD_TYPE` itself, the type mask: 9 for a creature or a pet, `0x19` for a player.
+    /// The display resolve asks the creature cache only for 9 (`0x60b134`).
+    pub fn object_type_mask(&self) -> Option<u32> {
+        self.get_u32(FIELD_OBJECT_TYPE)
+    }
     /// `OBJECT_FIELD_TYPE & TYPEMASK_ITEM`: an item, a bag included.
     pub fn is_item(&self) -> bool {
         self.get_u32(FIELD_OBJECT_TYPE).unwrap_or(0) & 0x2 != 0
@@ -27,6 +37,12 @@ impl ObjectFields {
         (i < 5)
             .then(|| self.get_u32(FIELD_ITEM_SPELL_CHARGES + u16::from(i)))?
             .map(|v| v as i32)
+    }
+    /// `ITEM_FIELD_DURATION` (field 15, the client's `[item+0x114]+0x24`): a timed item's
+    /// lifetime as the object carries it, 0 for none. The countdown a tooltip shows comes from
+    /// `SMSG_ITEM_TIME_UPDATE` instead.
+    pub fn item_duration(&self) -> Option<u32> {
+        self.get_u32(15)
     }
     /// `ITEM_FIELD_FLAGS` (field 21): `0x08` wrapped, never alerts; `0x10` forces red status 4.
     pub fn item_flags(&self) -> Option<u32> {
@@ -55,6 +71,12 @@ impl ObjectFields {
             .map(|id| id as i32)
             .filter(|&id| id != 0)
     }
+    /// `ITEM_FIELD_ENCHANTMENT + 1` (field 23): a charter's signature count, in slot 0's duration
+    /// dword beside the petition id; the tooltip reads it at `flds+0x44` (`0x52ba51`). vmangos
+    /// leaves the write out (`PetitionsHandler.cpp:307`), so it reads 0 there.
+    pub fn item_petition_signatures(&self) -> u32 {
+        self.get_u32(FIELD_ITEM_ENCHANTMENT + 1).unwrap_or(0)
+    }
     /// `ITEM_FIELD_ENCHANTMENT + 3*slot + 2`: charges left, shown as `" (N Charges)"` if nonzero.
     /// The tooltip skips the duration; a countdown comes from `SMSG_ITEM_ENCHANT_TIME_UPDATE`.
     pub fn item_enchant_charges(&self, slot: u8) -> u32 {
@@ -62,6 +84,11 @@ impl ObjectFields {
             .then(|| self.get_u32(FIELD_ITEM_ENCHANTMENT + 3 * u16::from(slot) + 2))
             .flatten()
             .unwrap_or(0)
+    }
+    /// `ITEM_FIELD_PROPERTY_SEED` (field 43, the client's `[item+0x114]+0x94`): the fourth number
+    /// of the item's link (`0x52ae88`), 0 when unset.
+    pub fn item_property_seed(&self) -> u32 {
+        self.get_u32(43).unwrap_or(0)
     }
     /// `ITEM_FIELD_RANDOM_PROPERTIES_ID` (field 44): the `ItemRandomProperties.dbc` suffix, 0 if
     /// none; only the name uses it (`0x5d8b00`), the roll's enchants fill enchant slots 2-6.
@@ -83,6 +110,14 @@ impl ObjectFields {
     /// `CONTAINER_FIELD_SLOT_1 + 2i`: the item guid in bag slot `i`, `Some(0)` when empty.
     pub fn container_slot(&self, i: u8) -> Option<u64> {
         (i < 36).then(|| self.get_guid(FIELD_CONTAINER_SLOT_1 + 2 * u16::from(i)))?
+    }
+    /// `PLAYER_VISIBLE_ITEM_<slot>_CREATOR`: the creator guid of the item worn in equipment slot
+    /// `i`, the visible-item block's first two dwords (`0x5333cd`), 0 for none.
+    pub fn player_visible_item_creator(&self, i: u8) -> u64 {
+        (i < 19)
+            .then(|| self.get_guid(FIELD_PLAYER_VISIBLE_ITEM_1_CREATOR + 12 * u16::from(i)))
+            .flatten()
+            .unwrap_or(0)
     }
     /// `PLAYER_VISIBLE_ITEM_<slot>_0`: the public entry worn in equipment slot `i`, which other
     /// clients render from; each slot is 12 dwords, the entry after a 2-dword creator.
@@ -115,6 +150,14 @@ impl ObjectFields {
             .flatten()
             .unwrap_or(0)
             & 0xffff
+    }
+    /// The high half of slot `i`'s `PLAYER_VISIBLE_ITEM_<slot>_PROPERTIES` dword (block `+0x2a`):
+    /// `GetVirtualItem 0x5ec240` takes bit 0 set as no weapon in the hand (`0x5ec2ee`).
+    pub fn player_visible_item_flags(&self, i: u8) -> u16 {
+        (i < 19)
+            .then(|| self.get_u32(FIELD_PLAYER_VISIBLE_ITEM_1_CREATOR + 10 + 12 * u16::from(i)))
+            .flatten()
+            .map_or(0, |v| (v >> 16) as u16)
     }
     /// `PLAYER_FIELD_INV_SLOT_HEAD + 2i`: our equipment (0-18) and equipped-bag (19-22) guids.
     pub fn player_inv_slot(&self, i: u8) -> Option<u64> {
@@ -194,6 +237,11 @@ impl ObjectFields {
     /// every creep-flagged unit then gets a minimap dot (`0x5ed210`, the `+0x1028` read).
     pub fn player_track_stealthed(&self) -> bool {
         self.get_u32(FIELD_PLAYER_FIELD_BYTES).unwrap_or(0) & 0x2 != 0
+    }
+    /// `PLAYER_FIELD_BYTES` byte 0 bit `0x4` (vmangos `PLAYER_FIELD_BYTE_LOGGING_OUT`): the cast
+    /// validator refuses a living player with it `0x61` (`0x60982b`, `[+0xe68]+0x1028`).
+    pub fn player_logging_out(&self) -> bool {
+        self.get_u32(FIELD_PLAYER_FIELD_BYTES).unwrap_or(0) & 0x4 != 0
     }
     /// `PLAYER_QUEST_LOG_<slot+1>_*`: one quest-log slot, `quest_id == 0` when the server cleared
     /// it; the count-state and timer are written with the id (`Player.h:1094-1099`).
@@ -313,6 +361,11 @@ impl ObjectFields {
         self.get_u32(FIELD_PLAYER_SELF_RES_SPELL)
             .filter(|&s| s != 0)
     }
+    /// `PLAYER_FIELD_PVP_MEDALS` (player block `+0x1034`): medal `n` is bit `n - 1`, which the item
+    /// tooltip (`0x52d70a`) and the usable gate (`0x5eaa89`) test.
+    pub fn player_pvp_medals(&self) -> Option<u32> {
+        self.get_u32(FIELD_PLAYER_PVP_MEDALS)
+    }
     /// `PLAYER_BYTES`: skinColor, faceType, hairStyle and hairColor, bytes 0 to 3.
     pub fn player_bytes(&self) -> Option<u32> {
         self.get_u32(FIELD_PLAYER_BYTES)
@@ -392,6 +445,11 @@ impl ObjectFields {
     pub fn player_guild_rank(&self) -> u32 {
         self.get_u32(FIELD_PLAYER_GUILDRANK).unwrap_or(0)
     }
+    /// `PLAYER_GUILD_TIMESTAMP` (field 197): public, a stamp the server moves to make every client
+    /// re-ask the player's guild record (`0x5e2890`).
+    pub fn player_guild_timestamp(&self) -> u32 {
+        self.get_u32(FIELD_PLAYER_GUILD_TIMESTAMP).unwrap_or(0)
+    }
     /// `PLAYER_FIELD_BYTES` byte 0 bit `0x08`, `PLAYER_FIELD_BYTE_RELEASE_TIMER`: set at death
     /// outside instances, where the server releases the spirit after 6 minutes; the client arms
     /// its own `now + 360000` ms, and with the bit clear `GetReleaseTimeRemaining()` is -1.
@@ -433,7 +491,9 @@ impl ObjectFields {
             .map(|b| ((b >> 24) & 0xff) as u8)
     }
     /// `PLAYER_BYTES_3` byte 2 (public): the city-protector title, a race id (`Player.h:354`);
-    /// `UnitPVPName` (`0x609370`) appends `PVP_MEDAL<n>` when nonzero. vmangos never writes it.
+    /// `UnitPVPName` (`0x609370`) appends `PVP_MEDAL<n>` when nonzero. vmangos sets it to the
+    /// player's race in `Player::SetCityTitle` and clears it in `RemoveCityTitle`
+    /// (`Player.cpp:1092-1101`).
     pub fn player_pvp_medal(&self) -> Option<u8> {
         self.get_u32(FIELD_PLAYER_BYTES_3)
             .map(|b| ((b >> 16) & 0xff) as u8)

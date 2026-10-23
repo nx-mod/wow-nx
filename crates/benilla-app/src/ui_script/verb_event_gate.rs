@@ -24,22 +24,6 @@ const ELSEWHERE: &[(&str, &str, &str)] = &[];
 /// Pairs nothing fires on the verb's path, each with its reason.
 const GAP: &[(&str, &str, &str)] = &[
     (
-        "ClickTargetTradeButton",
-        "TRADE_REPLACE_ENCHANT",
-        "the reference runs the enchant clash check 0x496170 when a spell is on the cursor and \
-         fires this for the replace dialog; casting \
-         an enchant onto the partner's slot is not built here — `ui_trade.rs` only mirrors the \
-         wire's enchant slot — so the verb is the money arm alone",
-    ),
-    (
-        "CloseTrade",
-        "PLAYER_TRADE_MONEY",
-        "fired only when the trade did not complete (`[0xb71748] == 0`), \
-         zeroing the cancelled offer under a frame TRADE_CLOSED \
-         hides; here `TradeSession::begin` resets the whole session at the next trade, so the \
-         next window opens at zero either way",
-    ),
-    (
         "CollapseCraftSkillLine",
         "CRAFT_UPDATE",
         "the reference commits through the 21-byte thunk 0x4f6be0 (the trainer's 0x4d8c90 shape); \
@@ -52,13 +36,6 @@ const GAP: &[(&str, &str, &str)] = &[
         "ExpandCraftSkillLine",
         "CRAFT_UPDATE",
         "the same thunk and the same no-op as CollapseCraftSkillLine",
-    ),
-    (
-        "PetDismiss",
-        "PET_DISMISS_START",
-        "the worker 0x4bd6e0 sends the dismiss and fires this with a duration (`%d`, 10000); \
-         no shipped file listens, the dismiss reaches the \
-         wire through the app's drain, and the pet frame follows the unit's departure",
     ),
     (
         "SelectGossipOption",

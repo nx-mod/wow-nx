@@ -33,6 +33,8 @@ mod worldmap_arrow;
 mod button;
 mod calls;
 mod camera_view;
+#[cfg(any(test, feature = "test-support"))]
+pub mod census;
 mod channel;
 mod char_stats;
 pub mod chat_bubble;
@@ -85,8 +87,8 @@ pub use glue::{glue_events, VmKind};
 pub use glue_core::scanf_d;
 pub use glue_core::{
     glue_status_key, launch_addon_url, launch_addon_url_allowed, launch_url_allowed, GlueCall,
-    GlueCredentials, GlueHost, GlueNotice, GlueRequest, GlueSignal, GlueText, NoticeState,
-    GLUE_STATUS_KEYS,
+    GlueCredentials, GlueHost, GlueNotice, GlueNotices, GlueRequest, GlueSignal, GlueText,
+    NoticeState, GLUE_STATUS_KEYS,
 };
 pub use glue_create::{
     GlueCreateCatalog, GlueCreateClass, GlueCreateCounts, GlueCreateLook, GlueCreateRace,
@@ -116,6 +118,7 @@ pub use surface::widget_method_census;
 mod input_verbs;
 mod inspect;
 mod inventory_verbs;
+mod item_calls;
 mod item_stats;
 mod item_text;
 pub mod keybind;
@@ -182,13 +185,17 @@ mod taxi;
 mod tick;
 pub use tick::system_chat_args;
 mod tooltip;
+mod tooltip_aura;
 mod tooltip_item;
 mod tooltip_spell;
+mod tooltip_studied;
+mod tooltip_text;
 mod tooltip_unit;
 mod ui_errors;
 mod ui_scale;
 mod update_walk;
-pub use tooltip_unit::TooltipTint;
+pub use tooltip_studied::{PetAbility, StudiedCreature};
+pub use tooltip_unit::{OwnerTitle, OwnerTitleKind, PartyRecord, TooltipTint, UnitTooltipFacts};
 mod trade;
 mod tradeskill;
 mod trainer;
@@ -204,15 +211,20 @@ mod worn_display;
 pub(crate) mod xml_layout;
 mod zone_text;
 
-pub use action::{ActionSlot, ActionState, ActionUse, CastView, OpenProfessions, Profession};
+pub use action::{
+    macro_slot_id, macro_slot_word, ActionSlot, ActionState, ActionUse, CastView, OpenProfessions,
+    Profession,
+};
 pub use addon::{addon_load_context, AddOnInfo, AddonLoad, AddonReply, AddonSecurity};
 pub use addon_enable::{AddonStateFiles, EnableHash, EnableStore};
 pub use addon_message::{AddonDistribution, AddonSend};
 pub use auction::{
-    AuctionBid, AuctionCategory, AuctionHighBidder, AuctionItemRow, AuctionListState, AuctionQuery,
-    AuctionStartRequest, AuctionState, AuctionSubCategory, BIDDER, LIST, OWNER, SORT_KEYS,
+    cancel_fee, tick_ms as auction_tick_ms, AuctionBid, AuctionCall, AuctionCategory,
+    AuctionHighBidder, AuctionItemRow, AuctionListState, AuctionQuery, AuctionRowBid,
+    AuctionStartRequest, AuctionState, AuctionSubCategory, BidVerdict, BIDDER, LIST, OWNER,
+    SORT_KEYS,
 };
-pub use aura::{AuraState, TrackingState};
+pub use aura::{AuraState, TrackingState, UnitAuraList};
 pub use backdrop::{Backdrop, Insets};
 pub use bank::BankState;
 pub use battlefield_positions::{BattlefieldFlagView, BattlefieldPositionView};
@@ -222,15 +234,19 @@ pub use bind_confirm::PendingEquipAnswer;
 pub use binding_abi::{ftol, s_str_to_float, s_str_to_int};
 pub use calls::{NearestMode, QueuedCall, ScriptCall};
 pub use camera_view::{CameraViewRequest, CAMERA_VIEW_COUNT};
-pub use channel::{ChannelCommand, RecruitmentPlan, RecruitmentRun, ZoneChannelRow};
+pub use channel::{ChannelCommand, JoinedChannel, RecruitmentPlan, ZoneChannelRow};
 pub use char_stats::{
     weapon_subclass_skill, BankBagSlots, InvSlotView, InventorySlots, UnitCombatStats,
     BANK_BAG_SLOT_COUNT, INVENTORY_SLOT_COUNT, SKILL_DEFENSE, SKILL_UNARMED,
 };
 pub use chat_misc::EmoteRequest;
-pub use chat_send::{ChatGroup, ChatSend, SEND_CHAT_TOKENS};
+pub use chat_send::{
+    expand_target_tokens, validate_escapes, ChatGroup, ChatSend, InvalidEscape, INVALID_ESCAPE,
+    SEND_CHAT_TOKENS,
+};
 pub use chat_types::ChatTypeColor;
 pub use chat_window::{message_group_index, ChatWindowLook, MESSAGE_GROUPS};
+pub use console_exec::s_str_tokenize;
 pub use console_exec::{console_word, cvar_name_arg, no_such_cvar, set_args};
 pub use container::{
     BagAutoStore, ContainerMove, ContainerSlot, ContainerState, ContainerUse, EnchantView,
@@ -251,10 +267,10 @@ pub use cvar_checks::{
     check_small_cull, check_tex_lod_bias, check_triple_buffer, CvarCheck, CvarRows, CvarVerdict,
 };
 pub use cvar_checks::{
-    check_dist_cull, check_error_filter, check_footstep_bias, check_horizon_farclip,
-    check_lod_dist, check_map_obj_light_lod, check_max_lights, check_particle_density,
-    check_shadow_bias, check_target_nearest_distance, check_texture_lod_dist, check_unit_draw_dist,
-    check_water_lod,
+    check_dist_cull, check_error_filter, check_ffx_echo, check_footstep_bias,
+    check_horizon_farclip, check_lod_dist, check_map_obj_light_lod, check_max_lights,
+    check_particle_density, check_shadow_bias, check_target_nearest_distance,
+    check_texture_lod_dist, check_unit_draw_dist, check_water_lod, scanf_f_prefix,
 };
 pub use cvars::small_cull_text;
 pub use cvars::{
@@ -268,23 +284,24 @@ pub use duel::DuelRequest;
 pub use follow::FollowRequest;
 pub use gm_survey::{GmSurveyTables, SurveyAnswerSend};
 pub use gm_ticket::{GmTicketIntent, GmTicketWrite};
-pub use gossip::{GossipMenu, GossipOptionView, GossipQuestRow};
+pub use gossip::{GossipCall, GossipMenu, GossipOptionView, GossipQuestRow};
 pub use guild::{
-    GuildMemberInfo, GuildRankEdit, GuildRankInfo, GuildRequest, GuildState, LastOnline, UnitGuild,
-    MAX_RANKS, MIN_RANKS, RANK_RIGHT_BITS,
+    GuildCall, GuildCells, GuildMemberInfo, GuildRankEdit, GuildRankInfo, GuildState, LastOnline,
+    UnitGuild, MAX_RANKS, MIN_RANKS, RANK_RIGHT_BITS,
 };
 pub use host::{CallHost, CallTail};
 pub use input_verbs::{BindingInput, FiredInput, HeldInput};
+pub use item_calls::ItemCall;
 pub use lfg::LfgDungeon;
 pub use lottery::UnservedSend;
 pub use modelframe::{CharacterPaneFrame, ModelPaneFrame, ModelWanted};
 pub use petition::{
-    validate_guild_name, PetitionRecordView, PetitionRequest, PetitionState, PETITION_TYPE_CHARTER,
+    validate_guild_name, PetitionCall, PetitionRecordView, PetitionState, PETITION_TYPE_CHARTER,
     PETITION_TYPE_PETITION,
 };
 pub use protected::InputEvents;
 pub use tabard::{
-    emblem_mask_path, TabardHost, TabardIntent, EMBLEM_MASK_TOKEN, TABARD_COUNTS,
+    emblem_mask_path, TabardCall, TabardHost, EMBLEM_MASK_TOKEN, TABARD_COUNTS,
     TABARD_CREATION_COST,
 };
 pub use video_pairs::VIDEO_PAIR_CVARS;
@@ -292,19 +309,26 @@ pub use worldmap_arrow::ARROW_MODEL;
 
 pub(crate) use button::{refresh_label_lua, state_font_lua, LabelFont};
 pub(crate) use font_block::{face_loads, own_font_lua, SAME_FONT_HEIGHT};
-pub use inspect::{InspectView, UnitReach};
-pub use item_stats::{item_usable, ItemSetView, ItemTemplateView, PlayerReqState};
+pub use inspect::UnitReach;
+pub use item_stats::{
+    item_usable, ItemRecipe, ItemSetView, ItemSpellLine, ItemTemplateView, PlayerReqState,
+    TaughtSpell,
+};
 pub use item_text::ItemTextState;
 pub use layout_cache::{AnchorLayout, FrameLayout, LayoutPoint};
 pub use lock_check::{check_lock, LockCheck, LockOpener, LockOpeners, LockSlotView};
-pub use loot::{LootRow, LootState, LOOT_PORTRAIT_UNIT};
+pub use loot::{LootCall, LootRow, LootState, LOOT_PORTRAIT_UNIT};
 pub use loot_roll::{LootRollEntry, LootRollsState};
-pub use macros::{MacroBinding, MacroState, MacroView, MAX_MACROS, MAX_MACRO_BODY, MAX_MACRO_NAME};
+pub use macros::{
+    macro_lines, MacroBinding, MacroDerives, MacroState, MacroView, CHARACTER_ID_BASE, MAX_MACROS,
+    MAX_MACRO_BODY, MAX_MACRO_NAME,
+};
 pub use mail::{
-    MailInboxRow, MailInvoice, MailSendRequest, MailState, PackageView, StationeryView,
+    MailCall, MailInboxRow, MailInvoice, MailRowVerb, MailSendRequest, MailState, PackageView,
+    StationeryView,
 };
 pub use measure::TextMeasure;
-pub use merchant::{ItemStatsHead, MerchantItem, MerchantState, RepairCosts};
+pub use merchant::{ItemStatsHead, MerchantCall, MerchantItem, MerchantState, RepairCosts};
 pub(crate) use minimap::apply_model_attrs as apply_minimap_model_attrs;
 pub use minimap::{
     MinimapRimArrow, CORPSE_ARROW as MINIMAP_CORPSE_ARROW, GROUP_ARROW as MINIMAP_GROUP_ARROW,
@@ -315,41 +339,46 @@ pub use model::{
     FontProbe, MacroIconSource, TextureProbe, TextureSizeFn, TextureSizeProbe, WorldLocFn,
     WorldLocProjector,
 };
-pub use party::{PartyMemberInfo, PartyRequest, PartyState, RaidMemberInfo, SavedInstanceInfo};
-pub use pet::{PetActionView, PetStats};
-pub use pvp::{decorated_name, pvp_name_global_keys, HonorState, InspectHonorData, RankTitle};
-pub use quest::{
-    QuestAction, QuestItemView, QuestPanel, QuestRewardSpell, QuestSelect, QuestState,
+pub use party::{
+    PartyMemberInfo, PartyRequest, PartyState, RaidMemberInfo, ReadyCheckState, SavedInstanceInfo,
 };
-pub use quest_log::{QuestObjectiveView, QuestRecordView, QuestSlotView, QUEST_LOG_SLOTS};
+pub use pet::{PetActionView, PetCall, PetStats, PET_DISMISS_WORD};
+pub use pvp::{decorated_name, pvp_name_global_keys, HonorState, InspectHonorData, RankTitle};
+pub use quest::{QuestCall, QuestItemView, QuestPanel, QuestRewardSpell, QuestSelect, QuestState};
+pub use quest_log::{
+    QuestLogCarry, QuestObjectiveView, QuestRecordView, QuestSlotView, QUEST_LOG_SLOTS,
+};
 pub(crate) use region::{
     apply_texture_name, apply_wrap_attrs, implicit_creation_anchor_lua, install_loaded_texture,
     load_blend_mode, load_texture_file, load_texture_name, load_xml_font_file,
     texture_name_verdict, FileLoad,
 };
-pub use reputation::{FactionEntry, ReputationSend, ReputationState};
+pub use reputation::{FactionEntry, ReputationCall, ReputationState};
 pub use session::SessionRequest;
 pub use shapeshift::ShapeshiftFormView;
 pub(crate) use simplehtml::{
     element_fonts_lua as simplehtml_element_fonts_lua,
     element_of_xml_tag as simplehtml_element_of_xml_tag,
 };
-pub use skills::{SkillEntry, SkillsState};
-pub use social::{FriendInfo, SocialRequest, SocialState, WhoInfo};
+pub use skills::{SkillCall, SkillEntry, SkillsState};
+pub use social::{FriendInfo, IgnoreInfo, SocialCall, SocialState, WhoInfo};
 pub use sound::{MusicRequest, SoundRequest};
 pub use spellbook::{
-    resolve_spell_by_name, PetBookState, SpellBookState, SpellSlotView, SpellTabView,
+    resolve_spell_in_books, NamedSpell, PetBookState, SpellBookState, SpellSlotView, SpellTabName,
+    SpellTabView,
 };
-pub use stable::{StableIntent, StablePetSlot, StableState, NUM_STABLE_SLOTS};
+pub use stable::{StableCall, StableIntent, StablePetSlot, StableState, NUM_STABLE_SLOTS};
 pub use summon::SummonConfirmUiState;
-pub use talent::{TalentPrereqView, TalentTabView, TalentUiState, TalentView};
-pub use taxi::{TaxiNodeType, TaxiUiNode, TaxiUiState};
-pub use tooltip_spell::SpellTooltipView;
-pub use trade::{TradeSideState, TradeSlotItem, TradeState, TRADE_SLOTS};
+pub use talent::{TalentCall, TalentPrereqView, TalentTabView, TalentUiState, TalentView};
+pub use taxi::{TaxiCall, TaxiNodeType, TaxiUiNode, TaxiUiState};
+pub use tooltip_aura::{AuraKey, AuraTooltipView};
+pub use tooltip_spell::{ReputationRequirement, SpellTooltipView};
+pub use tooltip_text::{KeyedArg, TextPart, TooltipText};
+pub use trade::{TradeCall, TradeOpenItem, TradeSideState, TradeSlotItem, TradeState, TRADE_SLOTS};
 pub use tradeskill::{TradeSkillDifficulty, TradeSkillReagent, TradeSkillRecipe, TradeSkillState};
 pub use trainer::{
-    TrainerAbilityReq, TrainerGroup, TrainerService, TrainerServiceCategory, TrainerSkillReq,
-    TrainerState, TrainerTooltip, TRAINER_GROUP_KNOWN,
+    TrainerAbilityReq, TrainerCall, TrainerGroup, TrainerService, TrainerServiceCategory,
+    TrainerSkillReq, TrainerState, TrainerTooltip, TRAINER_GROUP_KNOWN,
 };
 pub(crate) use types::{monochrome_flag, FontMask, MeasuredText, RegionData};
 pub use types::{
@@ -357,7 +386,7 @@ pub use types::{
     ExtractedQuad, FontObject, FontShadow, Gradient, JustifyH, JustifyV, LineMeasureRequest,
     MeasureRequest, Outline, QuadContent, ScriptValue, TexCoords, TextShadow,
 };
-pub use unit::by_name::{self, NameCandidate};
+pub use unit::by_name::{self, NameCandidate, SeatedSelection};
 pub use unit::{
     grey_band, level_reads_unknown, parse_unit_token, power_token, unit_is_grey, PlayerRecord,
     SelectionRequest, UnitBase, UnitGuids, UnitRelations, UnitState, UnitTokenParse,
@@ -616,8 +645,8 @@ fn open_state(vm: VmKind) -> mlua::Result<Lua> {
     let mut model = Model::new();
     model.vm = vm;
     lua.set_app_data(model);
-    // Before anything can fire a handler and while no app-data borrow is held, as the
-    // profiler's slot and the call host's require.
+    // Before anything can fire a handler: every VM carries the profiler's slot and the call
+    // host's.
     handler_prof::install(&lua);
     host::install(&lua);
 
@@ -764,6 +793,7 @@ impl UiScript {
     pub fn new() -> mlua::Result<UiScript> {
         let lua = install_framescript(VmKind::InGame)?;
         install_in_game(&lua)?;
+        object::guard_receivers(&lua)?;
         Ok(Self::host(lua))
     }
 
@@ -775,6 +805,7 @@ impl UiScript {
     pub fn new_glue() -> mlua::Result<UiScript> {
         let lua = install_framescript(VmKind::Glue)?;
         glue::install(&lua)?;
+        object::guard_receivers(&lua)?;
         Ok(Self::host(lua))
     }
 
@@ -832,8 +863,12 @@ impl UiScript {
         let session = NEXT_SESSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut model = self.model_ref().clone();
         model.session = session;
+        // What waits is the original's host's, and its handlers' values its VM's.
+        model.script_calls.clear();
         lua.set_app_data(model);
+        // A fork is a VM of its own, so it carries the profiler's slot and the call host's.
         handler_prof::install(&lua);
+        host::install(&lua);
         UiScript {
             lua,
             instructions: Default::default(),
@@ -1094,16 +1129,20 @@ impl UiScript {
 
     /// Run a chunk under the name the 1.12 client gives it ([`addon_chunk_name`] for addon files).
     pub fn run_chunk_named(&self, chunk: &[u8], name: &str) -> mlua::Result<()> {
-        self.lua
-            .load(crate::source::chunk(chunk))
-            .set_name(name)
-            .set_mode(mlua::ChunkMode::Text)
-            .exec()
+        host::unheld(&self.lua, || {
+            self.lua
+                .load(crate::source::chunk(chunk))
+                .set_name(name)
+                .set_mode(mlua::ChunkMode::Text)
+                .exec()
+        })
     }
 
     /// Load and evaluate a Lua chunk, returning its result: for tests and one-shot queries.
     pub fn eval<T: mlua::FromLuaMulti>(&self, chunk: &str) -> mlua::Result<T> {
-        self.lua.load(chunk).set_mode(mlua::ChunkMode::Text).eval()
+        host::unheld(&self.lua, || {
+            self.lua.load(chunk).set_mode(mlua::ChunkMode::Text).eval()
+        })
     }
 
     /// How many values the Lua expression `expr` returns (`"GetItemInfo(1)"`, not a chunk), zero
@@ -1595,7 +1634,10 @@ impl UiScript {
             return;
         };
         for arg in pending {
-            if let Err(e) = arg.value(&self.lua).and_then(|v| handler.call::<()>(v)) {
+            let ran = host::unheld(&self.lua, || {
+                arg.value(&self.lua).and_then(|v| handler.call::<()>(v))
+            });
+            if let Err(e) = ran {
                 self.model_mut()
                     .errors
                     .push(format!("error handler itself failed: {e}"));

@@ -114,7 +114,7 @@ fn wheel_for_world(
 /// [`WorldWheel`], which the bindings pass runs. After [`feed_ui_input`], so the frame's clicks
 /// and keys have landed.
 pub(super) fn feed_ui_wheel(
-    script: Option<NonSendMut<UiScript>>,
+    mut hosted_vm: crate::script_calls::HostedVm,
     window: Query<&Window, With<PrimaryWindow>>,
     keys: Res<ButtonInput<KeyCode>>,
     scroll: Res<AccumulatedMouseScroll>,
@@ -126,28 +126,29 @@ pub(super) fn feed_ui_wheel(
         Res<super::CapturePointerPinned>,
     ),
 ) {
-    let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
-    let window = window.single().ok();
-    // The same cursor the mouse half feeds.
-    let cursor = window.and_then(|w| {
-        w.cursor_position()
-            .or_else(crate::target::hover_probe_point)
-            .filter(|_| !(synthetic.0 || capture_pinned.0))
-            .map(|c| super::window_to_ui(w.height(), c))
-    });
-    let travel = (
-        scroll.unit,
-        crate::bindings::notch_travel(scroll.delta.x, scroll.delta.y, shift),
-    );
-    let mut script = script;
-    world_wheel.0 = wheel_for_world(
-        script.as_deref_mut(),
-        cursor,
-        &mut notches,
-        travel,
-        |up| crate::bindings::world_takes_wheel(dispatch.as_deref(), &keys, up),
-        egui.is_some_and(|e| e.0),
-    );
+    hosted_vm.run(|script| {
+        let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
+        let window = window.single().ok();
+        // The same cursor the mouse half feeds.
+        let cursor = window.and_then(|w| {
+            w.cursor_position()
+                .or_else(crate::target::hover_probe_point)
+                .filter(|_| !(synthetic.0 || capture_pinned.0))
+                .map(|c| super::window_to_ui(w.height(), c))
+        });
+        let travel = (
+            scroll.unit,
+            crate::bindings::notch_travel(scroll.delta.x, scroll.delta.y, shift),
+        );
+        world_wheel.0 = wheel_for_world(
+            script,
+            cursor,
+            &mut notches,
+            travel,
+            |up| crate::bindings::world_takes_wheel(dispatch.as_deref(), &keys, up),
+            egui.is_some_and(|e| e.0),
+        );
+    })
 }
 
 /// Feeds cursor, buttons, wheel and keys into the UI engine, publishing [`PlayerUiHover`] (the
@@ -259,17 +260,17 @@ pub(super) fn feed_ui_input(
             }
             for (btn, name) in UI_MOUSE_BUTTONS {
                 if buttons.just_pressed(btn) {
-                    // A left press that would drop into the world (`world_drop_click`: any payload
-                    // over terrain or nothing) is consumed now: the drop fires on the release, but
-                    // the world click-pick and camera orbit act on the press. Over an object the
-                    // reference runs SELECT with the payload still held.
-                    if btn == MouseButton::Left && hover.0.is_none() {
-                        use benilla_ui::script::WorldPick;
-                        let would_drop =
-                            script.cursor_payload().is_some() && world_pick != WorldPick::Object;
-                        if would_drop {
-                            click_consumed.0 = true;
-                        }
+                    // A left press whose release the payload takes (`world_press_consumed`: an
+                    // item, a spell or an action over terrain, any payload over nothing) is
+                    // consumed now: the drop fires on the release, but the world click-pick and
+                    // camera orbit act on the press. A vendor row over terrain or an object is put
+                    // down and the click goes on, to the ground click or the select (`0x492c90`,
+                    // `0x492ce0`).
+                    if btn == MouseButton::Left
+                        && hover.0.is_none()
+                        && script.world_press_consumed()
+                    {
+                        click_consumed.0 = true;
                     }
                     // A press the UI consumed is not the world's, hovered frame or not.
                     press_consumed.0 |= script.mouse_button(x, y, name, true);

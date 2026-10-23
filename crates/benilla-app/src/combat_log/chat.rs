@@ -41,6 +41,10 @@ pub(crate) struct ChatCtx<'a> {
     pub skill_lines: Option<&'a benilla_formats::SkillLineCatalog>,
     /// `SpellItemEnchantment.dbc` (`0xc0d7d8`), which the enchantment lines name.
     pub enchants: Option<&'a benilla_formats::EnchantCatalog>,
+    /// The item cache (`0xc0e2a0`), which `LogOpenLock` reads for an opened item.
+    pub items: Option<&'a crate::items::Items>,
+    /// The game object cache (`0xc0e318`), which `LogOpenLock` reads for an opened object.
+    pub gameobjects: Option<&'a crate::go_templates::GameObjectTemplates>,
     /// The display ranges: the reference's `0x8629e0` table, CVar-backed.
     pub ranges: &'a combat::CombatLogRanges,
     /// `CombatLogPeriodicSpells`, for its two chat-only read sites; the whole-packet gate is in
@@ -84,6 +88,25 @@ impl ChatCtx<'_> {
         combat::logged_spell(self.spells, spell_id).map(|d| d.name.clone())
     }
 
+    /// The record name `LogOpenLock` writes for what a lock opened (`0x62dcb9`-`0x62ddb6`): an
+    /// item's, by its entry in the item cache, tested first (type bit 1); else a game object's, by
+    /// its entry in the game object cache (bit 5). `None` for any other object, one not held and
+    /// one with no cached record.
+    fn opened_name(&self, guid: u64, stores: &impl Stores) -> Option<String> {
+        let fields = &self.index.0.get(&guid).and_then(|&e| stores.store(e))?.0;
+        if fields.is_item() {
+            let entry = fields.object_entry()?;
+            let item = self
+                .items?
+                .template(entry, 0, crate::query_cache::Ask::Read)?;
+            return Some(item.name.clone());
+        }
+        if fields.object_type() == Some(benilla_protocol::messages::ObjectType::GameObject) {
+            return Some(self.gameobjects?.of(fields)?.name.clone());
+        }
+        None
+    }
+
     /// `0x6ea280 == 2`, "this spell targets enemies": the predicate the chat-type stubs
     /// `0x627d30`/`0x627d60` use to choose a family's `…_DAMAGE` or `…_BUFF` row. A spell the
     /// catalog does not know reads as harmful, keeping the `…_DAMAGE` row.
@@ -101,7 +124,7 @@ pub(super) fn attacker_state(
     ctx: &ChatCtx,
     stores: &impl Stores,
     poses: &impl Poses,
-    log: &mut ChatLog,
+    log: &ChatLog,
 ) {
     let s = super::read_swing(s, ctx.index, stores);
     // `0x625e40`, checked before the dispatcher (`0x629b3e`, `0x629b45`): a swing from a spell
@@ -122,7 +145,8 @@ pub(super) fn attacker_state(
     };
     let fills = Fills {
         spell: String::new(),
-        school: (s.school != 0).then_some(s.school),
+        // A school past the table has no name, and so no line (`school_word`).
+        school: (s.school != 0).then(|| u8::try_from(s.school).unwrap_or(u8::MAX)),
         amount: i64::from(s.damage),
         // Only a landed hit grows a trailer, and only here can it say GLANCING, CRUSHING or BLOCK:
         // of `0x628410`'s call sites, this one passes a real `blocked` and `HitInfo` (`0x629ee7`).
@@ -151,33 +175,37 @@ pub(super) fn attacker_state(
 /// the packet's `victim`, who wears the shield; `attacker` struck it and takes the damage
 /// (`DAMAGESHIELDSELFOTHER` is "You reflect %d %s damage to %s."). The chat type is a two-way on
 /// the bearer: `0x62c140` returns `0x3f` `SPELL_DAMAGESHIELDS_ON_SELF` for class 0 or 1, else
-/// `0x40` `…ON_OTHERS`. After the line (`0x5e8552`), `UNIT_COMBAT` `WOUND` on the attacker, with
-/// no flags and no gate (`0x5e858c`).
+/// `0x40` `…ON_OTHERS`. The line (`0x62ca20`, from `0x5e8552`) is worded `DAMAGE_SHIELD` with the
+/// damage when the struck unit is you (`0x62cb5d`-`0x62cb6b`), and written for no damage not at all
+/// (`0x62ca50`). Then `UNIT_COMBAT` `WOUND` on the attacker, with no flags and no gate (`0x5e858c`).
 pub(super) fn damage_shield(
     s: DamageShield,
     ctx: &ChatCtx,
     stores: &impl Stores,
     poses: &impl Poses,
-    log: &mut ChatLog,
+    log: &ChatLog,
 ) {
-    let bearer = ctx.classify(s.victim, stores);
-    let struck = ctx.classify(s.attacker, stores);
-    let kind = combat::damage_shield_kind(bearer);
-    let fills = Fills {
-        school: u8::try_from(s.school).ok(),
-        amount: i64::from(s.damage),
-        ..Default::default()
-    };
-    queue(
-        log,
-        ctx,
-        poses,
-        kind,
-        combat::DAMAGESHIELD,
-        (s.victim, bearer),
-        (s.attacker, struck),
-        fills,
-    );
+    if s.damage != 0 {
+        let bearer = ctx.classify(s.victim, stores);
+        let struck = ctx.classify(s.attacker, stores);
+        let kind = combat::damage_shield_kind(bearer);
+        let fills = Fills {
+            school: u8::try_from(s.school).ok(),
+            amount: i64::from(s.damage),
+            ..Default::default()
+        };
+        queue_worded(
+            log,
+            ctx,
+            poses,
+            kind,
+            combat::DAMAGESHIELD,
+            (s.victim, bearer),
+            (s.attacker, struck),
+            fills,
+            to_me(struck, LineWord::with("DAMAGE_SHIELD", s.damage)),
+        );
+    }
     super::feedback::wound(log, s.attacker, s.damage, 0, s.school);
 }
 
@@ -189,7 +217,7 @@ pub(super) fn party_kill_log(
     ctx: &ChatCtx,
     stores: &impl Stores,
     poses: &impl Poses,
-    log: &mut ChatLog,
+    log: &ChatLog,
 ) {
     let killer = ctx.classify(s.killer, stores);
     let victim = ctx.classify(s.victim, stores);
@@ -217,7 +245,7 @@ pub(super) fn spell_insta_kill_log(
     ctx: &ChatCtx,
     stores: &impl Stores,
     poses: &impl Poses,
-    log: &mut ChatLog,
+    log: &ChatLog,
 ) {
     let victim = ctx.classify(s.victim, stores);
     let Some(spell) = ctx.spell_name(s.spell_id) else {
@@ -242,7 +270,9 @@ pub(super) fn spell_insta_kill_log(
 }
 
 /// `SMSG_PROCRESIST` ("%s resists %s's %s.") and `SMSG_SPELLORDAMAGE_IMMUNE` ("%s is immune to
-/// %s's %s."), both worded target first and typed off the (caster, target) pair.
+/// %s's %s."), both worded target first and typed off the (caster, target) pair. When the target,
+/// the second unit, is you, each line raises its word with the spell's name: `PROC_RESISTED`
+/// (`0x628b8a`-`0x628b96`) or `SPELL_IMMUNE` (`0x62d3ab`-`0x62d3b9`).
 ///
 /// `IMMUNESPELL`'s `log_format` byte is the periodic flag: `0x62d25f` in `0x62d240` gates that
 /// formatter alone on `CombatLogPeriodicSpells` when the byte is set; `PROCRESIST` is ungated.
@@ -252,7 +282,7 @@ pub(super) fn spell_outcome_log(
     ctx: &ChatCtx,
     stores: &impl Stores,
     poses: &impl Poses,
-    log: &mut ChatLog,
+    log: &ChatLog,
 ) {
     // The periodic gate, on `IMMUNESPELL` alone.
     if immune && s.log_format != 0 && !ctx.periodic {
@@ -269,65 +299,78 @@ pub(super) fn spell_outcome_log(
     let Some(kind) = combat::spell_kind(caster, target, buff) else {
         return;
     };
-    queue(
+    let (family, word) = if immune {
+        (combat::IMMUNESPELL, "SPELL_IMMUNE")
+    } else {
+        (combat::PROCRESIST, "PROC_RESISTED")
+    };
+    let word = to_me(target, LineWord::with(word, &spell));
+    queue_worded(
         log,
         ctx,
         poses,
         kind,
-        if immune {
-            combat::IMMUNESPELL
-        } else {
-            combat::PROCRESIST
-        },
+        family,
         (s.caster, caster),
         (s.target, target),
         Fills {
             spell,
             ..Default::default()
         },
+        word,
     );
 }
 
 /// `SMSG_SPELLDISPELLOG`: "Your %s is removed." or "%s's %s is removed.", one line per aura. The
-/// chat type is the literal `0x45` `SPELL_BREAK_AURA` (`0x62d480`); the dispeller is classified
-/// only for the range gate.
+/// chat type is the literal `0x45` `SPELL_BREAK_AURA` (`0x62d480`). The reader hands the writer
+/// the bearer, the packet's first guid, and the dispeller (`0x5e8be4`), which the writer never
+/// reads: it needs the bearer held as a unit (`0x62d4fb`-`0x62d504`) and within its class's range
+/// (`0x62d516`-`0x62d58e`). An `AURADISPELSELF` line raises `SPELL_DISPELLED` with the spell's name
+/// (`0x62d5ce`-`0x62d5e8`).
 pub(super) fn spell_dispel_log(
     s: &SpellDispelLog,
     ctx: &ChatCtx,
     stores: &impl Stores,
     poses: &impl Poses,
-    log: &mut ChatLog,
+    log: &ChatLog,
 ) {
     let bearer = ctx.classify(s.victim, stores);
-    let caster = ctx.classify(s.caster, stores);
     for &spell_id in &s.spell_ids {
         let Some(spell) = ctx.spell_name(spell_id) else {
             continue;
         };
-        queue(
+        if !ctx.holds_unit(s.victim, stores) {
+            continue;
+        }
+        let word = to_me(bearer, LineWord::with("SPELL_DISPELLED", &spell));
+        // The bearer is the line's only endpoint, in the key and the range gate.
+        queue_worded(
             log,
             ctx,
             poses,
             crate::ui_chat::ChatEventKind::SpellBreakAura,
             combat::AURADISPEL,
             (s.victim, bearer),
-            (s.caster, caster),
+            (s.victim, bearer),
             Fills {
                 spell,
                 ..Default::default()
             },
+            word,
         );
     }
 }
 
 /// `SMSG_DISPEL_FAILED`: "You fail to dispel %s's %s.", one line per aura. The format variant is
 /// picked once per packet (`0x628c20`); the chat type per line, since `0x627d30` asks the spell.
+/// When the second unit is you, each line raises `DISPEL_FAILED` with its spell's name
+/// (`0x628daa`-`0x628db8`).
 pub(super) fn dispel_failed(
     s: &DispelFailed,
     ctx: &ChatCtx,
     stores: &impl Stores,
     poses: &impl Poses,
-    log: &mut ChatLog,
+    log: &ChatLog,
 ) {
     let caster = ctx.classify(s.caster, stores);
     let victim = ctx.classify(s.victim, stores);
@@ -339,7 +382,8 @@ pub(super) fn dispel_failed(
         let Some(kind) = combat::spell_kind(caster, victim, !ctx.spell_harmful(spell_id)) else {
             continue;
         };
-        queue(
+        let word = to_me(victim, LineWord::with("DISPEL_FAILED", &spell));
+        queue_worded(
             log,
             ctx,
             poses,
@@ -351,6 +395,7 @@ pub(super) fn dispel_failed(
                 spell,
                 ..Default::default()
             },
+            word,
         );
     }
 }
@@ -371,7 +416,7 @@ pub(super) fn enchantment_log(
     ctx: &ChatCtx,
     stores: &impl Stores,
     poses: &impl Poses,
-    log: &mut ChatLog,
+    log: &ChatLog,
 ) {
     let owner = ctx.classify(s.owner, stores);
     let caster = ctx.classify(s.caster, stores);
@@ -428,15 +473,12 @@ pub(super) fn enchantment_log(
 /// effect id through the index table `0x5e845c` and the jump table `0x5e8430`. An effect with no
 /// arm of its own takes the cast line [`spell_cast_line`] once per row, with no target
 /// (`0x5e83e3`); so does a packet whose one group is a row-less effect 3 (`0x5e8004`-`0x5e8034`).
-///
-/// Not built: effects 33 and 59 `OPEN_LOCK` (its `%s` is a gameobject name, and there is no
-/// gameobject-name cache).
 pub(super) fn spell_log_execute(
     s: &SpellLogExecute,
     ctx: &ChatCtx,
     stores: &impl Stores,
     poses: &impl Poses,
-    log: &mut ChatLog,
+    log: &ChatLog,
 ) {
     use benilla_protocol::messages::ExecuteLog as E;
 
@@ -445,7 +487,7 @@ pub(super) fn spell_log_execute(
     // drain, extra attacks, open lock, durability damage and the cast line. Create item, feed pet
     // and dismiss pet name no spell, and interrupt names the row's.
     let spell = || ctx.spell_name(s.spell_id);
-    let cast_line = |log: &mut ChatLog, target: Option<u64>| {
+    let cast_line = |log: &ChatLog, target: Option<u64>| {
         spell_cast_line(
             log,
             ctx,
@@ -489,14 +531,20 @@ pub(super) fn spell_log_execute(
                     );
                 }
                 // Effect 19 ADD_EXTRA_ATTACKS: no caster in the sentence (`0x62d9f0`), only the
-                // unit that gained the attacks.
+                // unit that gained the attacks, typed by the spell's hostility (`0x62b190`, from
+                // `0x62db78`) and worded `EXTRA_ATTACKS` with the count when that is you
+                // (`0x62db7d`-`0x62dba9`); a count of 0 writes neither (`0x62da2a`).
                 E::ExtraAttacks { target, count } => {
+                    if count == 0 {
+                        continue;
+                    }
                     let Some(spell) = spell() else { continue };
                     let victim = ctx.classify(target, stores);
-                    let Some(kind) = combat::spell_kind(victim, victim, false) else {
+                    let buff = !ctx.spell_harmful(s.spell_id);
+                    let Some(kind) = combat::spell_kind(victim, victim, buff) else {
                         continue;
                     };
-                    queue(
+                    queue_worded(
                         log,
                         ctx,
                         poses,
@@ -513,6 +561,7 @@ pub(super) fn spell_log_execute(
                             amount: i64::from(count),
                             ..Default::default()
                         },
+                        to_me(victim, LineWord::with("EXTRA_ATTACKS", count)),
                     );
                 }
                 // Effect 24 CREATE_ITEM: the tradeskill line, literal type `0x3e`, split on the
@@ -541,7 +590,8 @@ pub(super) fn spell_log_execute(
                     combat::Named::Item(item_entry),
                 ),
                 // Effect 68 INTERRUPT_CAST: the sentence names the interrupted spell, off the row,
-                // not the packet's own.
+                // not the packet's own, and so does the `INTERRUPT` word when the interrupted unit
+                // is you (`0x626b53`-`0x626b69`).
                 E::InterruptCast { target, spell_id } => {
                     let victim = ctx.classify(target, stores);
                     let Some(interrupted) = ctx.spell_name(spell_id) else {
@@ -550,7 +600,8 @@ pub(super) fn spell_log_execute(
                     let Some(kind) = combat::spell_kind(caster, victim, false) else {
                         continue;
                     };
-                    queue(
+                    let word = to_me(victim, LineWord::with("INTERRUPT", &interrupted));
+                    queue_worded(
                         log,
                         ctx,
                         poses,
@@ -562,6 +613,7 @@ pub(super) fn spell_log_execute(
                             spell: interrupted,
                             ..Default::default()
                         },
+                        word,
                     );
                 }
                 // Effect 111 DURABILITY_DAMAGE: both fields `-1` is the "all items" form.
@@ -633,9 +685,20 @@ pub(super) fn spell_log_execute(
                 E::Target { target } if cast_names_target(*_effect) => {
                     cast_line(log, Some(target));
                 }
-                // Effects 33 and 59 OPEN_LOCK (`0x5e82b2`), not built.
-                E::Target { .. }
-                    if matches!(*_effect, EFFECT_OPEN_LOCK | EFFECT_OPEN_LOCK_ITEM) => {}
+                // Effects 33 and 59 OPEN_LOCK (`0x5e82b2`): [`open_lock_line`].
+                E::Target { target }
+                    if matches!(*_effect, EFFECT_OPEN_LOCK | EFFECT_OPEN_LOCK_ITEM) =>
+                {
+                    open_lock_line(
+                        log,
+                        ctx,
+                        stores,
+                        poses,
+                        s.spell_id,
+                        (s.caster, caster),
+                        target,
+                    );
+                }
                 // The default arm, which reads nothing of the row: heals and energizes, which are
                 // worded from their own packets, the summons and the rest.
                 E::Heal { .. } | E::Energize { .. } | E::Target { .. } => cast_line(log, None),
@@ -662,6 +725,50 @@ fn cast_names_target(effect: u32) -> bool {
     )
 }
 
+/// `LogOpenLock` (`0x62dc10`), the line for `SMSG_SPELLLOGEXECUTE`'s effects 33 and 59: "You perform
+/// Pick Lock on Copper Vein." After the spell gates, the caster must be held as a unit within its
+/// class's range (`0x628010`). The target must be a held item with a record in the item cache
+/// (`0x62dce2`) or a held game object with one in the game object cache (`0x62ddac`), read
+/// without asking; the line names its record. `OPEN_LOCK_SELF` or `OPEN_LOCK_OTHER` on the
+/// caster, typed by the caster against itself through the spell's hostility (`0x627d30`). No word
+/// follows.
+fn open_lock_line(
+    log: &ChatLog,
+    ctx: &ChatCtx,
+    stores: &impl Stores,
+    poses: &impl Poses,
+    spell_id: u32,
+    caster: (u64, UnitClass),
+    target: u64,
+) {
+    let Some(spell) = ctx.spell_name(spell_id) else {
+        return;
+    };
+    if !ctx.holds_unit(caster.0, stores) {
+        return;
+    }
+    let Some(opened) = ctx.opened_name(target, stores) else {
+        return;
+    };
+    let Some(kind) = combat::spell_kind(caster.1, caster.1, !ctx.spell_harmful(spell_id)) else {
+        return;
+    };
+    queue(
+        log,
+        ctx,
+        poses,
+        kind,
+        combat::OPEN_LOCK,
+        caster,
+        caster,
+        Fills {
+            spell,
+            named: opened,
+            ..Default::default()
+        },
+    );
+}
+
 /// `SPELL_ATTR_IS_ABILITY` (vmangos `SpellDefines.h:796`): the cast line says "performs" (`0x62aff0`).
 const ATTR_IS_ABILITY: u32 = 0x10;
 
@@ -679,7 +786,7 @@ const ATTR_EX4_NO_CAST_LOG: u32 = 0x1;
 /// or `SPELLTERSEPERFORM` keyed on the caster, typed by the matrix on the caster against itself
 /// (`0x62b190`), and worded when the caster is you (`0x62b12f`).
 fn spell_cast_line(
-    log: &mut ChatLog,
+    log: &ChatLog,
     ctx: &ChatCtx,
     stores: &impl Stores,
     poses: &impl Poses,
@@ -755,46 +862,61 @@ fn spell_cast_line(
     }
 }
 
-/// `SMSG_ENVIRONMENTALDAMAGELOG`: "You fall and lose %d health." and its five siblings.
-/// `0x62aac0` builds the key from a six-entry damage-type table and SELF/OTHER, and calls the
-/// melee HITS selector with the victim's class in both positions, so a party member's fall types
-/// as `HOSTILEPLAYER_HITS` through the selector's tgt<=3 override, as in the reference. It takes
-/// absorb and resist trailers.
+/// `SMSG_ENVIRONMENTALDAMAGELOG`'s handler `0x624f30`, which writes and signals nothing for a hit
+/// of all zeros (`0x624f4c`-`0x624f60`). The line, "You fall and lose %d health." and its five
+/// siblings: `0x62aac0` builds the key from a six-entry damage-type table and SELF/OTHER, and calls
+/// the melee HITS selector with the victim's class in both positions, so a party member's fall
+/// types as `HOSTILEPLAYER_HITS` through the selector's tgt<=3 override, as in the reference. It
+/// takes absorb and resist trailers, and on you raises [`combat::damage_word`] (`0x62ac74`). Then,
+/// for the active player (`0x624f83`), `UNIT_COMBAT` `WOUND` in the type's school, marked `0x20`
+/// for an absorb and `0x40` for a resist (`0x624f8c`-`0x624fc4`).
 pub(super) fn environmental_damage_log(
     e: EnvironmentalDamageLog,
     ctx: &ChatCtx,
     stores: &impl Stores,
     poses: &impl Poses,
-    log: &mut ChatLog,
+    log: &ChatLog,
 ) {
+    if e.damage == 0 && e.absorb == 0 && e.resist == 0 {
+        return;
+    }
     let victim = ctx.classify(e.victim, stores);
-    let Some(family) = combat::env_family(e.damage_type) else {
-        return;
-    };
-    let Some(kind) = combat::combat_kind(victim, victim, false) else {
-        return;
-    };
-    queue(
-        log,
-        ctx,
-        poses,
-        kind,
-        family,
-        (e.victim, victim),
-        (e.victim, victim),
-        Fills {
-            amount: i64::from(e.damage),
-            trailers: Some(combat::Trailers {
-                absorbed: e.absorb,
-                resisted: e.resist,
-                // The environmental call site passes zero for both.
-                blocked: 0,
-                hit_info: 0,
-            }),
-            ..Default::default()
-        },
-    );
+    let kind = combat::combat_kind(victim, victim, false);
+    if let (Some(family), Some(kind)) = (combat::env_family(e.damage_type), kind) {
+        queue_worded(
+            log,
+            ctx,
+            poses,
+            kind,
+            family,
+            (e.victim, victim),
+            (e.victim, victim),
+            Fills {
+                amount: i64::from(e.damage),
+                trailers: Some(combat::Trailers {
+                    absorbed: e.absorb,
+                    resisted: e.resist,
+                    // The environmental call site passes zero for both.
+                    blocked: 0,
+                    hit_info: 0,
+                }),
+                ..Default::default()
+            },
+            to_me(victim, combat::damage_word(e.damage, e.absorb, e.resist)),
+        );
+    }
+    let school = ENV_DAMAGE_SCHOOLS.get(usize::from(e.damage_type));
+    if let (Some(&school), true) = (school, ctx.self_guid.0 == Some(e.victim)) {
+        let marks = super::feedback::hit_flags(false, e.absorb, e.resist, 0);
+        super::feedback::wound(log, e.victim, e.damage, marks, school);
+    }
 }
+
+/// The school of each environmental damage type 0 to 5, the table `0x809274` that `0x624fb3`
+/// indexes: fatigue, drowning and falling physical, lava and fire fire, slime nature. The index has
+/// no bound; a type past it, which no server sends (vmangos maps its void fall to 2,
+/// `Objects/Unit.cpp:5396`), signals nothing here.
+const ENV_DAMAGE_SCHOOLS: [u32; 6] = [0, 0, 0, 2, 3, 2];
 
 /// `SMSG_SET_FACTION_STANDING`: "Your %s reputation has increased by %d.". The wire carries the
 /// new total and the sentence the delta, so this runs before the store is overwritten, and an
@@ -802,22 +924,20 @@ pub(super) fn environmental_damage_log(
 /// its faction is not `HIDDEN`: the handler passes `0x4d6330` its print argument as
 /// `index == 0 && !(flags & 4)` (`0x4d57dd`-`0x4d57ea`), so the spill-over entries of one kill
 /// update silently. No range gate or classifier: the chat type is the literal `0x55`
-/// `COMBAT_FACTION_CHANGE`. The wire's list id is `Faction.dbc`'s `rep_index`.
+/// `COMBAT_FACTION_CHANGE`. The wire's list id is `Faction.dbc`'s `rep_index`. The line
+/// (`0x62c5f0`) raises `FACTION` with the faction's name and the signed change, whoever's line it
+/// is (`0x62c661`-`0x62c667`).
 pub(crate) fn faction_standing(
     deltas: &[(u32, i32)],
     reputations: &Reputations,
     factions: Option<&crate::target::ring::Factions>,
-    log: &mut ChatLog,
+    log: &ChatLog,
 ) {
     let Some(catalog) = factions.map(|f| f.catalog()) else {
         return;
     };
     for &(list_id, standing) in deltas.iter().take(1) {
-        let (flags, old) = reputations
-            .slots
-            .get(list_id as usize)
-            .copied()
-            .unwrap_or((0, 0));
+        let (flags, old) = reputations.slot(list_id as usize);
         if flags & benilla_formats::faction_flags::HIDDEN != 0 {
             continue;
         }
@@ -853,7 +973,7 @@ pub(crate) fn faction_standing(
             },
             named: combat::Named::Ready,
             tries: 0,
-            word: None,
+            word: Some(LineWord::text_number("FACTION", name, delta)),
         });
     }
 }
@@ -861,7 +981,7 @@ pub(crate) fn faction_standing(
 /// The tail every arm ends in: build the queued line (dropping a class-9 endpoint) and park it
 /// for its names.
 fn queue(
-    log: &mut ChatLog,
+    log: &ChatLog,
     ctx: &ChatCtx,
     poses: &impl Poses,
     kind: crate::ui_chat::ChatEventKind,
@@ -887,7 +1007,7 @@ fn queue(
 /// [`queue`] for a family whose `Named` slot (an item entry or unit guid) the drain resolves,
 /// holding the line until it lands (`0x6294b0`).
 fn queue_named(
-    log: &mut ChatLog,
+    log: &ChatLog,
     ctx: &ChatCtx,
     poses: &impl Poses,
     kind: crate::ui_chat::ChatEventKind,
@@ -905,7 +1025,7 @@ fn queue_named(
 /// [`queue`] for a formatter that raises a `COMBAT_TEXT_UPDATE` after its line: the word rides
 /// the line and fires only once the line is written.
 fn queue_worded(
-    log: &mut ChatLog,
+    log: &ChatLog,
     ctx: &ChatCtx,
     poses: &impl Poses,
     kind: crate::ui_chat::ChatEventKind,
@@ -939,7 +1059,7 @@ fn to_me(class: UnitClass, word: LineWord) -> Option<LineWord> {
 /// `al` (set at `0x627fb0`/`0x627fe2`/`0x627ff4`, cleared at `0x628006`), and a failed range gate
 /// or empty template is a fall-through there.
 fn queue_reported(
-    log: &mut ChatLog,
+    log: &ChatLog,
     ctx: &ChatCtx,
     poses: &impl Poses,
     kind: crate::ui_chat::ChatEventKind,

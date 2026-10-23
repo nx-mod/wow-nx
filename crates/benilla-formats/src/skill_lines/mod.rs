@@ -217,6 +217,24 @@ impl SkillLineCatalog {
         self
     }
 
+    /// This catalog with a `SkillRaceClassInfo.dbc` row of `flags` for every race and class on
+    /// each line, for tests and fixtures.
+    pub fn with_race_class_flags(mut self, lines: impl IntoIterator<Item = (u32, u32)>) -> Self {
+        for (id, flags) in lines {
+            self.race_class.entry(id).or_default().push(SrciRow {
+                race_mask: 0,
+                class_mask: 0,
+                row: SkillRaceClass {
+                    flags,
+                    min_level: 0,
+                    tier_id: 0,
+                    cost_index: 0,
+                },
+            });
+        }
+        self
+    }
+
     /// The skill line a spell belongs to, if `SkillLineAbility.dbc` names one.
     pub fn spell_to_line(&self, spell_id: u32) -> Option<u32> {
         self.abilities.get(&spell_id).map(|a| a.skill_id)
@@ -265,6 +283,21 @@ impl SkillLineCatalog {
             cur = next;
         }
         false
+    }
+
+    /// `spell_id` and each later rank of its chain, in order: what the item tooltip's known-recipe
+    /// test asks `0x60c740` and `KnownHigherRank` (`0x60c8d0`) of, together.
+    pub fn rank_and_later(&self, spell_id: u32) -> Vec<u32> {
+        let mut ranks = vec![spell_id];
+        let mut cur = spell_id;
+        for _ in 0..MAX_RANK_CHAIN {
+            let Some(next) = self.rank_successor(cur) else {
+                break;
+            };
+            ranks.push(next);
+            cur = next;
+        }
+        ranks
     }
 
     /// A catalog of ability rows only, for tests.

@@ -10,6 +10,7 @@ fn action_ids(s: &mut UiScript) -> Vec<u32> {
 fn shipped_action_bar_drives_end_to_end() {
     benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     // The three stock bar files, counted as they load; `ExhaustionTick_Update` reads
     // `ReputationWatchBar`, which ReputationFrame.xml declares.
@@ -358,7 +359,7 @@ fn a_spell_tooltip_with_a_live_line_arms_the_stock_refresh() {
         name: "Shield Wall".into(),
         cast_time: Some(cast.into()),
         recovery_ms,
-        chance: chance.map(str::to_string),
+        chance: chance.map(Into::into),
         ..Default::default()
     };
     // The value the stock button saved from the setter's answer.
@@ -743,6 +744,7 @@ fn a_cooldown_count_draws_over_the_bonus_bars_sweep() {
 fn a_right_click_on_an_action_button_uses_the_action() {
     benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     load_action_bar(&s);
 
@@ -1111,21 +1113,21 @@ fn macro_name_line_follows_get_action_text_through_the_xml() {
     let mut s = UiScript::new().unwrap();
     s.set_screen_size(1024.0, 768.0);
     load_action_bar(&s);
-    s.set_macros(MacroState {
-        account: vec![MacroView {
+    s.set_macros(MacroState::from_scopes(
+        vec![MacroView {
             name: "spawn".into(),
             texture: Some("Interface\\Icons\\Ability_Racial_Cannibalize".into()),
             body: ".spawn 16032".into(),
-            local_only: false,
+            ..Default::default()
         }],
-        character: Vec::new(),
-    });
+        Vec::new(),
+    ));
     s.set_action(
         1,
         Some(ActionSlot {
             texture: Some("Interface\\Icons\\Ability_Racial_Cannibalize".into()),
             kind: 0x40, // MACRO
-            action: 1,  // macro index 1
+            action: 1,  // macro id 1
             count: 0,
             consumable: false,
             use_spell: None,
@@ -1179,6 +1181,8 @@ fn shipped_bag_frame_drives_end_to_end() {
     use benilla_ui::script::{ContainerSlot, ContainerState};
 
     let mut s = UiScript::new().unwrap();
+
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     // `ContainerFrameItemButton_OnClick` reads `StackSplitFrame` and `MerchantFrame`
     // (ContainerFrame.lua:581, 586), which the bag kit leaves to its caller.
@@ -1212,9 +1216,11 @@ fn shipped_bag_frame_drives_end_to_end() {
     slots.insert(
         1,
         ContainerSlot {
+            uncached_link: None,
             use_fork: Default::default(),
             item_class: None,
             duration_ms: None,
+            field_duration: 0,
             petition: None,
             already_bound: false,
             occupied_seats: None,
@@ -1240,6 +1246,7 @@ fn shipped_bag_frame_drives_end_to_end() {
             flags: 0,
             enchants: Vec::new(),
             spell_0: false,
+            spell_charges: [0; 5],
         },
     );
     s.set_container(
@@ -1310,18 +1317,18 @@ fn shipped_bag_frame_drives_end_to_end() {
         "a pickup alone queues no move"
     );
 
-    // Right-click while holding: the right arm has no cursor test (ContainerFrame.lua:583-599),
-    // and `UseContainerItem` clears the cursor before it reads the slot (`0x4fa198`).
+    // Right-click while holding: the UI root's press handler runs the world hook first (`0x492b50`,
+    // `0x766370`), which puts the held item back and consumes the press, so the slot's right arm
+    // (ContainerFrame.lua:583-599) never sees it.
     s.mouse_button(bx, by, "RightButton", true);
     s.mouse_button(bx, by, "RightButton", false);
-    assert_eq!(
-        s.take_container_uses(),
-        vec![(0, 1)],
-        "the right arm uses the slot even with a full cursor"
+    assert!(
+        s.take_container_uses().is_empty(),
+        "no frame saw the press with a full cursor"
     );
     assert!(
         s.cursor_item().is_none(),
-        "…after putting the held item back"
+        "the press put the held item back"
     );
 
     s.mouse_button(bx, by, "RightButton", true);
@@ -1792,6 +1799,7 @@ fn the_main_bar_pages_and_a_bonus_page_still_outranks_it() {
 fn bonus_bar_slides_up_with_sound_and_down_without() {
     benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     super::test_ui::load_ui(&s, "Interface\\FrameXML\\GlobalStrings.lua");
     super::test_ui::load_ui(&s, "Interface\\FrameXML\\Fonts.xml");

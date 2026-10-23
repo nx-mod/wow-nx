@@ -165,6 +165,9 @@ mod tests {
         world.init_resource::<crate::ui_cast::CastReports>();
         world.init_resource::<crate::ui_action::UiErrorKeys>();
         world.init_resource::<crate::spell::AutoRepeatActive>();
+        world.init_resource::<crate::creature_anim::AttackStopInFlight>();
+        world.init_resource::<crate::creature_anim::UnitEdits>();
+        world.init_resource::<bevy::ecs::message::Messages<crate::player::StandStateRequest>>();
         world.init_resource::<crate::ui_tradeskill::TradeSkillOpens>();
         world.init_resource::<super::super::SpellTargeting>();
         world.init_resource::<crate::spell::HeldForPick>();
@@ -280,8 +283,7 @@ mod tests {
         const HEAL: u32 = 2050;
         let commit = crate::spell::cast_send::CastCommit::Spell;
         let changes = |world: &mut World| {
-            let reports =
-                std::mem::take(&mut world.resource_mut::<crate::ui_cast::CastReports>().0);
+            let reports = world.resource_mut::<crate::ui_cast::CastReports>().take();
             reports
                 .iter()
                 .filter(|r| matches!(r, crate::ui_cast::CastReport::Changed))
@@ -601,6 +603,7 @@ mod tests {
             bag_index: 255,
             slot: 24,
             entry: 7148,
+            guid: None,
             spell_index: 0,
             on_object: None,
         };

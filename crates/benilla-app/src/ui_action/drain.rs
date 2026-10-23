@@ -4,10 +4,8 @@
 
 use bevy::prelude::*;
 
-use benilla_protocol::messages::{
-    ActionButton, ACTION_KIND_ITEM, ACTION_KIND_MACRO, ACTION_KIND_SPELL,
-};
-use benilla_ui::script::UiScript;
+use benilla_protocol::messages::{ActionButton, ACTION_KIND_ITEM, ACTION_KIND_SPELL};
+use benilla_ui::script::{macro_slot_id, UiScript};
 
 use crate::net::{ClientCommand, NetCommands};
 
@@ -74,7 +72,7 @@ pub(crate) struct AttackPress<'w, 's> {
     pick: crate::target::AttackPick<'w, 's>,
     selection: ResMut<'w, crate::target::Selection>,
     seam: crate::creature_anim::AttackSeam<'w, 's>,
-    ui_errors: ResMut<'w, UiErrorKeys>,
+    ui_errors: Res<'w, UiErrorKeys>,
 }
 
 impl AttackPress<'_, '_> {
@@ -99,24 +97,22 @@ impl AttackPress<'_, '_> {
     /// [`Self::attack_target`]'s second half, the toggle at the validated target.
     pub(crate) fn start_attack(&mut self, guid: u64) {
         let Self { pick, seam, .. } = self;
-        let Ok(e) = seam.me.single() else {
+        if seam.me.single().is_err() {
             return;
-        };
+        }
         let engaged = pick.engaged();
         debug!(
             "attack {} at {guid:#x}",
             if engaged { "toggled off" } else { "swing" }
         );
-        crate::creature_anim::toggle_attack_local(
-            e,
-            guid,
-            engaged,
-            &mut seam.slots,
-            &mut seam.auto_repeat,
-            &mut seam.sheath,
-            &mut seam.ecs,
-            &seam.net,
-        );
+        seam.toggle(guid, engaged);
+    }
+
+    /// A stand state change's attack stop inside its call, `0x5ecac0` at `0x5f07e7` while we
+    /// attack (`0x60ecb0`).
+    pub(crate) fn stop_for_stand(&mut self) {
+        let engaged = self.pick.engaged();
+        self.seam.stop(engaged);
     }
 
     /// TryCast's attack pick (`0x6e4efb`) for a spell press held there
@@ -148,58 +144,66 @@ impl AttackPress<'_, '_> {
 /// so every rung applies: a second click on a chest mid-cast is `0x6e4d43`'s silent same-spell
 /// bail, and a skin while another spell is in flight `0x6e4d97`'s 0x61.
 pub(crate) fn drain_click_casts(
+    mut vm: crate::script_calls::VmWith<(
+        cast_target::CastTargeting<'static, 'static>,
+        CastLadder<'static, 'static>,
+        crate::ui_bind_confirm::BindGate<'static>,
+    )>,
     mut queue: ResMut<crate::ui_action::ClickCasts>,
-    script: Option<NonSendMut<UiScript>>,
-    targeting: cast_target::CastTargeting,
-    mut ladder: CastLadder,
     // Not a `CastLadder` field: Bevy panics on a resource reachable twice from one system.
-    mut ui_errors: ResMut<UiErrorKeys>,
-    mut gate: crate::ui_bind_confirm::BindGate,
+    ui_errors: Res<UiErrorKeys>,
 ) {
-    if queue.0.is_empty() {
-        return;
-    }
-    let ctx = targeting.context();
-    let mut script = script;
-    for cast in std::mem::take(&mut queue.0) {
-        match cast {
-            super::ClickCast::AtObject { spell_id, go_guid } => {
-                debug!("ui_action: gameobject opener casts {spell_id} at {go_guid:#x}");
-                ladder.send_at_object(spell_id, &ctx, go_guid);
-            }
-            super::ClickCast::AtUnit {
-                spell_id,
-                entity,
-                guid,
-            } => {
-                debug!("ui_action: right-click casts {spell_id} at {guid:#x}");
-                ladder.send(
+    vm.turn(|script, (targeting, mut ladder, mut gate)| {
+        if queue.0.is_empty() {
+            return;
+        }
+        let ctx = targeting.context();
+        let mut script = script;
+        for cast in std::mem::take(&mut queue.0) {
+            match cast {
+                super::ClickCast::AtObject { spell_id, go_guid } => {
+                    debug!("ui_action: gameobject opener casts {spell_id} at {go_guid:#x}");
+                    ladder.send_at_object(spell_id, &ctx, go_guid);
+                }
+                super::ClickCast::AtUnit {
                     spell_id,
-                    &targeting.context_at(entity, guid),
-                    crate::spell::CastCommit::Spell,
-                );
-            }
-            // The key goes through the shared `CGItem::Use` fork, as a bag click does.
-            super::ClickCast::Key(it) => {
-                let Some(script) = script.as_deref_mut() else {
-                    continue;
-                };
-                debug!(
-                    "ui_action: gameobject opener uses the key at wire {}/{} on {:?}",
-                    it.bag_index, it.slot, it.on_object
-                );
-                crate::ui_items::send_item_use(
-                    it,
-                    &ctx,
-                    &mut ladder,
-                    script,
-                    &mut gate,
-                    false,
-                    &mut ui_errors,
-                );
+                    entity,
+                    guid,
+                    auto_loot,
+                } => {
+                    debug!("ui_action: right-click casts {spell_id} at {guid:#x}");
+                    ladder.send(
+                        spell_id,
+                        &targeting.context_at(entity, guid),
+                        crate::spell::CastCommit::Spell,
+                    );
+                    // Then the store, whatever the attempt answered (`0x5f06e1`-`0x5f06ef`).
+                    if let (Some(byte), Some(script)) = (auto_loot, script.as_deref_mut()) {
+                        script.set_auto_loot(byte);
+                    }
+                }
+                // The key goes through the shared `CGItem::Use` fork, as a bag click does.
+                super::ClickCast::Key(it) => {
+                    let Some(script) = script.as_deref_mut() else {
+                        continue;
+                    };
+                    debug!(
+                        "ui_action: gameobject opener uses the key at wire {}/{} on {:?}",
+                        it.bag_index, it.slot, it.on_object
+                    );
+                    crate::ui_items::send_item_use(
+                        it,
+                        &ctx,
+                        &mut ladder,
+                        script,
+                        &mut gate,
+                        false,
+                        &ui_errors,
+                    );
+                }
             }
         }
-    }
+    })
 }
 
 /// What a `UseAction` press reads and writes.
@@ -209,7 +213,7 @@ pub(crate) struct ActionPress<'w, 's> {
     targeting: cast_target::CastTargeting<'w, 's>,
     // The by-key error line. Not a `CastLadder` field: Bevy panics, at runtime and not in unit
     // tests, on a resource reachable twice from one system.
-    ui_errors: ResMut<'w, UiErrorKeys>,
+    ui_errors: Res<'w, UiErrorKeys>,
     ladder: CastLadder<'w, 's>,
     gate: crate::ui_bind_confirm::BindGate<'w>,
     equip_sound: MessageWriter<'w, crate::sound::AutoEquipSound>,
@@ -264,17 +268,6 @@ pub(crate) fn use_action(
             return UseOutcome::Attack;
         }
         Some(b) if b.kind == ACTION_KIND_SPELL => {
-            // Re-pressing the spell whose targeting cursor is up cancels it before `TryCast`
-            // (`GetTargetingSpellId 0x4e60ea`, `StopTargeting 0x4e60f3`), as `CastBookSpell`
-            // does for the spellbook (`0x4b3474`, [`crate::ui_spellbook::cast_spell`]).
-            if ladder.ground.spell() == Some(b.action) {
-                debug!(
-                    "ui_action: cast {} re-pressed — targeting toggles off",
-                    b.action
-                );
-                ladder.stop_targeting();
-                return UseOutcome::Done;
-            }
             // A live `ActiveIconID` spell re-pressed cancels its aura (`0x4e55f0`, cancel
             // `0x4e60c1`). The form-match toggle is `CastSpell`'s alone, not `UseAction`'s.
             if let Some(d) = ladder.spells.as_ref().and_then(|s| s.catalog.get(b.action)) {
@@ -288,6 +281,26 @@ pub(crate) fn use_action(
                         return UseOutcome::Done;
                     }
                 }
+            }
+            // Then the running auto-repeat spell stops (`0x4e60d1`-`0x4e60da`), a toggle no
+            // `CastSpellByName` has: `TryCast` never reads the key.
+            if ladder.stop_auto_repeat_of(b.action) {
+                debug!(
+                    "ui_action: cast {} re-pressed — auto-repeat toggles off",
+                    b.action
+                );
+                return UseOutcome::Done;
+            }
+            // Then the spell whose targeting cursor is up cancels it before `TryCast`
+            // (`GetTargetingSpellId 0x4e60ea`, `StopTargeting 0x4e60f3`), as `CastBookSpell`
+            // does for the spellbook (`0x4b3474`, [`crate::ui_spellbook::cast_spell`]).
+            if ladder.ground.spell() == Some(b.action) {
+                debug!(
+                    "ui_action: cast {} re-pressed — targeting toggles off",
+                    b.action
+                );
+                ladder.stop_targeting();
+                return UseOutcome::Done;
             }
             debug!(
                 "ui_action: cast {} (target {:?}{})",
@@ -407,10 +420,12 @@ pub(crate) fn use_action(
                 );
             }
         }
-        // The macro arm (`0x4e5ee0` calls `0x4f1460`): each body line goes through the chat
-        // input, as if typed, under the press's input events.
-        Some(b) if b.kind == ACTION_KIND_MACRO => return UseOutcome::Macro(b.action),
         Some(b) => {
+            // The macro arm (`0x4e5ee0` calls `0x4f1460` with the id): each body line goes through
+            // the chat input, as if typed, under the press's input events.
+            if let Some(id) = macro_slot_id(b.kind, b.action) {
+                return UseOutcome::Macro(id);
+            }
             debug!(
                 "ui_action: action {action} kind {:#04x} has no use path",
                 b.kind
@@ -423,38 +438,39 @@ pub(crate) fn use_action(
 
 /// Applies the queued `PickupAction`/`PlaceAction` writes (packed 0 clears) to the store, which
 /// the VM already mirrors, marks it dirty for the feed and sends each as `CMSG_SET_ACTION_BUTTON`.
-pub(super) fn drain_action_sets(
-    script: Option<NonSendMut<UiScript>>,
-    mut actions: ResMut<PlayerActions>,
+pub(crate) fn drain_action_sets(
+    mut vm: crate::script_calls::VmWith<ResMut<'static, PlayerActions>>,
     commands: Res<NetCommands>,
 ) {
-    let Some(mut script) = script else {
-        return;
-    };
-    for (lua_id, packed) in script.take_action_sets() {
-        let Ok(slot) = u8::try_from(lua_id.saturating_sub(1)) else {
-            debug!("ui_action: set_action_button lua id {lua_id} out of range — ignored");
-            continue;
+    vm.turn(|script, mut actions| {
+        let Some(script) = script else {
+            return;
         };
-        if packed == 0 {
-            actions.buttons.remove(&slot);
-        } else {
-            actions.buttons.insert(
-                slot,
-                ActionButton {
+        for (lua_id, packed) in script.take_action_sets() {
+            let Ok(slot) = u8::try_from(lua_id.saturating_sub(1)) else {
+                debug!("ui_action: set_action_button lua id {lua_id} out of range — ignored");
+                continue;
+            };
+            if packed == 0 {
+                actions.buttons.remove(&slot);
+            } else {
+                actions.buttons.insert(
                     slot,
-                    action: packed & 0x00FF_FFFF,
-                    kind: (packed >> 24) as u8,
-                },
-            );
-        }
-        actions.dirty = true;
-        debug!(
+                    ActionButton {
+                        slot,
+                        action: packed & 0x00FF_FFFF,
+                        kind: (packed >> 24) as u8,
+                    },
+                );
+            }
+            actions.dirty = true;
+            debug!(
             "ui_action: set_action_button lua {lua_id} (wire slot {slot}) packed {packed:#010x}"
         );
-        let _ = commands.0.send(ClientCommand::SetActionButton {
-            button: slot,
-            packed,
-        });
-    }
+            let _ = commands.0.send(ClientCommand::SetActionButton {
+                button: slot,
+                packed,
+            });
+        }
+    })
 }

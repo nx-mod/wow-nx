@@ -26,7 +26,9 @@ use crate::ui_chat::combat::{CombatLogRanges, LogPeriodicSpells};
 use crate::ui_chat::ChatLog;
 
 pub(crate) mod chat;
-mod feedback;
+#[cfg(test)]
+mod death_tests;
+pub(crate) mod feedback;
 pub(crate) mod text;
 
 /// `SMSG_ATTACKERSTATEUPDATE`'s swing as every consumer reads it: the record read runs
@@ -72,10 +74,21 @@ impl Ctx<'_> {
             names: self.names.as_deref(),
             skill_lines: self.skill_lines.as_deref().map(|s| &s.catalog),
             enchants: self.enchants.as_deref().map(|e| &e.0),
+            items: None,
+            gameobjects: None,
             ranges: &self.ranges,
             periodic: self.periodic.0,
         }
     }
+}
+
+/// The caches `LogOpenLock` reads (`0xc0e2a0`, `0xc0e318`). They stay out of [`Ctx`] because
+/// `on_missile_miss` runs in `Update` with it, and the sound systems that write the item cache run
+/// there too: a claim on a cache no line of that leg reads would only add undeclared orders.
+#[derive(SystemParam)]
+struct LockCaches<'w> {
+    items: Option<Res<'w, crate::items::Items>>,
+    gameobjects: Option<Res<'w, crate::go_templates::GameObjectTemplates>>,
 }
 
 /// What the two legs resolve endpoints through and write to.
@@ -85,7 +98,7 @@ pub(crate) struct Sinks<'w, 's> {
     damage_text: Res<'w, DamageTextGates>,
     stores: Query<'w, 's, &'static mut ObjectStore>,
     poses: Query<'w, 's, &'static mut Transform>,
-    log: ResMut<'w, ChatLog>,
+    log: Res<'w, ChatLog>,
     text: MessageWriter<'w, CombatTextSpawn>,
 }
 
@@ -136,17 +149,17 @@ impl Plugin for CombatLogPlugin {
     }
 }
 
-fn on_attacker_state(In(ev): In<SessionEvent>, c: Ctx, mut l: Sinks) {
+fn on_attacker_state(In(ev): In<SessionEvent>, c: Ctx, l: Sinks) {
     if let SessionEvent::AttackerState(s) = ev {
         let ctx = c.ctx();
-        chat::attacker_state(s, &ctx, &l.stores, &l.poses, &mut l.log);
+        chat::attacker_state(s, &ctx, &l.stores, &l.poses, &l.log);
     }
 }
 
 fn on_spell_damage_log(In(ev): In<SessionEvent>, c: Ctx, mut l: Sinks) {
     if let SessionEvent::SpellDamageLog(s) = ev {
         let ctx = c.ctx();
-        chat::spell_damage_log(s, &ctx, &l.stores, &l.poses, &mut l.log);
+        chat::spell_damage_log(s, &ctx, &l.stores, &l.poses, &l.log);
         text::spell_damage_log(
             s,
             &c.index,
@@ -168,7 +181,7 @@ fn on_periodic_aura_log(In(ev): In<SessionEvent>, c: Ctx, mut l: Sinks) {
             return;
         }
         let ctx = c.ctx();
-        chat::periodic_aura_log(&s, &ctx, &l.stores, &l.poses, &mut l.log);
+        chat::periodic_aura_log(&s, &ctx, &l.stores, &l.poses, &l.log);
         text::periodic_aura_log(
             s,
             &c.index,
@@ -181,25 +194,25 @@ fn on_periodic_aura_log(In(ev): In<SessionEvent>, c: Ctx, mut l: Sinks) {
     }
 }
 
-fn on_spell_heal_log(In(ev): In<SessionEvent>, c: Ctx, mut l: Sinks) {
+fn on_spell_heal_log(In(ev): In<SessionEvent>, c: Ctx, l: Sinks) {
     if let SessionEvent::SpellHealLog(s) = ev {
         let ctx = c.ctx();
-        chat::spell_heal_log(s, &ctx, &l.stores, &l.poses, &mut l.log);
+        chat::spell_heal_log(s, &ctx, &l.stores, &l.poses, &l.log);
     }
 }
 
-fn on_spell_energize_log(In(ev): In<SessionEvent>, c: Ctx, mut l: Sinks) {
+fn on_spell_energize_log(In(ev): In<SessionEvent>, c: Ctx, l: Sinks) {
     if let SessionEvent::SpellEnergizeLog(s) = ev {
         let ctx = c.ctx();
         // `0x494770`, the energize `UNIT_COMBAT`, is an empty stub: no flash, only the line.
-        chat::spell_energize_log(s, &ctx, &l.stores, &l.poses, &mut l.log);
+        chat::spell_energize_log(s, &ctx, &l.stores, &l.poses, &l.log);
     }
 }
 
 fn on_damage_shield(In(ev): In<SessionEvent>, c: Ctx, mut l: Sinks) {
     if let SessionEvent::DamageShield(s) = ev {
         let ctx = c.ctx();
-        chat::damage_shield(s, &ctx, &l.stores, &l.poses, &mut l.log);
+        chat::damage_shield(s, &ctx, &l.stores, &l.poses, &l.log);
         text::damage_shield(
             s,
             &c.index,
@@ -218,7 +231,7 @@ fn on_spell_log_miss(In(ev): In<SessionEvent>, c: Ctx, mut l: Sinks) {
             return;
         }
         let ctx = c.ctx();
-        chat::spell_log_miss(&s, &ctx, &l.stores, &l.poses, &mut l.log);
+        chat::spell_log_miss(&s, &ctx, &l.stores, &l.poses, &l.log);
         text::spell_log_miss(
             s,
             &c.index,
@@ -270,7 +283,7 @@ fn on_spell_go(In(ev): In<SessionEvent>, c: Ctx, mut l: Sinks) {
         &ctx,
         &l.stores,
         &l.poses,
-        &mut l.log,
+        &l.log,
     );
     text::spell_go_misses(
         caster,
@@ -311,7 +324,7 @@ fn on_missile_miss(
     c: Ctx,
     stores: Query<&ObjectStore>,
     poses: Query<&Transform>,
-    mut log: ResMut<ChatLog>,
+    log: Res<ChatLog>,
 ) {
     for arrival in arrivals.read() {
         let Ok(&Guid(target)) = guids.get(arrival.anchor) else {
@@ -327,73 +340,77 @@ fn on_missile_miss(
             &ctx,
             &stores,
             &poses,
-            &mut log,
+            &log,
         );
     }
 }
 
 // ── Chat-only packets: no damage number, so no floating-text leg ──
 
-fn on_party_kill_log(In(ev): In<SessionEvent>, c: Ctx, mut l: Sinks) {
+fn on_party_kill_log(In(ev): In<SessionEvent>, c: Ctx, l: Sinks) {
     if let SessionEvent::PartyKillLog(k) = ev {
         let ctx = c.ctx();
-        chat::party_kill_log(k, &ctx, &l.stores, &l.poses, &mut l.log);
+        chat::party_kill_log(k, &ctx, &l.stores, &l.poses, &l.log);
     }
 }
 
-fn on_spell_insta_kill_log(In(ev): In<SessionEvent>, c: Ctx, mut l: Sinks) {
+fn on_spell_insta_kill_log(In(ev): In<SessionEvent>, c: Ctx, l: Sinks) {
     if let SessionEvent::SpellInstaKillLog(k) = ev {
         let ctx = c.ctx();
-        chat::spell_insta_kill_log(k, &ctx, &l.stores, &l.poses, &mut l.log);
+        chat::spell_insta_kill_log(k, &ctx, &l.stores, &l.poses, &l.log);
     }
 }
 
-fn on_spell_outcome_log(In(ev): In<SessionEvent>, c: Ctx, mut l: Sinks) {
+fn on_spell_outcome_log(In(ev): In<SessionEvent>, c: Ctx, l: Sinks) {
     let (o, immune): (SpellOutcomeLog, bool) = match ev {
         SessionEvent::ProcResist(o) => (o, false),
         SessionEvent::SpellOrDamageImmune(o) => (o, true),
         _ => return,
     };
     let ctx = c.ctx();
-    chat::spell_outcome_log(o, immune, &ctx, &l.stores, &l.poses, &mut l.log);
+    chat::spell_outcome_log(o, immune, &ctx, &l.stores, &l.poses, &l.log);
 }
 
-fn on_spell_dispel_log(In(ev): In<SessionEvent>, c: Ctx, mut l: Sinks) {
+fn on_spell_dispel_log(In(ev): In<SessionEvent>, c: Ctx, l: Sinks) {
     if let SessionEvent::SpellDispelLog(d) = ev {
         let ctx = c.ctx();
-        chat::spell_dispel_log(&d, &ctx, &l.stores, &l.poses, &mut l.log);
+        chat::spell_dispel_log(&d, &ctx, &l.stores, &l.poses, &l.log);
     }
 }
 
-fn on_dispel_failed(In(ev): In<SessionEvent>, c: Ctx, mut l: Sinks) {
+fn on_dispel_failed(In(ev): In<SessionEvent>, c: Ctx, l: Sinks) {
     if let SessionEvent::DispelFailed(d) = ev {
         let ctx = c.ctx();
-        chat::dispel_failed(&d, &ctx, &l.stores, &l.poses, &mut l.log);
+        chat::dispel_failed(&d, &ctx, &l.stores, &l.poses, &l.log);
     }
 }
 
-fn on_enchantment_log(In(ev): In<SessionEvent>, c: Ctx, mut l: Sinks) {
+fn on_enchantment_log(In(ev): In<SessionEvent>, c: Ctx, l: Sinks) {
     if let SessionEvent::EnchantmentLog(e) = ev {
         let ctx = c.ctx();
-        chat::enchantment_log(e, &ctx, &l.stores, &l.poses, &mut l.log);
+        chat::enchantment_log(e, &ctx, &l.stores, &l.poses, &l.log);
     }
 }
 
-fn on_spell_log_execute(In(ev): In<SessionEvent>, c: Ctx, mut l: Sinks) {
+fn on_spell_log_execute(In(ev): In<SessionEvent>, c: Ctx, caches: LockCaches, l: Sinks) {
     if let SessionEvent::SpellLogExecute(x) = ev {
-        let ctx = c.ctx();
-        chat::spell_log_execute(&x, &ctx, &l.stores, &l.poses, &mut l.log);
+        let ctx = chat::ChatCtx {
+            items: caches.items.as_deref(),
+            gameobjects: caches.gameobjects.as_deref(),
+            ..c.ctx()
+        };
+        chat::spell_log_execute(&x, &ctx, &l.stores, &l.poses, &l.log);
     }
 }
 
-fn on_environmental_damage_log(In(ev): In<SessionEvent>, c: Ctx, mut l: Sinks) {
+fn on_environmental_damage_log(In(ev): In<SessionEvent>, c: Ctx, l: Sinks) {
     if let SessionEvent::EnvironmentalDamageLog(e) = ev {
         let ctx = c.ctx();
-        chat::environmental_damage_log(e, &ctx, &l.stores, &l.poses, &mut l.log);
+        chat::environmental_damage_log(e, &ctx, &l.stores, &l.poses, &l.log);
     }
 }
 
-fn on_xp_gain(In(ev): In<SessionEvent>, c: Ctx, mut l: Sinks) {
+fn on_xp_gain(In(ev): In<SessionEvent>, c: Ctx, mut l: Sinks, mut commands: Commands) {
     if let SessionEvent::XpGain(x) = ev {
         text::xp_gain(
             x,
@@ -401,7 +418,8 @@ fn on_xp_gain(In(ev): In<SessionEvent>, c: Ctx, mut l: Sinks) {
             &c.self_guid,
             &l.stores,
             &mut l.text,
-            &mut l.log,
+            &l.log,
+            &mut commands,
         );
     }
 }
@@ -409,7 +427,7 @@ fn on_xp_gain(In(ev): In<SessionEvent>, c: Ctx, mut l: Sinks) {
 fn on_exploration_xp(
     In(ev): In<SessionEvent>,
     c: Ctx,
-    mut l: Sinks,
+    l: Sinks,
     area_table: Option<Res<crate::area::AreaTableRes>>,
     exploration_sounds: Option<Res<crate::sound::ExplorationSounds>>,
     mut server_sounds: MessageWriter<ServerSoundMessage>,
@@ -423,14 +441,14 @@ fn on_exploration_xp(
             &c.self_guid,
             &l.stores,
             &mut server_sounds,
-            &mut l.log,
+            &l.log,
         );
     }
 }
 
-fn on_level_up(In(ev): In<SessionEvent>, mut l: Sinks) {
+fn on_level_up(In(ev): In<SessionEvent>, l: Sinks) {
     if let SessionEvent::LevelUp(lv) = ev {
-        text::level_up(lv, &mut l.log);
+        text::level_up(lv, &l.log);
     }
 }
 
@@ -438,7 +456,7 @@ fn on_level_up(In(ev): In<SessionEvent>, mut l: Sinks) {
 /// written. The packet's handler writes nothing unless the client holds the active player
 /// (`0x48f703`, type mask `0x10`; `0x48f708`). A kill needs its victim held as a unit (`0x62529f`,
 /// `0x6252ab`), and an honorable one a victim on a side ([`honor_side`]); otherwise nothing at all.
-fn on_pvp_credit(In(ev): In<SessionEvent>, c: Ctx, mut l: Sinks) {
+fn on_pvp_credit(In(ev): In<SessionEvent>, c: Ctx, l: Sinks) {
     let SessionEvent::PvpCredit(credit) = ev else {
         return;
     };
@@ -860,6 +878,7 @@ mod tests {
                 total,
                 base: 40,
                 kill,
+                group: 1.0,
             });
             app.world_mut()
                 .run_system_once_with(on_xp_gain, packet)
@@ -873,21 +892,24 @@ mod tests {
                 .count();
             (lines, kinds, floats)
         };
-        assert_eq!(gain(MOB, 60, true), (vec![(MOB, 60, 40)], vec!["xp"], 1));
+        assert_eq!(
+            gain(MOB, 60, true),
+            (vec![(MOB, 60, 40, 1.0)], vec!["xp"], 1)
+        );
         assert_eq!(
             gain(77, 60, true),
-            (vec![(0, 60, 40)], vec!["xp"], 1),
+            (vec![(0, 60, 40, 1.0)], vec!["xp"], 1),
             "not held"
         );
         assert_eq!(
             gain(MOB, 60, false),
-            (vec![(0, 60, 40)], vec!["xp"], 1),
+            (vec![(0, 60, 40, 1.0)], vec!["xp"], 1),
             "no kill"
         );
         assert_eq!(gain(MOB, 0, true), (vec![], vec![], 0), "a zero kill");
         assert_eq!(
             gain(0, 0, false),
-            (vec![(0, 0, 40)], vec!["xp"], 1),
+            (vec![(0, 0, 40, 1.0)], vec!["xp"], 1),
             "a zero award"
         );
         assert_eq!(
@@ -907,6 +929,7 @@ mod tests {
             .add_message::<crate::swing_refusal::SwingRefusalEdge>()
             .init_resource::<crate::creature_anim::PendingImpacts>()
             .init_resource::<crate::creature_anim::PlaySeq>()
+            .init_resource::<crate::creature_anim::AttackStopInFlight>()
             .add_plugins(CombatLogPlugin);
         crate::creature_anim::net::register(&mut app);
         app
@@ -962,5 +985,66 @@ mod tests {
             kinds(&app),
             ["combat", "unit combat", "combat", "unit combat"]
         );
+    }
+
+    /// `HandleUnitCombatMessage` signals `PLAYER_ENTER_COMBAT` inside our `SMSG_ATTACKSTART`
+    /// (`0x6256ff`) and `PLAYER_LEAVE_COMBAT` inside our `SMSG_ATTACKSTOP`, after its swing flush
+    /// (`0x625763` → `0x624e40`, then `0x625778`), each gated on the attacker being the active
+    /// player (`0x5fa6d0`): a start and a stop in one drain both signal, at their place among the
+    /// swing's line and its flushed feedback, and another unit's attack signals neither.
+    #[test]
+    fn our_attack_start_and_stop_signal_combat_at_their_packets() {
+        let me_hits_mob = SessionEvent::AttackerState(benilla_protocol::messages::AttackerState {
+            attacker: ME,
+            victim: MOB,
+            hit_info: 0x2,
+            damage: 30,
+            victim_state: 1,
+            absorb: 0,
+            resist: 0,
+            blocked: 0,
+            melee_spell_id: 0,
+            school: 0,
+        });
+        let mut app = swing_world(&[ME, MOB]);
+        crate::net::handlers::dispatch(
+            app.world_mut(),
+            vec![
+                SessionEvent::AttackStart {
+                    attacker: ME,
+                    victim: MOB,
+                },
+                me_hits_mob,
+                SessionEvent::AttackStop {
+                    attacker: ME,
+                    victim: MOB,
+                },
+            ],
+        );
+        assert_eq!(
+            kinds(&app),
+            [
+                "PLAYER_ENTER_COMBAT",
+                "combat",
+                "unit combat",
+                "PLAYER_LEAVE_COMBAT"
+            ]
+        );
+
+        let mut app = swing_world(&[ME, MOB]);
+        crate::net::handlers::dispatch(
+            app.world_mut(),
+            vec![
+                SessionEvent::AttackStart {
+                    attacker: MOB,
+                    victim: ME,
+                },
+                SessionEvent::AttackStop {
+                    attacker: MOB,
+                    victim: ME,
+                },
+            ],
+        );
+        assert!(kinds(&app).is_empty(), "{:?}", kinds(&app));
     }
 }

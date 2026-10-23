@@ -1,16 +1,14 @@
-//! The relation feed: the copy of the relation functions the Lua API asks
-//! ([`RelationSnapshot`]), pushed into the VM.
+//! The relation feed: the relation functions the Lua API asks ([`RelationSnapshot`]), the held
+//! units copied and the reputation slots shared, pushed into the VM.
 
 use std::collections::HashMap;
 use std::rc::Rc;
 
 use bevy::prelude::*;
 
-use benilla_ui::script::UiScript;
-
 use crate::net::{Guid, ObjectStore};
 use crate::target::relations::RelationSnapshot;
-use crate::target::{RelUnit, RelationWorld};
+use crate::target::RelUnit;
 use crate::ui_script::VmMemo;
 
 /// The units [`feed_unit_relations`] last pushed into a VM.
@@ -27,54 +25,55 @@ pub(super) struct RelationMemo {
 /// or a creature record arrived, and the copy is pushed only when a unit's relation facts, the set
 /// of units or a relation input moved.
 pub(super) fn feed_unit_relations(
-    script: Option<NonSendMut<UiScript>>,
-    world: RelationWorld,
+    mut vm: crate::script_calls::VmWith<crate::target::RelationWorld<'static, 'static>>,
     units: Query<(&Guid, Ref<ObjectStore>)>,
     mut memo: Local<VmMemo<RelationMemo>>,
 ) {
-    let Some(mut script) = script else {
-        return;
-    };
-    let (memo, vm_reset) = memo.get_reset(&script);
-    let reread = world.records_changed();
-    let mut moved = false;
-    let mut held = 0;
-    for (guid, store) in &units {
-        if !store.is_unit() {
-            continue;
+    vm.turn(|script, world| {
+        let Some(script) = script else {
+            return;
+        };
+        let (memo, vm_reset) = memo.get_reset(script);
+        let reread = world.records_changed();
+        let mut moved = false;
+        let mut held = 0;
+        for (guid, store) in &units {
+            if !store.is_unit() {
+                continue;
+            }
+            held += 1;
+            if !reread && !store.is_changed() && memo.units.contains_key(&guid.0) {
+                continue;
+            }
+            let unit = world.unit_of(guid.0, &store);
+            moved |= memo.units.insert(guid.0, unit) != Some(unit);
         }
-        held += 1;
-        if !reread && !store.is_changed() && memo.units.contains_key(&guid.0) {
-            continue;
+        // A unit gone since: start over from the held ones.
+        if memo.units.len() != held {
+            memo.units = units
+                .iter()
+                .filter(|(_, s)| s.is_unit())
+                .map(|(g, s)| (g.0, world.unit_of(g.0, &s)))
+                .collect();
+            moved = true;
         }
-        let unit = world.unit_of(guid.0, &store);
-        moved |= memo.units.insert(guid.0, unit) != Some(unit);
-    }
-    // A unit gone since: start over from the held ones.
-    if memo.units.len() != held {
-        memo.units = units
-            .iter()
-            .filter(|(_, s)| s.is_unit())
-            .map(|(g, s)| (g.0, world.unit_of(g.0, &s)))
-            .collect();
-        moved = true;
-    }
-    let me = world.me();
-    moved |= std::mem::replace(&mut memo.me, me) != me;
-    if !(moved || vm_reset || world.inputs_changed()) {
-        return;
-    }
-    let mut units = memo.units.clone();
-    if let Some(me) = me {
-        units.insert(me.guid, me);
-    }
-    script.set_unit_relations(Some(Rc::new(RelationSnapshot {
-        units,
-        factions: world.factions().cloned(),
-        reputations: world.reputations().clone(),
-        me: world.me_guid(),
-        roster: world.roster().cloned().unwrap_or_default(),
-    })));
+        let me = world.me();
+        moved |= std::mem::replace(&mut memo.me, me) != me;
+        if !(moved || vm_reset || world.inputs_changed()) {
+            return;
+        }
+        let mut units = memo.units.clone();
+        if let Some(me) = me {
+            units.insert(me.guid, me);
+        }
+        script.set_unit_relations(Some(Rc::new(RelationSnapshot {
+            units,
+            factions: world.factions().cloned(),
+            reputations: world.reputations().clone(),
+            me: world.me_guid(),
+            roster: world.roster().cloned().unwrap_or_default(),
+        })));
+    })
 }
 
 #[cfg(test)]
@@ -86,6 +85,7 @@ mod tests {
     use crate::net::{GuidIndex, Reputations, SelfGuid, SelfPlayer};
     use crate::spell::group_relation::GroupRoster;
     use crate::target::relations::fixture::*;
+    use benilla_ui::script::UiScript;
 
     const ME: u64 = 0x10;
     const FOE: u64 = 0x11;

@@ -69,7 +69,7 @@ impl GroupMemberEntry {
 
 /// The loot tail `SMSG_GROUP_LIST` carries only when it lists members (`Group.cpp:170-179`);
 /// `threshold` is an item quality, 2 to 4 in practice.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GroupLootInfo {
     /// 0 free-for-all, 1 round-robin, 2 master, 3 group, 4 need before greed (`LootMethod`).
     pub method: u8,
@@ -342,7 +342,7 @@ impl PartyMemberStatsInfo {
             / power_display_scale(u32::from(self.shown_power_type()))
     }
 
-    /// `UnitPowerType` from the pet block (`+0xd8`, `0x5179d2`'s pet leg), 0 when it has none.
+    /// `UnitPowerType` from the pet block (`+0xd8`, the pet leg `0x5179ff`), 0 when it has none.
     pub fn shown_pet_power_type(&self) -> u8 {
         self.pet_power_type.unwrap_or(0)
     }
@@ -551,7 +551,8 @@ pub fn group_uninvite(member_name: &str) -> Vec<u8> {
     body
 }
 
-/// `CMSG_GROUP_UNINVITE_GUID` body, the raid frame's kick: a full guid (`Group.cpp:14-17`).
+/// `CMSG_GROUP_UNINVITE_GUID` body, the kick `0x5e9510` sends for a player whose object the client
+/// does not hold (`0x5e953e`): a full guid (`Group.cpp:14-17`).
 pub fn group_uninvite_guid(guid: u64) -> Vec<u8> {
     guid.to_le_bytes().to_vec()
 }
@@ -642,9 +643,11 @@ pub fn ready_check_start() -> Vec<u8> {
     Vec::new()
 }
 
-/// `MSG_RAID_READY_CHECK` body answering one: 1 ready or 0 not, no guid (`Group.cpp:84-92`).
-pub fn ready_check_answer(ready: bool) -> Vec<u8> {
-    vec![u8::from(ready)]
+/// `MSG_RAID_READY_CHECK` body answering one: the status byte, no guid (`Group.cpp:84-92`). The
+/// client writes whatever byte `ConfirmReadyCheck` was given (`PutInt8` at `0x4bc0e4`); the stock
+/// buttons pass 1 ready and 0 not.
+pub fn ready_check_answer(status: u8) -> Vec<u8> {
+    vec![status]
 }
 
 /// One `SMSG_RAID_INSTANCE_INFO` row, a permanent raid lockout (vmangos `Player::SendRaidInfo`).

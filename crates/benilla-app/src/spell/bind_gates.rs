@@ -1,7 +1,7 @@
 //! `BindTarget 0x6e5b40`'s gates: the five silent exits a unit meets before any relation arm
 //! (`6e5bd8`-`6e5ca2`). A refused unit binds nothing, so `ArmCast` falls to its next candidate,
 //! the player behind `autoSelfCast`, and then to the enemy-word refusal or the targeting cursor.
-//! The read-only mirror `SpellCanTargetUnit 0x6e6460` runs the same five (`6e6507`-`6e65ab`), so
+//! The read-only mirror `SpellCanTargetObject 0x6e6460` runs the same five (`6e6507`-`6e65ab`), so
 //! the press, the cursor's click, `SpellTargetUnit` and the hover verdict share this one gate
 //! through [`super::cast_target::unit_binds`].
 
@@ -98,13 +98,12 @@ mod tests {
         store: &ObjectStore,
         types: CreatureTypeSources,
     ) -> bool {
-        static EMPTY: Reputations = Reputations::from_slots(Vec::new());
         let rel = TargetRelations {
             target_store: Some(store),
             target_owner_store: None,
             self_store: None,
             factions: None,
-            reputations: &EMPTY,
+            reputations: Reputations::empty(),
             types,
             group: Default::default(),
         };
@@ -187,6 +186,7 @@ mod tests {
                     pet_family: 0,
                     rank: 0,
                     type_flags: 0,
+                    pet_spell_list: 0,
                     civilian: false,
                     racial_leader: false,
                     display_id: 0,
@@ -343,6 +343,7 @@ mod tests {
                 pet_family: 0,
                 rank: 0,
                 type_flags: 0,
+                pet_spell_list: 0,
                 civilian: false,
                 racial_leader: false,
                 display_id: 0,
@@ -386,8 +387,12 @@ mod tests {
             };
             let candidates = CastCandidates {
                 selection: Some(if selection_is_self { ME } else { THEM }),
+                selection_held: true,
                 caster: Some(ME),
+                auto_self: Some(ME),
+                auto_self_store: rel.self_store,
                 main_hand_item: None,
+                long_range: false,
             };
             resolve_cast_target(Some(def), &candidates, auto_self_cast, &rel)
         }

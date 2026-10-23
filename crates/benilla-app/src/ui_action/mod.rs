@@ -20,26 +20,37 @@ pub(crate) use cast_lines::{CastFailLines, CastFailRedisplays};
 mod drain;
 // A `UseAction` press, applied in call order by `crate::script_calls`.
 pub(crate) use drain::{attack_nearest_probe, use_action, ActionPress, AttackPress, UseOutcome};
+// The bar's drain of the VM's queued writes, which the macro migration's test runs end to end.
+#[cfg(test)]
+pub(crate) use drain::drain_action_sets;
 // The right-click casts' drain, which the click's tests run after the click.
 #[cfg(test)]
 pub(crate) use drain::drain_click_casts;
 #[cfg(test)]
 mod drain_tests;
 pub(crate) mod drop_item;
+#[cfg(test)]
+mod drop_item_tests;
 mod errors;
 mod feed;
-pub(crate) use feed::{spell_action_icon, MISSING_ITEM_ICON};
+pub(crate) use feed::{bonus_bar_offset, spell_action_icon, MISSING_ITEM_ICON};
 #[cfg(test)]
 mod feed_tests;
 mod net;
 mod ranks;
-mod recount;
-pub(crate) use recount::recount_item_actions;
+// The rank pass, which the macro load orders itself ahead of: it rewrites a bar word, too.
+pub(crate) use ranks::normalize_action_ranks;
+mod reactive;
+#[cfg(test)]
+mod reactive_tests;
+pub(crate) mod recount;
 mod state;
+pub(crate) use state::ActionStates;
 pub(crate) mod toggle;
+mod unlearn;
 mod weapon_icon;
 
-/// Every feed that pushes cooldown triples runs `.before` this set: [`state::feed_action_state`]
+/// Every feed that pushes cooldown triples runs `.before` this set: [`state::fire_action_events`]
 /// fires the cooldown events synchronously, so a triple pushed later goes unread until the next
 /// cooldown change. The pet list's flush, `ui_pet::bar::fire_pet_cooldown_events`, runs `.after`
 /// it on the same rule.
@@ -50,9 +61,9 @@ pub(crate) use cast_fail::report_reaches_pop;
 #[cfg(test)]
 pub(crate) use cast_fail::CAST_FAIL_KEYS;
 pub(crate) use errors::{
-    attack_actor_blocked, attack_actor_refusal, keyed_line, keyed_line_s, reagent_totem_refusal,
-    show_messages, ui_error_text, CastFail, Caster, FillArg, MessageSink, MountErrors,
-    PetTameFailures, Shown, UiError, UiErrorKeys, UiErrorTexts,
+    attack_actor_refusal, keyed_line, keyed_line_s, reagent_totem_refusal, show_messages, show_now,
+    ui_error_text, CastFail, Caster, FillArg, MessageSink, MountErrors, PetTameFailures, Shown,
+    UiError, UiErrorKeys, UiErrorTexts,
 };
 pub(crate) use weapon_icon::{melee_auto_attack_icon, ranged_weapon_icon, substitutes_weapon_icon};
 
@@ -67,10 +78,24 @@ pub(crate) const SPELL_ATTACK: u32 = 6603;
 pub(crate) struct PlayerActions {
     /// Wire slot (0-based) to its packed action; the Lua action id is slot + 1.
     pub buttons: HashMap<u8, ActionButton>,
-    /// The spell book (`SMSG_INITIAL_SPELLS`), ordered on purpose: the reference's first-hit
-    /// scans (the lock resolver `0x5f83d0`) pick between equal spells, 6478 and 22810 "Opening",
-    /// by array order, which is ascending id: the server sends the book from a `std::map`.
+    /// The known spells (`SMSG_INITIAL_SPELLS` and the learns since), the reference's known-spell
+    /// bits `0xb710fc` (`0x4b2603`): a set, which keeps no learn order.
     pub spells: BTreeSet<u32>,
+    /// `[0xb700b0]`: the known spells whose `Effect[0]` is `SPELL_EFFECT_OPEN_LOCK`, in learn
+    /// order. The login list enters in wire order (`0x5dea8b`-`0x5deab9`), each learn appends at
+    /// the tail with no duplicate check (`0x4b2665`-`0x4b2689`), and an unlearn removes the last
+    /// copy and closes the gap (`0x4b2d60`-`0x4b2d87`). The lock resolver `0x5f83d0` and the
+    /// item tooltip's lock walk `0x5da5e0` scan it from the front, so its order picks between
+    /// 6478 "Opening" and 22810 "Opening - No Text", which open the same locks.
+    pub openers: Vec<u32>,
+    /// `SMSG_SUPERCEDED_SPELL`'s `(old, new)` pairs in arrival order, for the macro arm of
+    /// `0x4e5e60`: a macro on the bar whose cached spell is `old` gets `new` (`0x4e5ec4`). The
+    /// macro rebind drains it ([`crate::ui_macro`]).
+    pub superseded: Vec<(u32, u32)>,
+    /// The spells unlearned (`0x5e9fe0`), by `SMSG_REMOVED_SPELL` or a supersede's old rank, in
+    /// arrival order, whose bar slots the unlearn clears (`0x5ea253` into `0x4e5e20`), drained by
+    /// the bar's clear (`unlearn`).
+    pub unlearned: Vec<u32>,
     /// Set by every book or bar change, cleared once the feed re-resolves slot identity, which a
     /// landed item template ([`crate::items::Items::template_epoch`]) also triggers. Between
     /// resolves an item slot's count moves only by the item watchers' recount (`recount`).
@@ -98,6 +123,9 @@ pub(crate) enum ClickCast {
         spell_id: u32,
         entity: Entity,
         guid: u64,
+        /// The byte `InteractWithSpell` passes `SetAutoLoot` after the cast, its `set` given
+        /// (`0x5f06e1`-`0x5f06ef`).
+        auto_loot: Option<bool>,
     },
 }
 
@@ -120,21 +148,57 @@ pub(crate) struct Spells {
 
 impl Spells {
     /// The cast time in ms as `GetCastTime 0x6e3340` returns it for argument 1, the tooltip's
-    /// (`52eb4b`): the level-scaled `CastingTimeIndex` row, then spell-mod op 10 (`0x6e33b7`),
-    /// with no clamp, so row 18's negative time survives. A missing row returns 0 before the
-    /// modifier (`0x6e338a`). The cast-speed multiply (`0x6e3422`) is not applied.
+    /// (`52eb4b`): the `CastingTimeIndex` row scaled at `level` (`0x6e3130`, the player's skill
+    /// in the spell's line over 5), then spell-mod op 10 (`0x6e33b7`), then
+    /// the caster's cast speed, with no clamp, so row 18's negative time survives. A missing row
+    /// returns 0 before the modifier (`0x6e338a`). `caster` is the unit the speed is read off, the
+    /// player or, for a pet spell, its charm else its summon (`0x6e33e8`-`0x6e3416`), `None` when
+    /// it is not streamed, which skips the multiply (`0x6e341d`). `reads` hears the level when the
+    /// row scales by it and the speed when it is read.
     pub(crate) fn cast_time_unclamped_ms(
         &self,
         def: &benilla_formats::SpellDisplay,
-        caster_level: u32,
+        caster: Option<&benilla_protocol::ObjectFields>,
+        level: crate::spell::SpellLevel,
         mods: &crate::spell::SpellModifiers,
+        reads: &mut dyn crate::spell::SpellReads,
     ) -> i32 {
-        self.cast_times
-            .get(def.casting_time_index)
-            .map_or(0, |row| {
-                let resolved = row.resolved_ms(caster_level, def.base_level);
-                mods.apply(def, crate::spell::OP_CAST_TIME, resolved)
-            })
+        let Some(row) = self.cast_times.get(def.casting_time_index) else {
+            return 0;
+        };
+        // The row's level, `0x6e3130`, read only by a row that scales by it.
+        let caster_level = if row.reads_caster_level() {
+            level.read(def, reads)
+        } else {
+            0
+        };
+        let resolved = row.resolved_ms(caster_level, def.base_level);
+        let time = mods.apply(def, crate::spell::OP_CAST_TIME, resolved);
+        // An ability or a trade skill keeps its time (`Attributes & 0x30`, `0x6e33c3`), and so does
+        // a time at or below zero (`0x6e3424`).
+        let Some(caster) = caster.filter(|_| def.attributes & ATTR_NO_CAST_SPEED == 0 && time > 0)
+        else {
+            return time;
+        };
+        reads.unit(crate::spell::UnitField::CastSpeed);
+        // A field never sent is the descriptor's 0, which casts in no time; vmangos sends 1.0 for
+        // that reason (`Player.cpp:464-466`).
+        let speed = caster.unit_mod_cast_speed().unwrap_or(0.0);
+        // `|speed - 1|` below the epsilon at `0x8029d4` keeps the time; equal to it, or a NaN, an
+        // unordered compare, multiplies (`0x6e3432`-`0x6e3445`: `test ah, 5` then `jnp`).
+        if (speed - 1.0).abs() < CAST_SPEED_EPSILON {
+            return time;
+        }
+        // `fimul` on the x87 stack, stored as an `f32`, then `fistp`, which rounds to nearest
+        // even and stores the integer indefinite for a NaN or a value out of range
+        // (`0x6e3447`-`0x6e3456`). The product is exact in `f64` for any `f32` times an `i32`
+        // below 2^29 ms.
+        let product = f64::from((f64::from(speed) * f64::from(time)) as f32).round_ties_even();
+        if (f64::from(i32::MIN)..=f64::from(i32::MAX)).contains(&product) {
+            product as i32
+        } else {
+            i32::MIN
+        }
     }
 
     /// [`Self::cast_time_unclamped_ms`] for argument 0, the cast validator's (`0x609e16`): a
@@ -142,12 +206,22 @@ impl Spells {
     pub(crate) fn cast_time_ms(
         &self,
         def: &benilla_formats::SpellDisplay,
-        caster_level: u32,
+        caster: Option<&benilla_protocol::ObjectFields>,
+        level: crate::spell::SpellLevel,
         mods: &crate::spell::SpellModifiers,
     ) -> u32 {
-        self.cast_time_unclamped_ms(def, caster_level, mods).max(0) as u32
+        let time =
+            self.cast_time_unclamped_ms(def, caster, level, mods, &mut crate::spell::Unrecorded);
+        time.max(0) as u32
     }
 }
+
+/// `Attributes` bits 4 and 5, vmangos `SPELL_ATTR_IS_ABILITY` and `SPELL_ATTR_IS_TRADESKILL`
+/// (`SpellDefines.h:796-797`): a cast time the caster's speed does not scale (`0x6e33c3`).
+const ATTR_NO_CAST_SPEED: u32 = 0x30;
+
+/// The `f32` at `0x8029d4`, 2^-22: a cast speed this close to 1 leaves the time as it is.
+const CAST_SPEED_EPSILON: f32 = f32::from_bits(0x3480_0000);
 
 #[cfg(test)]
 impl Spells {
@@ -167,9 +241,20 @@ impl Spells {
 #[cfg(test)]
 pub(crate) fn run_feed_action_state_once(world: &mut World) {
     use bevy::ecs::system::RunSystemOnce;
+    world.init_resource::<state::ActionStateMemory>();
     world
         .run_system_once(state::feed_action_state)
         .expect("the action-state feed runs as a one-shot system");
+}
+
+/// One pass of the action-state feed and the events it owes, for a test that hears them.
+#[cfg(test)]
+pub(crate) fn run_action_events_once(world: &mut World) {
+    use bevy::ecs::system::RunSystemOnce;
+    run_feed_action_state_once(world);
+    world
+        .run_system_once(state::fire_action_events)
+        .expect("the action events run as a one-shot system");
 }
 
 /// The 5875 spell data; `None` skips where the install is absent.
@@ -208,7 +293,7 @@ const SPELL_EFFECT_SKIN_PLAYER_CORPSE: u32 = 0x74;
 const SPELL_EFFECT_FEED_PET: u32 = 0x65;
 
 /// Re-derives [`LearnedAbilities`] whenever the book changes, standing in for learn-time writes.
-fn track_learned_abilities(
+pub(crate) fn track_learned_abilities(
     actions: Res<PlayerActions>,
     spells: Option<Res<Spells>>,
     mut learned: ResMut<LearnedAbilities>,
@@ -277,7 +362,9 @@ impl Plugin for UiActionPlugin {
     fn build(&self, app: &mut App) {
         net::register(app);
         // A UI-only harness has no net stack; declaring a message twice is idempotent.
-        app.add_message::<crate::item_watch::ItemNotice>()
+        app.add_message::<crate::net::FieldChanged>()
+            .init_resource::<state::ActionEvents>()
+            .init_resource::<state::ActionStateMemory>()
             .add_message::<crate::net::WorldEnterCascadeMessage>()
             .init_resource::<PlayerActions>()
             .init_resource::<LearnedAbilities>()
@@ -299,19 +386,50 @@ impl Plugin for UiActionPlugin {
                     ranks::normalize_action_ranks
                         .in_set(UnitFeed)
                         .before(feed::feed_actions),
-                    // The item watchers' recounts, after the server's unlocks, which each handler
-                    // runs first (`0x5d94af` before `0x5d94e1`).
+                    // The unlearns' clears, after the macros' bound spells a macro slot resolves
+                    // through and after the rank pass, which stands in for the supersede's move
+                    // of the spell slots (`0x4e5e60`) that its unlearn (`0x5e6392`) follows; before
+                    // the identity feed that consumes their `dirty`.
+                    unlearn::clear_unlearned_slots
+                        .in_set(UnitFeed)
+                        .after(crate::ui_macro::MacroBindings)
+                        .after(ranks::normalize_action_ranks)
+                        .before(feed::feed_actions),
+                    // Our player's arrival recount, after the server's unlocks.
                     recount::recount_item_actions
                         .in_set(UnitFeed)
                         .after(crate::ui_items::locks::apply_item_releases)
                         .before(feed::feed_actions),
-                    feed::feed_actions.in_set(UnitFeed),
+                    // Before the aura feed, whose `raidFilter` verdicts rebuild off the book
+                    // when `PlayerActions` moves, so a book this pass settles is read this frame.
+                    feed::feed_actions
+                        .in_set(UnitFeed)
+                        .before(crate::ui_aura::AuraEvents),
+                    // A seat: the world-enter events' handlers read the slots' state, which the
+                    // reference's arrival stores before its enter cascade (`0x5deafc`, `0x5deb60`).
+                    // After the macros' bound spells, which a macro slot resolves through. After the
+                    // bag feed, a seat too: left to the VM pass, the pair links through one more
+                    // command barrier ([`crate::vm_pass`]).
                     state::feed_action_state
                         .in_set(UnitFeed)
-                        .in_set(CooldownEvents)
+                        .in_set(crate::ui_unit::WorldEnterSeats)
                         .after(crate::player::ControlRestore)
+                        .after(crate::ui_items::feed::feed_containers)
+                        .after(crate::ui_macro::MacroBindings)
                         .after(feed::feed_actions),
-                    drain::drain_action_sets.after(UiInput),
+                    // After the unit snapshots, which its handlers read (the target stored at
+                    // `0x4936e2`, a watched field written before its watch runs), and ahead of the
+                    // events its producers precede: the select's `PLAYER_TARGET_CHANGED` and the
+                    // combo points' event (the unit events), the watched fields' own events (the
+                    // field notices, whose lane fires after every feed) and the form's cast
+                    // change (the cast reports).
+                    state::fire_action_events
+                        .in_set(UnitFeed)
+                        .in_set(CooldownEvents)
+                        .after(state::feed_action_state)
+                        .after(crate::ui_unit::UnitSnapshots)
+                        .before(crate::ui_cast::feed_cast_reports),
+                    drain::drain_action_sets.in_set(crate::ui_script::UiDrain),
                     // The target chain queues the right-click casts earlier in the frame.
                     drain::drain_click_casts
                         .after(UiInput)

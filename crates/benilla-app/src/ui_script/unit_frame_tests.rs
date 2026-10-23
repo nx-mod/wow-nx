@@ -37,6 +37,9 @@ fn load_unit_frames_with(s: &UiScript, extra: &[&str]) {
         // `GetDifficultyColor` (`QuestLogFrame.lua:585`), which `TargetFrame_CheckLevel` asks for
         // an attackable target (`TargetFrame.lua:130`).
         r"Interface\FrameXML\QuestLogFrame.lua",
+        // `StaticPopup_Hide`, which UIParent's `PLAYER_UNGHOST` arm calls (`UIParent.lua:251-257`)
+        // at a live arrival.
+        r"Interface\FrameXML\StaticPopup.xml",
     ];
     for file in super::test_ui::production_order(&[UNIT_FRAMES, extra]) {
         load_xml(s, file);
@@ -383,6 +386,7 @@ fn unit_combat_drives_the_player_hit_indicator() {
 fn left_clicking_the_player_frame_targets_self() {
     benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     load_unit_frames(&s);
 
@@ -431,10 +435,9 @@ fn left_clicking_the_player_frame_targets_self() {
             name: "Alice".into(),
             guid: 0xA11CE,
         }],
-        leader_index: 0, // we lead
-        // The player's own guid, unset; 0 is also the ungrouped sentinel, but there is a member.
-        leader_guid: 0,
-        own_guid: 0,
+        leader_index: 0, // we lead: the leader cell holds our guid
+        leader_guid: 0x5E1F,
+        own_guid: 0x5E1F,
         raid: Vec::new(),
         loot_method: "group".into(),
         master_looter: None,
@@ -463,6 +466,11 @@ fn left_clicking_the_player_frame_targets_self() {
         "Loot Method is nested for the leader"
     );
     s.resolve();
+    // `LeaveParty` sends only with the player's object (`0x4e9196`).
+    s.set_unit_guids(&benilla_ui::script::UnitGuids {
+        player: 0x5E1F,
+        ..Default::default()
+    });
     let (rx, ry) = s
         .eval::<(f64, f64)>("return DropDownList1Button4:GetCenter()")
         .unwrap();
@@ -487,6 +495,7 @@ fn left_clicking_the_player_frame_targets_self() {
 fn raid_mark_clicks_through_the_nested_level() {
     benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     load_unit_frames(&s);
 
@@ -506,13 +515,15 @@ fn raid_mark_clicks_through_the_nested_level() {
             guid: 0xA11CE,
         }],
         leader_index: 0, // we lead: the mark rows are leader-gated
-        leader_guid: 0,  // the player's own guid; this fixture leaves it unset
-        own_guid: 0,
+        leader_guid: 0x5E1F,
+        own_guid: 0x5E1F,
         raid: Vec::new(),
         loot_method: "group".into(),
         master_looter: None,
         loot_threshold: 2,
     });
+    // The resolver's inputs, which `SetRaidTarget` reads the token through (`0x4bbeff`).
+    s.seat_player_guid(0x5E1F);
     s.resolve();
 
     let (cx, cy) = s
@@ -561,7 +572,7 @@ fn raid_mark_clicks_through_the_nested_level() {
     assert_eq!(
         s.take_party_requests(),
         vec![benilla_ui::script::PartyRequest::SetRaidTarget {
-            unit: "player".into(),
+            guid: 0x5E1F,
             index: 8
         }],
         "Skull queues the mark intent for the menu's unit"
@@ -1083,7 +1094,6 @@ fn a_live_faction_template_change_recolours_the_target_plate() {
 /// pushed for the stock poll.
 #[test]
 fn a_values_block_moves_the_target_health_bar_and_a_retarget_fires_no_unit_event() {
-    use crate::field_watch::FieldNotice;
     use crate::net::{Guid, GuidIndex, NetCommands, ObjectStore, SelfPlayer};
     use crate::target::Selection;
     use benilla_protocol::field::{FIELD_UNIT_HEALTH, FIELD_UNIT_MAXHEALTH};
@@ -1220,11 +1230,14 @@ fn a_values_block_moves_the_target_health_bar_and_a_retarget_fires_no_unit_event
             WOLF,
             ObjectType::Unit,
             &store.0,
-            &edges,
+            &crate::field_watch::Notified::new(
+                crate::field_watch::Sent::Fields(&[FIELD_UNIT_HEALTH]),
+                &edges,
+            ),
         )
     };
     app.world_mut()
-        .resource_mut::<Messages<FieldNotice>>()
+        .resource_mut::<crate::field_watch::NoticeLane>()
         .write_batch(notices);
     app.update();
     assert_eq!(seen(&mut app), ["UNIT_HEALTH:target"]);
@@ -1248,11 +1261,14 @@ fn a_values_block_moves_the_target_health_bar_and_a_retarget_fires_no_unit_event
             BOAR,
             ObjectType::Unit,
             &store.0,
-            &edges,
+            &crate::field_watch::Notified::new(
+                crate::field_watch::Sent::Fields(&[FIELD_UNIT_HEALTH]),
+                &edges,
+            ),
         )
     };
     app.world_mut()
-        .resource_mut::<Messages<FieldNotice>>()
+        .resource_mut::<crate::field_watch::NoticeLane>()
         .write_batch(notices);
     app.update();
     assert!(seen(&mut app).is_empty(), "no targettarget unit event");
@@ -1266,7 +1282,8 @@ fn a_values_block_moves_the_target_health_bar_and_a_retarget_fires_no_unit_event
 }
 
 /// A forced-reaction table arriving recolours the target plate: the reference's handler `0x4d59a0`
-/// fires `UNIT_FACTION` for every token naming a unit (`0x4d5a5e` → `0x606e20`), where the plate
+/// refreshes the active player's reaction (`0x4d5a5e` → `0x606e20`), whose sweep signals
+/// `UNIT_FACTION` for the held target too, where the plate
 /// listens for it (`TargetFrame.lua:75-79`) and no field edge moves. A change of the standings
 /// alone fires nothing, a resend of the same table fires again, and a table naming another
 /// faction still fires: the handler tests nothing.
@@ -1369,6 +1386,23 @@ fn a_forced_reaction_table_arriving_recolours_the_target_plate() {
         out
     };
     let plate = |app: &mut App| plate_color(&mut script(app));
+    // `SMSG_SET_FORCED_REACTIONS` as its handler applies it: the table, then `RefreshReaction` on
+    // the active player (`0x4d5a5e`), its signals on the notice lane.
+    let arrive = |app: &mut App, table: Vec<(u32, u32)>| {
+        app.world_mut()
+            .resource_mut::<Reputations>()
+            .set_forced(table);
+        let world = app.world_mut();
+        let mut q = world.query::<(&Guid, &ObjectStore)>();
+        let units: Vec<(u64, benilla_protocol::ObjectFields)> =
+            q.iter(world).map(|(g, s)| (g.0, s.0.clone())).collect();
+        let me = units.iter().find(|(g, _)| *g == ME).map(|(_, f)| f.clone());
+        let others = || crate::field_watch::reaction_sweep(ME, units.iter().map(|(g, f)| (*g, f)));
+        let notices = crate::field_watch::reaction_signals(ME, &me.unwrap(), Some(ME), &others);
+        world
+            .resource_mut::<crate::field_watch::NoticeLane>()
+            .write_batch(notices);
+    };
     let is_green =
         |c: [f32; 4]| c[0].abs() < 1e-6 && (c[1] - 1.0).abs() < 1e-6 && c[2].abs() < 1e-6;
     let is_red = |c: [f32; 4]| (c[0] - 1.0).abs() < 1e-6 && c[1].abs() < 1e-6 && c[2].abs() < 1e-6;
@@ -1384,15 +1418,12 @@ fn a_forced_reaction_table_arriving_recolours_the_target_plate() {
     // A standing moves: the questgiver and unit feeds wake, and no event fires.
     app.world_mut()
         .resource_mut::<Reputations>()
-        .slots
-        .push((0, 0));
+        .set_standing(63, 1);
     app.update();
     assert!(seen(&mut app).is_empty(), "no table arrived");
 
     // A table naming another faction still fires: the handler tests nothing (`0x4d5a5e`).
-    app.world_mut()
-        .resource_mut::<Reputations>()
-        .set_forced(vec![(faction + 1000, 0)]);
+    arrive(&mut app, vec![(faction + 1000, 0)]);
     app.update();
     assert_eq!(
         seen(&mut app),
@@ -1405,27 +1436,21 @@ fn a_forced_reaction_table_arriving_recolours_the_target_plate() {
     );
 
     // The guard's faction forced to Hated: the plate follows `UNIT_FACTION`, not a retarget.
-    app.world_mut()
-        .resource_mut::<Reputations>()
-        .set_forced(vec![(faction, 0)]);
+    arrive(&mut app, vec![(faction, 0)]);
     app.update();
     assert_eq!(seen(&mut app), ["player", "target"]);
     let after = plate(&mut app);
     assert!(is_red(after), "forced Hated reads red, got {after:?}");
 
     // The same table sent again fires again, and the aura's removal (an empty table) repaints.
-    app.world_mut()
-        .resource_mut::<Reputations>()
-        .set_forced(vec![(faction, 0)]);
+    arrive(&mut app, vec![(faction, 0)]);
     app.update();
     assert_eq!(
         seen(&mut app),
         ["player", "target"],
         "a resend is an arrival"
     );
-    app.world_mut()
-        .resource_mut::<Reputations>()
-        .set_forced(Vec::new());
+    arrive(&mut app, Vec::new());
     app.update();
     assert_eq!(seen(&mut app), ["player", "target"]);
     let cleared = plate(&mut app);
@@ -2305,9 +2330,9 @@ fn the_player_frame_wears_the_leader_and_master_looter_icons() {
             guid: 0x7A17,
         }],
         leader_index,
-        // Follows `leader_index`: 0 = the player (unset here), else the member who leads.
-        leader_guid: if leader_index == 0 { 0 } else { 0x7A17 },
-        own_guid: 0,
+        // Follows `leader_index`: 0 = the player, else the member who leads.
+        leader_guid: if leader_index == 0 { 0x5E1F } else { 0x7A17 },
+        own_guid: 0x5E1F,
         raid: Vec::new(),
         loot_method: method.into(),
         master_looter,

@@ -7,10 +7,10 @@ use bevy::prelude::*;
 
 use super::{
     mail_refusal, MailOpen, MailPending, MailResult, CHECKED_COD_PAYMENT, CHECKED_COPIED,
-    MAIL_SENT_KEY,
+    CHECKED_RETURNED, MAIL_SENT_KEY,
 };
 use crate::net::{ClientCommand, NetCommands, NetHandlerApp};
-use crate::ui_items::{EquipError, EquipErrors};
+use crate::query_cache::Ask;
 
 pub(super) fn register(app: &mut App) {
     use SessionEventKind as K;
@@ -22,9 +22,68 @@ pub(super) fn register(app: &mut App) {
         .net_handler(K::Disconnected, on_session_end);
 }
 
-fn on_mail_list(In(ev): In<SessionEvent>, mut mail: ResMut<MailOpen>, commands: Res<NetCommands>) {
+/// What the list handler reads beside the session: the papers it defaults a row to, the item
+/// templates and GlobalStrings an auction notice's subject is written from, and the profanity
+/// mask it runs on each subject.
+#[derive(bevy::ecs::system::SystemParam)]
+struct ListReads<'w, 's> {
+    stationery: Option<Res<'w, super::Stationery>>,
+    self_q: Query<
+        'w,
+        's,
+        (&'static crate::net::ObjectStore, &'static crate::net::Guid),
+        With<crate::net::SelfPlayer>,
+    >,
+    objects: crate::net::Objects<'w, 's>,
+    items: Res<'w, crate::items::Items>,
+    filter: Option<Res<'w, crate::text_filter::TextFilter>>,
+    switches: Option<Res<'w, crate::text_filter::TextFilterSwitches>>,
+    script: Option<NonSend<'w, benilla_ui::script::UiScript>>,
+    props: Option<Res<'w, crate::items::RandomProperties>>,
+}
+
+fn on_mail_list(
+    In(ev): In<SessionEvent>,
+    mut mail: ResMut<MailOpen>,
+    commands: Res<NetCommands>,
+    social: Res<crate::ui_social::SocialState>,
+    reads: ListReads,
+) {
     if let SessionEvent::MailList { mails } = ev {
-        mail_list(mails, &mut mail, &commands);
+        // The usable list's first paper (`[[0xb6ee30]]`, `0x4ad565`-`0x4ad56d`).
+        let first_paper = reads.stationery.as_deref().and_then(|catalog| {
+            super::stationeries(catalog, &reads.self_q, &reads.objects, &reads.items, None)
+                .first()
+                .map(|v| v.id)
+        });
+        let enabled = reads.switches.as_deref().is_some_and(|s| s.profanity);
+        let get_text = |key: &str| {
+            reads
+                .script
+                .as_deref()
+                .and_then(|s| crate::ui_chat::combat::global_string(s, key))
+        };
+        mail_list(
+            mails,
+            &mut mail,
+            &commands,
+            |guid| social.is_ignored(guid),
+            first_paper,
+            |raw| {
+                super::auction_subject(
+                    raw,
+                    &reads.items,
+                    reads.props.as_deref(),
+                    Ask::Event(&commands),
+                    &get_text,
+                )
+            },
+            |subject| {
+                if let Some(filter) = reads.filter.as_deref() {
+                    filter.mask(enabled, subject);
+                }
+            },
+        );
     }
 }
 
@@ -32,7 +91,6 @@ fn on_send_mail_result(
     In(ev): In<SessionEvent>,
     mut mail: ResMut<MailOpen>,
     commands: Res<NetCommands>,
-    mut equip_errors: ResMut<EquipErrors>,
 ) {
     if let SessionEvent::SendMailResult {
         mail_id,
@@ -50,7 +108,6 @@ fn on_send_mail_result(
             item,
             &mut mail,
             &commands,
-            &mut equip_errors,
         );
     }
 }
@@ -89,31 +146,75 @@ fn on_session_end(
     *pending = MailPending::default();
 }
 
-/// `SMSG_MAIL_LIST_RESULT` replaces the rows; an expired row (`expire_days <= 0`) is deleted with
-/// `CMSG_MAIL_DELETE` and dropped, as the handler `0x4ad1b0` does. It never touches
-/// [`MailPending`]: nothing on the inbox path writes the countdown `0x845eac`.
-pub(super) fn mail_list(mails: Vec<MailListEntry>, mail: &mut MailOpen, commands: &NetCommands) {
+/// `SMSG_MAIL_LIST_RESULT` (`0x4ad1b0`) replaces the rows, whatever their days left: the handler
+/// reads them (`0x4ad414`) and never tests them. A player's mail from an ignored sender
+/// (`0x4ad47f`) that is neither returned nor a COD payment (`0x4ad496`) is answered at once and
+/// dropped (`0x4ad51d`): `CMSG_MAIL_RETURN_TO_SENDER` when it holds an item or money (`0x4ad4bf`,
+/// `0x4ad4c7`), else `CMSG_MAIL_DELETE` (`0x4ad4cf`), with the mailbox cell as it stands, 0 when
+/// none is open (`0x4ad4e3`). Every other row with no positive stationery id takes `first_paper`,
+/// the usable list's first (`0x4ad551`-`0x4ad56f`). An auction notice's subject is written by
+/// `rewrite` when its item is held, else emptied (`0x4ad580`-`0x4ad5a0`, `0x4acf3d`), and every
+/// row's shown subject is then
+/// masked in list order (`0x4ad5b2`, `dl` 0); a notice keeps its raw triplet beside it
+/// ([`super::ListedSubject`]). It never touches [`MailPending`]: nothing on the inbox path writes
+/// the countdown `0x845eac`.
+///
+/// Deviation: with no usable paper the reference reads the first record of an empty list through
+/// a null pointer (`0x4ad561`-`0x4ad56d`, `mov eax,[eax]` with `eax` 0) and faults; benilla keeps
+/// the row's wire id, so the inbox still opens.
+pub(super) fn mail_list(
+    mails: Vec<MailListEntry>,
+    mail: &mut MailOpen,
+    commands: &NetCommands,
+    is_ignored: impl Fn(u64) -> bool,
+    first_paper: Option<u32>,
+    mut rewrite: impl FnMut(&str) -> Option<String>,
+    mut mask: impl FnMut(&mut String),
+) {
     // The answer clears the request lock (`0x4ad5d0`).
     mail.resolve_request();
     // The parse ends in `MAIL_INBOX_UPDATE` (`0x4ad5c6`).
     mail.list_results += 1;
-    let mailbox = mail.mailbox;
+    let mailbox = mail.mailbox.unwrap_or(0);
+    let mut auction_subjects = std::collections::HashMap::new();
     mail.mails = mails
         .into_iter()
         .filter(|e| {
-            if e.expire_days <= 0.0 {
-                if let Some(mailbox) = mailbox {
-                    let _ = commands.0.send(ClientCommand::MailDelete {
-                        mailbox,
-                        mail_id: e.message_id,
-                    });
-                }
-                false
-            } else {
-                true
+            let answered = e.message_type == mail_message_type::NORMAL
+                && is_ignored(e.sender_guid.unwrap_or(0))
+                && e.checked & (CHECKED_RETURNED | CHECKED_COD_PAYMENT) == 0;
+            if answered {
+                let mail_id = e.message_id;
+                let _ = commands.0.send(if e.item.is_some() || e.money != 0 {
+                    ClientCommand::MailReturnToSender { mailbox, mail_id }
+                } else {
+                    ClientCommand::MailDelete { mailbox, mail_id }
+                });
             }
+            !answered
+        })
+        .map(|mut e| {
+            // The id is read signed (`0x4ad551 cmp [ecx+0x11c],0; jg`).
+            if (e.stationery as i32) <= 0 {
+                if let Some(id) = first_paper {
+                    e.stationery = id;
+                }
+            }
+            if e.message_type == mail_message_type::AUCTION {
+                let written = rewrite(&e.subject);
+                let rewritten = written.is_some();
+                // An item not held, or a subject the parse cannot name, leaves the cell empty
+                // (`0x4acf3d`, `0x4acfbd`).
+                let mut text = written.unwrap_or_default();
+                mask(&mut text);
+                auction_subjects.insert(e.message_id, super::ListedSubject { text, rewritten });
+            } else {
+                mask(&mut e.subject);
+            }
+            e
         })
         .collect();
+    mail.auction_subjects = auction_subjects;
 }
 
 /// Whether a take leaves the mail empty, which the client then deletes itself: `CMSG_MAIL_DELETE`,
@@ -150,7 +251,6 @@ pub(super) fn send_mail_result(
     _item: Option<(u32, u32)>,
     mail: &mut MailOpen,
     commands: &NetCommands,
-    equip_errors: &mut EquipErrors,
 ) {
     // ITEM_TAKEN's `(entry, count)` tail is unused; vmangos sends no `SMSG_ITEM_PUSH_RESULT` for a
     // mail take (`MailHandler.cpp:675`). Every result lifts the request lock at the handler's
@@ -159,20 +259,14 @@ pub(super) fn send_mail_result(
     // Every result owes the feed its tail `MAIL_FAILED`, whatever its action (`0x4ad15f`).
     let mut result = MailResult::default();
     if action == mail_action::SEND {
-        if error == mail_error::EQUIP_ERROR {
-            equip_errors.0.push(EquipError {
-                unlocks: [0, 0],
-                reason: equip_error.unwrap_or(0) as u8,
-                required_level: None,
-                // The result carries no bag slot: 255 is the wire's "own array" sentinel, so
-                // reason 16 names no container.
-                bag_slot: 255,
-            });
-        }
         result.send = Some(error == mail_error::OK);
         result.line = match error {
             mail_error::OK => Some(MAIL_SENT_KEY),
-            mail_error::EQUIP_ERROR => None,
+            // The equip-error table's line, with no fill: the result carries no bag slot and no
+            // level, and unlocks nothing.
+            mail_error::EQUIP_ERROR => Some(crate::ui_items::equip_error_key(
+                equip_error.unwrap_or(0) as u8,
+            )),
             other => Some(mail_refusal(other)),
         };
         mail.results.push(result);
@@ -210,12 +304,11 @@ pub(super) fn send_mail_result(
                 }
             }
         }
-        mail_error::EQUIP_ERROR => equip_errors.0.push(EquipError {
-            unlocks: [0, 0],
-            reason: equip_error.unwrap_or(0) as u8,
-            required_level: None,
-            bag_slot: 255,
-        }),
+        mail_error::EQUIP_ERROR => {
+            result.line = Some(crate::ui_items::equip_error_key(
+                equip_error.unwrap_or(0) as u8
+            ))
+        }
         other => result.line = Some(mail_refusal(other)),
     }
     mail.results.push(result);
@@ -257,7 +350,6 @@ mod tests {
         app.add_plugins(MinimalPlugins)
             .init_resource::<MailOpen>()
             .init_resource::<MailPending>()
-            .init_resource::<EquipErrors>()
             .insert_resource(NetCommands(tx));
         register(&mut app);
 
@@ -285,7 +377,6 @@ mod tests {
     fn every_mail_result_lifts_the_request_lock() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let commands = NetCommands(tx);
-        let mut equip = EquipErrors::default();
         for (action, error) in [
             (mail_action::SEND, mail_error::OK),
             (mail_action::MONEY_TAKEN, mail_error::OK),
@@ -296,9 +387,7 @@ mod tests {
         ] {
             let mut mail = MailOpen::default();
             mail.click(0x20);
-            send_mail_result(
-                7, action, error, None, None, &mut mail, &commands, &mut equip,
-            );
+            send_mail_result(7, action, error, None, None, &mut mail, &commands);
             assert!(mail.request_resolved, "action {action} error {error}");
         }
     }
@@ -310,7 +399,6 @@ mod tests {
     fn every_mail_result_signals_mail_failed_once() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let commands = NetCommands(tx);
-        let mut equip = EquipErrors::default();
         let mut mail = MailOpen::default();
         mail.click(0x20);
         let mut cod = super::super::tests::entry(7, Some(0xA), 0, 30.0);
@@ -323,9 +411,7 @@ mod tests {
             (mail_action::ITEM_TAKEN, mail_error::EQUIP_ERROR),
             (mail_action::SEND, mail_error::OK),
         ] {
-            send_mail_result(
-                7, action, error, None, None, &mut mail, &commands, &mut equip,
-            );
+            send_mail_result(7, action, error, None, None, &mut mail, &commands);
         }
         assert_eq!(mail.results.len(), 5, "one per result");
 
@@ -381,7 +467,6 @@ mod tests {
         action: u32,
     ) -> crossbeam_channel::Receiver<ClientCommand> {
         let (tx, rx) = crossbeam_channel::unbounded();
-        let mut equip = EquipErrors::default();
         send_mail_result(
             id,
             action,
@@ -390,7 +475,6 @@ mod tests {
             None,
             mail,
             &NetCommands(tx),
-            &mut equip,
         );
         rx
     }
@@ -402,7 +486,6 @@ mod tests {
     fn a_take_edits_its_row_in_place_and_asks_for_no_list() {
         let (tx, rx) = crossbeam_channel::unbounded();
         let commands = NetCommands(tx);
-        let mut equip = EquipErrors::default();
         let mut mail = MailOpen::default();
         mail.click(0x20);
         let mut row = super::super::tests::entry(7, Some(0xA), 0, 30.0);
@@ -414,16 +497,7 @@ mod tests {
             (mail_action::ITEM_TAKEN, 7),
             (mail_action::MADE_PERMANENT, 7),
         ] {
-            send_mail_result(
-                id,
-                action,
-                mail_error::OK,
-                None,
-                None,
-                &mut mail,
-                &commands,
-                &mut equip,
-            );
+            send_mail_result(id, action, mail_error::OK, None, None, &mut mail, &commands);
         }
         let row = &mail.mails[0];
         assert_eq!((row.money, row.item.is_none()), (0, true));
@@ -476,7 +550,6 @@ mod tests {
             row.item_text_id = text;
             row.message_type = kind;
             mail.mails.push(row);
-            let mut equip = EquipErrors::default();
             send_mail_result(
                 7,
                 mail_action::ITEM_TAKEN,
@@ -485,7 +558,6 @@ mod tests {
                 None,
                 &mut mail,
                 &NetCommands(tx),
-                &mut equip,
             );
             assert_eq!(
                 sent_commands(&rx).is_empty(),
@@ -504,7 +576,6 @@ mod tests {
         let mut cod = super::super::tests::entry(7, Some(0xA), 0, 30.0);
         cod.checked = CHECKED_COD_PAYMENT;
         mail.mails.push(cod);
-        let mut equip = EquipErrors::default();
         send_mail_result(
             7,
             mail_action::MONEY_TAKEN,
@@ -513,7 +584,6 @@ mod tests {
             None,
             &mut mail,
             &NetCommands(tx),
-            &mut equip,
         );
         assert_eq!(sent_commands(&rx), [("delete", 7)]);
         assert_eq!(mail.results[0].close_inbox, Some(1));

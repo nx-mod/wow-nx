@@ -30,16 +30,20 @@ mod net;
 mod body_pose;
 pub(crate) mod camera;
 mod camera_channel;
+mod camera_clip;
 pub(crate) mod camera_dynamics;
 pub(crate) mod camera_zoom;
 mod controller;
 mod world_focus;
+#[cfg(test)]
+pub(crate) use world_focus::insert_test_room;
+pub(crate) use world_focus::{publish_caster_outdoors, BarUnitOutdoors, PlayerOutdoors};
 // The remembered camera pose, inside `player/` to read the rig's `pub(super)` fields.
 mod camera_saved;
 mod camera_water;
 // The five named camera views, inside `player/` to write the rig's `pub(super)` fields.
 pub(crate) mod camera_view;
-mod drunk;
+pub(crate) mod drunk;
 mod edge;
 mod embody;
 mod flags;
@@ -92,6 +96,8 @@ pub(crate) use approach::{
     can_auto_interact, cancel_move_action_on_ui_shutdown, Approach, ApproachVerb, AutoMove,
     Refused, Subject, RANGE_STOP_FRACTION, TALK_STOP,
 };
+/// `SetStandState` run inside a script call.
+pub(crate) use posture::StandSetter;
 use state::{
     MoveSpeed, PlayerRide, AIR_NUDGE_SPEED, FALL_FAR_DROP, FALL_FAR_TIME, FOOT_CONE_HEIGHT,
     GROUND_COS, GROUND_PROBE, JUMP_SPEED, LAND_PROBE, MOUSELOOK_PITCH_CLAMP, RUN_BACK_RATIO,
@@ -100,9 +106,9 @@ use state::{
     WEDGE_STALL_RATIO, WEDGE_STILL_FRAMES,
 };
 pub(crate) use state::{
-    Player, PlayerCapsule, CAPSULE_HEIGHT, CAPSULE_RADIUS, CREATURE_STEP_UP_HEIGHT,
-    DEFAULT_COLLISION_HEIGHT, FEATHER_TERMINAL_VELOCITY, GRAVITY, HOVER_CLIMB_RATE, HOVER_HEIGHT,
-    SETTLE_TIMEOUT, STEP_UP_HEIGHT, TERMINAL_VELOCITY,
+    OwnControlLost, Player, PlayerCapsule, StandPending, CAPSULE_HEIGHT, CAPSULE_RADIUS,
+    CREATURE_STEP_UP_HEIGHT, DEFAULT_COLLISION_HEIGHT, FEATHER_TERMINAL_VELOCITY, GRAVITY,
+    HOVER_CLIMB_RATE, HOVER_HEIGHT, SETTLE_TIMEOUT, STEP_UP_HEIGHT, TERMINAL_VELOCITY,
 };
 /// The swim boundary `0.75·h`, also the wade ceiling, for the creature swim marker and the
 /// footstep splash, which have no `Player`.
@@ -149,10 +155,10 @@ pub(crate) const UNIT_FLAG_IN_COMBAT: u32 = 0x0008_0000;
 pub(crate) const UNIT_FLAG_TAXI_FLIGHT: u32 = 0x0010_0000;
 
 /// A stand-state request for [`posture`]'s one setter, the client's `SetStandState` (`0x5ed430`:
-/// send `CMSG_STANDSTATECHANGE` and apply locally through `0x6127b0`). The posture emotes (`/sit`,
-/// `/sleep`, `/kneel`, `/stand`, `/lay`) send it, as `DoEmote`'s `EmoteSpecProc == 1` branch calls
-/// the setter the `X` key does; the server sets no posture for a state text emote
-/// (`ChatHandler.cpp:729-733`). States are `UnitStandStateType`: 0 stand, 1 sit, 3 sleep, 8 kneel.
+/// send `CMSG_STANDSTATECHANGE` and apply locally through `0x6127b0`), made where no call runs it
+/// at once: the attack's stand, the idle sit, the approach's stand. A script call runs the setter
+/// inside the call ([`StandSetter`]). States are `UnitStandStateType`: 0 stand, 1 sit, 3 sleep, 8
+/// kneel.
 #[derive(bevy::ecs::message::Message, Clone, Copy, Debug)]
 pub(crate) struct StandStateRequest {
     pub(crate) state: u8,
@@ -166,6 +172,28 @@ pub(crate) struct ServerStandState {
     pub(crate) state: u8,
 }
 
+/// The active player, whichever body is driven: what the posture verbs read and act on, as the
+/// stand-state setter `0x5ed430` and the sheathe toggle `0x5eb480` each refuse any unit but the
+/// active player (`0x5ed46c`, `0x5eb4ba`). Its entity, its driver and committed sheath state, its
+/// descriptor, its attack target, its hands, its precast, and whether it is the driven body.
+pub(super) type SelfPosture<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        Option<(
+            &'static crate::creature_anim::AnimDriver,
+            &'static crate::creature_anim::CommittedSheath,
+        )>,
+        Option<&'static crate::net::ObjectStore>,
+        Has<crate::creature_anim::Engaged>,
+        Option<&'static crate::creature_anim::Wielded>,
+        Has<crate::creature_anim::Precast>,
+        Has<Embodied>,
+    ),
+    (With<crate::net::SelfPlayer>, Without<FlyCam>),
+>;
+
 /// The body we drive: our own avatar, or a possessed creature. Everything reads its pivot, speeds,
 /// scale and descriptor off the entity, so a creature needs nothing special.
 pub(super) type BodyQuery<'w, 's> = Query<
@@ -176,7 +204,11 @@ pub(super) type BodyQuery<'w, 's> = Query<
         &'static mut Transform,
         Option<&'static mut MovementState>,
         Option<&'static CameraPivot>,
-        Option<&'static crate::creature_anim::AnimDriver>,
+        // The driver and the unit's committed sheath state, which it requires.
+        Option<(
+            &'static crate::creature_anim::AnimDriver,
+            &'static crate::creature_anim::CommittedSheath,
+        )>,
         Option<&'static crate::net::ObjectStore>,
         Has<crate::creature_anim::Engaged>,
         Option<&'static crate::net::UnitSpeeds>,
@@ -208,6 +240,11 @@ pub(super) type TransportQuery<'w, 's> = Query<
     ),
 >;
 
+/// The stream focus's publish and the post-snap hold's release, which write the player's settle
+/// state: a reader of it this frame runs after the set.
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct WorldFocusSet;
+
 /// The controller's ordering handle, for anything that writes the aim or the camera rig before
 /// `control` reads them (`capture::probe_look`, `capture::probe_cam`).
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
@@ -221,27 +258,43 @@ impl Plugin for PlayerPlugin {
         net::register(app);
         follow::plugin(app);
         approach::plugin(app);
+        camera_clip::plugin(app);
         camera_saved::plugin(app);
         camera_view::plugin(app);
         // The stream focus is published after `control`'s teleport snap and before the stream
         // stage, and the post-snap hold released after it. Both edges are needed: without
         // `.after(Input)` the focus can precede the snap, the world streams around the departure,
-        // and the hold releases at once.
+        // and the hold releases at once. Both run among the VM pass's hosts, which read the
+        // player's settle state, so a host after them reads this frame's.
         app.add_systems(
             Update,
-            (world_focus::publish_viewer, world_focus::publish_view_focus)
-                .after(benilla_world::schedule::WorldStage::Input)
-                .before(benilla_world::schedule::WorldStage::Stream),
-        )
-        .add_systems(
-            Update,
-            world_focus::release_post_snap_hold.after(benilla_world::schedule::WorldStage::Stream),
+            (
+                (world_focus::publish_viewer, world_focus::publish_view_focus)
+                    .after(benilla_world::schedule::WorldStage::Input)
+                    .before(benilla_world::schedule::WorldStage::Stream),
+                world_focus::release_post_snap_hold
+                    .after(benilla_world::schedule::WorldStage::Stream),
+            )
+                .in_set(WorldFocusSet)
+                .in_set(crate::vm_pass::VmPass::Member),
         );
+        // The casters' outdoors answers, once this frame's re-place has put the body where it
+        // stands; the cast validator's place rungs read them, so it runs among the VM pass's hosts.
+        app.init_resource::<PlayerOutdoors>()
+            .init_resource::<BarUnitOutdoors>()
+            .add_systems(
+                Update,
+                publish_caster_outdoors
+                    .after(WorldFocusSet)
+                    .in_set(crate::vm_pass::VmPass::Member),
+            );
         app.add_observer(camera::on_cvar);
         app.add_observer(camera_dynamics::on_cvar);
         app.init_resource::<camera::LookConfig>();
         app.init_resource::<camera_zoom::ZoomLimit>();
         app.init_resource::<camera::FollowConfig>();
+        app.init_resource::<OwnControlLost>();
+        app.init_resource::<StandPending>();
         app.init_resource::<camera_dynamics::CameraOptions>();
         // Far sight resolves `PLAYER_FARSIGHT` to a pose before `control` seats the camera: a
         // separate system, as `control` holds our `Transform` mutably and cannot read another's.
@@ -268,10 +321,10 @@ impl Plugin for PlayerPlugin {
         )
         // The world camera renders only in world or under the loading screen, whose covered
         // render compiles the world's pipelines before the first visible frame.
-        // Before the input pass, whose script calls read the cameras: the gate is settled first.
+        // Before the VM pass, whose script calls read the cameras: the gate is settled first.
         .add_systems(
             Update,
-            setup::gate_world_camera.before(crate::script_calls::CallHosts),
+            setup::gate_world_camera.before(crate::vm_pass::VmPass::Start),
         )
         // Off in capture mode, where the harness pins the camera, and in world only, so the glue
         // screens keep the cursor and send no movement.

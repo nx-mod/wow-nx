@@ -4,7 +4,7 @@
 use mlua::Lua;
 
 use crate::script::tick::verb;
-use crate::script::Model;
+use crate::script::{ItemCall, Model};
 
 use super::{
     clear, clear_cursor, set_cursor, Clear, CursorItem, CursorPayload, EQUIPMENT_BAG,
@@ -91,16 +91,18 @@ pub(crate) fn auto_equip_held(model: &mut Model, suppress: bool) -> AutoEquip {
 }
 
 /// `AutoEquipCursorItem()` (`0x48a040` into `0x5e1480`), a click or drop on the doll's model
-/// (`PaperDollFrame.lua:31-35`), queueing the send or the question for the app. Returns whether
-/// to repaint.
+/// (`PaperDollFrame.lua:31-35`), filing the send or the question for the host
+/// ([`ItemCall::AutoEquip`], [`ItemCall::EquipAsk`]). Returns whether to repaint.
 pub(crate) fn auto_equip_cursor_item(model: &mut Model) -> bool {
     match auto_equip_held(model, false) {
         AutoEquip::Sent { bag, slot, .. } => {
-            model.container_autoequips.push((bag, slot));
+            model.item_calls.push(ItemCall::AutoEquip { bag, slot });
             true
         }
         AutoEquip::Asked { bag, slot, guid } => {
-            model.container_equip_asks.push((bag, slot, guid));
+            model
+                .item_calls
+                .push(ItemCall::EquipAsk { bag, slot, guid });
             false
         }
         AutoEquip::Back => true,
@@ -314,6 +316,7 @@ mod tests {
     #[test]
     fn a_bind_on_equip_item_stays_held_and_locked_under_the_question() {
         let mut s = UiScript::new().unwrap();
+        s.keep_calls();
         s.set_container(0, Some(boe_bag(2, false)));
         s.run("PickupContainerItem(0, 1) AutoEquipCursorItem()")
             .unwrap();
@@ -336,6 +339,7 @@ mod tests {
             (3, false, false),
         ] {
             let mut s = UiScript::new().unwrap();
+            s.keep_calls();
             s.set_container(0, Some(boe_bag(bonding, bound)));
             s.run("PickupContainerItem(0, 1) AutoEquipCursorItem()")
                 .unwrap();
@@ -348,6 +352,7 @@ mod tests {
         }
         // A level-60 axe on a level-10 player is never asked about (`0x5ea930`).
         let mut s = UiScript::new().unwrap();
+        s.keep_calls();
         s.set_container(0, Some(boe_bag(2, false)));
         s.set_player_req_state(crate::script::PlayerReqState {
             level: 10,
@@ -375,6 +380,7 @@ mod tests {
     #[test]
     fn a_right_click_on_a_bind_on_equip_item_holds_it_under_the_question() {
         let mut s = UiScript::new().unwrap();
+        s.keep_calls();
         s.set_container(0, Some(boe_bag(2, false)));
         s.run("UseContainerItem(0, 1)").unwrap();
 
@@ -393,6 +399,7 @@ mod tests {
     #[test]
     fn a_right_click_on_an_ordinary_item_sends_and_leaves_the_cursor_empty() {
         let mut s = UiScript::new().unwrap();
+        s.keep_calls();
         s.set_container(0, Some(boe_bag(0, false)));
         s.run("UseContainerItem(0, 1)").unwrap();
 
@@ -410,6 +417,7 @@ mod tests {
     #[test]
     fn the_accept_clears_the_cursor_and_sends_without_asking_again() {
         let mut s = UiScript::new().unwrap();
+        s.keep_calls();
         s.set_container(0, Some(boe_bag(2, false)));
         s.run("UseContainerItem(0, 1)").unwrap();
         assert!(s.cursor_item().is_some());
@@ -432,6 +440,7 @@ mod tests {
     #[test]
     fn an_item_in_the_trade_window_is_refused_before_the_set() {
         let mut s = UiScript::new().unwrap();
+        s.keep_calls();
         s.open_trade_window();
         s.set_container(0, Some(bag(&[(1, 0x11, 4), (2, 0x12, 4)])));
         // Offer the second item, then hold the first.
@@ -457,5 +466,36 @@ mod tests {
             AutoEquip::Sent { .. }
         ));
         assert!(s.take_ui_errors().is_empty());
+    }
+
+    /// `0x5e1840` sets the item on the cursor, the set's inner clear signalling `CURSOR_UPDATE`
+    /// with the cursor emptied (`0x4952cc`) and the set its own with the item held, then sends it
+    /// off, whose clear signals with the cursor empty again (`0x5e1761`). An engine step's handlers
+    /// held for the host read the cursor as each of those steps left it, as they do in place.
+    #[test]
+    fn a_held_handler_reads_the_cursor_its_step_left() {
+        for held in [false, true] {
+            let mut s = UiScript::new().unwrap();
+            s.set_container(0, Some(bag(&[(1, 0x11, 4), (2, 0x12, 4)])));
+            s.run(
+                "SEEN = '' local f = CreateFrame('Frame') f:RegisterEvent('CURSOR_UPDATE') \
+                 f:SetScript('OnEvent', function() SEEN = SEEN .. (CursorHasItem() and 1 or 0) end)",
+            )
+            .unwrap();
+            let sent = if held {
+                let sent = s.host_out(|s| s.auto_equip_guid(0x12, false));
+                s.refuse_waiting();
+                sent
+            } else {
+                s.auto_equip_guid(0x12, false)
+            };
+            assert!(matches!(sent, AutoEquip::Sent { guid: 0x12, .. }));
+            assert_eq!(
+                s.eval::<String>("return SEEN").unwrap(),
+                "010",
+                "held: {held}"
+            );
+            assert!(s.cursor_item().is_none(), "held: {held}");
+        }
     }
 }

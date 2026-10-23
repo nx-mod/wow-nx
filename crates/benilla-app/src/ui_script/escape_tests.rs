@@ -12,9 +12,11 @@ fn one_item_backpack() -> ContainerState {
     slots.insert(
         1,
         ContainerSlot {
+            uncached_link: None,
             use_fork: Default::default(),
             item_class: None,
             duration_ms: None,
+            field_duration: 0,
             petition: None,
             already_bound: false,
             occupied_seats: None,
@@ -40,6 +42,7 @@ fn one_item_backpack() -> ContainerState {
             flags: 0,
             enchants: Vec::new(),
             spell_0: false,
+            spell_charges: [0; 5],
         },
     );
     ContainerState {
@@ -55,6 +58,7 @@ fn one_item_backpack() -> ContainerState {
 fn escape_closes_bag_and_panel_releases_loot_and_keeps_the_held_item() {
     let _data = benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     // `LOOT_UI` whole: a missing `ItemButtonTemplate` is only a load warning, so it fails silently.
     for file in super::test_ui::production_order(&[
@@ -77,7 +81,7 @@ fn escape_closes_bag_and_panel_releases_loot_and_keeps_the_held_item() {
     s.run("MainMenuBarBackpackButton:Click()").unwrap();
     s.set_loot(Some(LootState {
         source_unit: false,
-        fishing: false,
+        has_money: false,
         master_candidates: Vec::new(),
         rows: vec![Some(LootRow {
             item_id: 0,
@@ -121,8 +125,8 @@ fn escape_closes_bag_and_panel_releases_loot_and_keeps_the_held_item() {
         "ESC hid the loot window"
     );
     assert_eq!(
-        s.take_loot_close(),
-        Some(false),
+        s.take_loot_calls(),
+        vec![benilla_ui::script::LootCall::Close { failed: false }],
         "closing the loot fired the release (OnHide → CloseLoot)"
     );
     // Stock `ToggleGameMenu` has no `ClearCursor` arm, so the held item survives ESC.
@@ -184,6 +188,7 @@ fn escape_is_consumed_by_a_focused_editbox_and_leaves_windows_open() {
 fn escape_closes_the_options_window_before_opening_the_menu() {
     benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     load_xml(&s, r"Interface\FrameXML\GlobalStrings.lua");
     load_xml(&s, "Interface\\FrameXML\\Fonts.xml");
@@ -264,9 +269,11 @@ fn escape_closes_an_open_stack_split_frame() {
     slots.insert(
         1,
         ContainerSlot {
+            uncached_link: None,
             use_fork: Default::default(),
             item_class: None,
             duration_ms: None,
+            field_duration: 0,
             petition: None,
             already_bound: false,
             occupied_seats: None,
@@ -292,6 +299,7 @@ fn escape_closes_an_open_stack_split_frame() {
             flags: 0,
             enchants: Vec::new(),
             spell_0: false,
+            spell_charges: [0; 5],
         },
     );
     s.set_container(
@@ -330,6 +338,7 @@ fn escape_ladder_cast_then_windows_then_target_one_eater_per_press() {
 
     let _data = benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     for file in crate::ui_script::test_ui::production_order(&[
         BAG_UI,
@@ -442,6 +451,7 @@ fn escape_ladder_cast_then_windows_then_target_one_eater_per_press() {
 fn escape_ladder_targeting_rung_after_cast_before_windows() {
     let _data = benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     for file in crate::ui_script::test_ui::production_order(&[
         BAG_UI,
@@ -510,6 +520,7 @@ fn escape_ladder_targeting_rung_after_cast_before_windows() {
 fn an_addon_frame_registered_in_uispecialframes_closes_on_escape() {
     benilla_formats::wow_data_or_skip!();
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
     load_xml(&s, r"Interface\FrameXML\GlobalStrings.lua");
     load_xml(&s, "Interface\\FrameXML\\Fonts.xml");

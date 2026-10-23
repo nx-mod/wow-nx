@@ -83,6 +83,7 @@ fn roster() -> crate::glue_session::roster::Roster {
         class: 1, // Warrior
         gender: 0,
         level: 60,
+        new_character: false,
         skin: 0,
         face: 0,
         hair_style: 0,
@@ -125,6 +126,7 @@ fn descriptor_snapshot(seat: &benilla_ui::script::UnitState) -> benilla_ui::scri
 /// A session's VM: the whole interface, `INSTALLED` walked in dependency order, a real backpack.
 fn seat(root: &Path, seat: Seat) -> UiScript {
     let mut s = UiScript::new().expect("VM");
+    s.keep_calls();
     s.set_screen_size(1024.0, 768.0);
 
     let mut registry: Vec<AddOnInfo> = INSTALLED
@@ -1145,9 +1147,9 @@ fn bagnon_forevers_records_survive_the_logout_boundary() {
         "the login scan records the occupied slot's short link"
     );
 
-    // An equipped bag: the inventory slot (20) first, then the container and its `BAG_UPDATE`,
-    // the order `feed_char.before(feed_containers)` holds. The size row reads the bag item's own
-    // count and link, so the other order records the bag without its link.
+    // An equipped bag: the inventory slot (20) and the container pushed, then its `BAG_UPDATE`,
+    // which the lanes' drain fires after every push. The size row reads the bag item's own count
+    // and link, so an event ahead of the inventory push records the bag without its link.
     let mut inv: benilla_ui::script::InventorySlots = Default::default();
     inv[20] = Some(benilla_ui::script::InvSlotView {
         item_id: 4497,
@@ -1179,13 +1181,7 @@ fn bagnon_forevers_records_survive_the_logout_boundary() {
 
     // The logout boundary: the despawn frame (no self store), then the shutdown events.
     let mut memory = crate::ui_items::feed::FeedMemory::default();
-    crate::ui_items::feed::apply_container_source(
-        &mut s,
-        &mut memory,
-        None,
-        Default::default(),
-        Vec::new(),
-    );
+    crate::ui_items::feed::push_containers(&mut s, &mut memory, None);
     s.fire_event("PLAYER_LEAVING_WORLD", Vec::new());
     s.fire_event("PLAYER_LOGOUT", Vec::new());
     let (size, item) = s

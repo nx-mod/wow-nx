@@ -855,7 +855,7 @@ fn set_font_string_adopts_the_label_and_raises_on_anything_else() {
     assert!(s.eval::<bool>("return b:GetFontString() == fs2").unwrap());
     let err = s.run("fs:GetText()").unwrap_err().to_string();
     assert!(
-        err.contains("stale") || err.contains("invalid"),
+        err.contains("Wrong object type for member function"),
         "the replaced label must be destroyed, not left live: {err}"
     );
 
@@ -888,6 +888,15 @@ fn set_font_string_adopts_the_label_and_raises_on_anything_else() {
     let err = s.run("b:SetFontString(tex)").unwrap_err().to_string();
     assert!(
         err.contains("Wrong object type, expected fontstring"),
+        "{err}"
+    );
+    // A Font object holds an object at `[0]` too (`0x780b27`), so it fails the type gate.
+    let err = s
+        .run("b:SetFontString(CreateFont(\"NotAFontString\"))")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("Btn:SetFontString(): Wrong object type, expected fontstring"),
         "{err}"
     );
     assert!(s.eval::<bool>("return b:GetFontString() == fs2").unwrap());

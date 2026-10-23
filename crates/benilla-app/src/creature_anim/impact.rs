@@ -48,7 +48,7 @@ pub(crate) struct SwingImpact {
 #[derive(SystemParam)]
 pub(crate) struct ImpactSinks<'w, 's> {
     out: MessageWriter<'w, SwingImpact>,
-    log: ResMut<'w, ChatLog>,
+    log: Res<'w, ChatLog>,
     guids: Query<'w, 's, &'static Guid>,
     pub(crate) stores: Query<'w, 's, &'static ObjectStore>,
 }
@@ -60,7 +60,7 @@ impl ImpactSinks<'_, '_> {
             .swing
             .victim
             .and_then(|v| Some((self.guids.get(v).ok()?.0, self.stores.get(v).ok()?)));
-        crate::ui_unit::melee_unit_combat(&mut self.log, &impact.swing, victim);
+        crate::ui_unit::melee_unit_combat(&self.log, &impact.swing, victim);
         self.out.write(impact);
     }
 }
@@ -247,6 +247,7 @@ mod tests {
             hit_info: 0x2,
             victim_state,
             damage: if victim_state == 1 { 42 } else { 0 },
+            school: 0,
             displayed: true,
             seq: 1,
         }
@@ -552,7 +553,7 @@ mod tests {
         receive(&mut app, swing(a, Some(v), 1));
         app.world_mut()
             .resource_mut::<ChatLog>()
-            .push_xp_gain(0, 10, 10);
+            .push_xp_gain(0, 10, 10, 1.0);
         tag(&mut app, a, *b"$CAH");
         assert_eq!(kinds(&app), ["xp", "unit combat"]);
         let flashed = app.world().resource::<ChatLog>().pending_unit_combat();

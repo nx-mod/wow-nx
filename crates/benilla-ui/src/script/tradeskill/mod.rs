@@ -98,7 +98,8 @@ pub struct TradeSkillRecipe {
     /// The product's `InventoryType`, which the inv-slot filter folds to slot bits through
     /// `DAT_00809200` (`0x4fcee6`); 0 takes the catch-all bit.
     pub product_inv_type: u32,
-    /// The product's `ItemLevel`, the sort key between tier and name (`record+0x14`, `0x7c9640`).
+    /// The product's `ItemLevel` (`0x7c9640`), the sort key between tier and name, highest first
+    /// (`row+0x14`, `0x4fd4e6`).
     pub product_item_level: u32,
     /// In display order.
     pub reagents: Vec<TradeSkillReagent>,
@@ -112,6 +113,8 @@ pub struct TradeSkillState {
     /// The `SkillLine.dbc` id, the persistence key (`0xbde064`).
     pub line: u32,
     pub line_name: String,
+    /// `GetTradeSkillLine`'s rank and maximum: the slot's halves with the permanent bonus
+    /// (`0x4fdd40`); the recipes are banded on the raw value.
     pub rank: u32,
     pub max_rank: u32,
     /// Unordered: the engine sorts them (`0x4fca20`), and Lua indexes the visible rows, not this.
