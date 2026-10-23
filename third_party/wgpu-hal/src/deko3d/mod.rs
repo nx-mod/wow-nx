@@ -201,6 +201,9 @@ impl Descriptors {
 pub(super) struct Shared {
     pub(super) device: DkDevice,
     queue: DkQueue,
+    /// A deko3d queue is not thread-safe, and wgpu calls acquire, submit and present from whichever thread asks. It
+    /// holds the GPFIFO entries submitted since the GPU was last idle (`Queue::submit`).
+    queue_lock: Mutex<u32>,
     zeros: DkMemBlock,
     code: Mutex<CodeMemory>,
     descriptors: Mutex<Descriptors>,
@@ -210,6 +213,19 @@ pub(super) struct Shared {
 
 unsafe impl Send for Shared {}
 unsafe impl Sync for Shared {}
+
+impl Shared {
+    /// The queue for this thread alone; says so once if another thread had it.
+    fn lock_queue(&self) -> parking_lot::MutexGuard<'_, u32> {
+        static TOLD: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+        self.queue_lock.try_lock().unwrap_or_else(|| {
+            if !TOLD.swap(true, core::sync::atomic::Ordering::Relaxed) {
+                log::warn!("deko3d: two threads used the queue at once");
+            }
+            self.queue_lock.lock()
+        })
+    }
+}
 
 /// Everything that owns a memory block (the swapchain, encoders, buffers, textures) holds the shared state, so the
 /// device goes last: deko3d refuses to destroy a device with blocks alive, and hbl cannot hand the console back to
@@ -305,6 +321,11 @@ unsafe impl Sync for TextureView {}
 
 #[derive(Debug)]
 pub struct Resource;
+
+/// GPFIFO entries the GPU's ring holds (libnx's GPFIFO_QUEUE_SIZE) less a margin, and what deko3d adds to a flush
+/// besides the lists (its cache invalidation and a processing barrier, gpu_base.cpp).
+const RING_BUDGET: u32 = 1536;
+const FLUSH_ENTRIES: u32 = 4;
 
 /// Fence values, each signalled by a deko3d fence after a submission.
 #[derive(Debug, Default)]
@@ -510,6 +531,7 @@ const SURFACE_FORMATS: [wgt::TextureFormat; 2] =
 impl Surface {
     unsafe fn release(&self) {
         if let Some(c) = self.swapchain.lock().take() {
+            let _queue = c._shared.lock_queue();
             unsafe {
                 dkQueueWaitIdle(c.queue);
                 dkSwapchainDestroy(c.dk);
@@ -587,7 +609,11 @@ impl crate::Surface for Surface {
     ) -> Result<Option<crate::AcquiredSurfaceTexture<Api>>, crate::SurfaceError> {
         let guard = self.swapchain.lock();
         let c = guard.as_ref().ok_or(crate::SurfaceError::Outdated)?;
-        let slot = unsafe { dkQueueAcquireImage(c.queue, c.dk) };
+        let slot = {
+            let mut in_flight = c._shared.lock_queue();
+            *in_flight += FLUSH_ENTRIES;
+            unsafe { dkQueueAcquireImage(c.queue, c.dk) }
+        };
         if slot < 0 {
             return Err(crate::SurfaceError::Lost);
         }
@@ -650,6 +676,7 @@ impl crate::Adapter for Adapter {
         let shared = Arc::new(Shared {
             device,
             queue,
+            queue_lock: Mutex::new(0),
             zeros,
             code: Mutex::new(CodeMemory { mem_block: code, used: 0 }),
             descriptors: Mutex::new(Descriptors {
@@ -724,27 +751,24 @@ impl crate::Queue for Queue {
         (fence, fence_value): (&mut Fence, crate::FenceValue),
     ) -> DeviceResult<()> {
         let queue = self.shared.queue;
-        // Each list flushed as it goes, so the channel's 2048 GPFIFO entries never fill (command.rs); and every
-        // LISTS_PER_WAIT kickoffs the GPU is let catch up, or the kernel's ring of submissions fills and a kickoff
-        // fails (a first frame's uploads are hundreds of lists).
-        const LISTS_PER_WAIT: usize = 8;
-        let mut kicked = 0;
+        let mut in_flight = self.shared.lock_queue();
+        // Each list flushed as it goes, so libnx's 2048 GPFIFO entries between kickoffs never fill (command.rs). The
+        // GPU's own ring is those 2048 entries too, and a kickoff that does not fit times out (LibnxNvidiaError_Timeout,
+        // "gpu channel kickoff failed"): before a list could overrun it, the GPU is let finish what it has.
         for cb in command_buffers {
-            for &list in &cb.lists {
+            for &(list, entries) in &cb.lists {
+                if *in_flight + entries + FLUSH_ENTRIES > RING_BUDGET {
+                    unsafe { dkQueueWaitIdle(queue) };
+                    *in_flight = 0;
+                }
+                *in_flight += entries + FLUSH_ENTRIES;
                 unsafe {
                     dkQueueSubmitCommands(queue, list);
                     dkQueueFlush(queue);
                 }
-                kicked += 1;
-                if kicked % LISTS_PER_WAIT == 0 {
-                    unsafe { dkQueueWaitIdle(queue) };
-                }
             }
         }
-        #[cfg(deko3d_depurar)]
-        if kicked > LISTS_PER_WAIT {
-            log::warn!("deko3d: a submission of {} command buffers, {kicked} lists", command_buffers.len());
-        }
+        *in_flight += FLUSH_ENTRIES;
         let mut dk = Box::new(unsafe { core::mem::zeroed::<DkFence>() });
         unsafe {
             dkQueueSignalFence(queue, &mut *dk, true);
@@ -755,6 +779,7 @@ impl crate::Queue for Queue {
             static SUBMISSIONS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
             let n = SUBMISSIONS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             unsafe { dkQueueWaitIdle(queue) };
+            *in_flight = 0;
             if unsafe { dkQueueIsInErrorState(queue) } {
                 log::error!("deko3d: the GPU faulted in submission {n} ({} command buffers)", command_buffers.len());
             }
@@ -766,6 +791,8 @@ impl crate::Queue for Queue {
         let guard = surface.swapchain.lock();
         let c = guard.as_ref().ok_or(crate::SurfaceError::Outdated)?;
         let slot = texture.slot.ok_or(crate::SurfaceError::Other("not a surface texture"))?;
+        let mut in_flight = c._shared.lock_queue();
+        *in_flight += FLUSH_ENTRIES;
         unsafe { dkQueuePresentImage(c.queue, c.dk, slot) };
         Ok(())
     }

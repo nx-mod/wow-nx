@@ -67,9 +67,10 @@ pub struct CommandEncoder {
     memory: Box<CommandMemory>,
     addrs: DeviceAddrs,
     empty: bool,
-    /// Lists finished so far in this encoding, and commands in the current one.
-    lists: Vec<DkCmdList>,
+    /// Lists finished so far in this encoding (with their GPFIFO entries), and commands and entries in the current one.
+    lists: Vec<(DkCmdList, u32)>,
     commands: u32,
+    entries: u32,
     /// A barrier asked for and not yet written: consecutive transitions make one, before the next command.
     barrier_pending: bool,
     state: DrawState,
@@ -80,9 +81,13 @@ unsafe impl Sync for CommandEncoder {}
 
 #[derive(Debug)]
 pub struct CommandBuffer {
-    /// Short lists, each submitted and flushed on its own (`LIST_COMMANDS`).
-    pub(super) lists: Vec<DkCmdList>,
+    /// Short lists, each submitted and flushed on its own (`LIST_COMMANDS`), with the GPFIFO entries each takes at
+    /// most (`Queue::submit` keeps the GPU's ring from filling).
+    pub(super) lists: Vec<(DkCmdList, u32)>,
 }
+
+/// GPFIFO entries any list takes besides the ones counted (its start, its end, a change of command memory).
+const LIST_ENTRIES: u32 = 4;
 
 /// Commands per deko3d list. libnx's GPU channel holds 2048 GPFIFO entries between flushes, and a long list (a
 /// frame's texture uploads) overflows it ("gpfifo entry append failed"): lists are kept short and each one is flushed
@@ -113,6 +118,7 @@ impl CommandEncoder {
             empty: true,
             lists: Vec::new(),
             commands: 0,
+            entries: 0,
             barrier_pending: false,
             state: DrawState::default(),
         })
@@ -122,11 +128,7 @@ impl CommandEncoder {
     fn cmd(&mut self) -> DkCmdBuf {
         let c = self.cmdbuf;
         if self.commands >= LIST_COMMANDS {
-            let list = unsafe { dkCmdBufFinishList(c) };
-            if list != 0 {
-                self.lists.push(list);
-            }
-            self.commands = 0;
+            self.finish_list();
         }
         self.commands += 1;
         if self.empty {
@@ -141,9 +143,20 @@ impl CommandEncoder {
         }
         if self.barrier_pending {
             self.barrier_pending = false;
+            // A full barrier starts a GPFIFO entry of its own (deko3d's gpu_base.cpp).
+            self.entries += 1;
             unsafe { dkCmdBufBarrier(c, DkBarrier::DkBarrier_Full, DkInvalidateFlags_Image | DkInvalidateFlags_Shader) };
         }
         c
+    }
+
+    fn finish_list(&mut self) {
+        let list = unsafe { dkCmdBufFinishList(self.cmdbuf) };
+        if list != 0 {
+            self.lists.push((list, self.entries + LIST_ENTRIES));
+        }
+        self.commands = 0;
+        self.entries = 0;
     }
 
     fn stages(&self) -> &'static [DkStage] {
@@ -199,6 +212,28 @@ impl CommandEncoder {
     // TODO(wow-nx): pick the barrier from the usages (fragments only, no invalidation) once draws exist.
     fn barrier(&mut self) {
         self.barrier_pending = true;
+    }
+}
+
+/// Whether a transition has to wait for earlier GPU work: when that work wrote, or when this one writes over what it
+/// read. A first use (a texture uninitialized, a buffer the CPU wrote, which a flush makes visible) waits for nothing.
+/// Each barrier is a GPFIFO entry, and a frame's uploads were one per copy: hundreds of entries (Queue::submit).
+fn buffer_needs_barrier(t: &crate::StateTransition<wgt::BufferUses>) -> bool {
+    use wgt::BufferUses as U;
+    let gpu_from = t.from - (U::MAP_READ | U::MAP_WRITE);
+    !gpu_from.is_empty() && (gpu_from.intersects(U::EXCLUSIVE) || t.to.intersects(U::EXCLUSIVE))
+}
+
+fn texture_needs_barrier(t: &crate::StateTransition<wgt::TextureUses>) -> bool {
+    use wgt::TextureUses as U;
+    let from = t.from - U::UNINITIALIZED;
+    !from.is_empty() && (from.intersects(U::EXCLUSIVE) || t.to.intersects(U::EXCLUSIVE))
+}
+
+impl CommandEncoder {
+    fn indirect(&mut self) {
+        // An indirect draw or dispatch splits its entry and adds its parameters as another (gpu_3d_base.cpp).
+        self.entries += 2;
     }
 }
 
@@ -295,6 +330,7 @@ impl crate::CommandEncoder for CommandEncoder {
         self.empty = true;
         self.lists.clear();
         self.commands = 0;
+        self.entries = 0;
         self.barrier_pending = false;
         self.state = DrawState::default();
         Ok(())
@@ -304,6 +340,7 @@ impl crate::CommandEncoder for CommandEncoder {
         unsafe { dkCmdBufFinishList(self.cmdbuf) };
         self.lists.clear();
         self.commands = 0;
+        self.entries = 0;
         self.barrier_pending = false;
     }
     unsafe fn end_encoding(&mut self) -> DeviceResult<CommandBuffer> {
@@ -312,12 +349,10 @@ impl crate::CommandEncoder for CommandEncoder {
             self.cmd();
         }
         if !self.empty {
-            let list = unsafe { dkCmdBufFinishList(self.cmdbuf) };
-            if list != 0 {
-                self.lists.push(list);
-            }
+            self.finish_list();
         }
         self.commands = 0;
+        self.entries = 0;
         Ok(CommandBuffer { lists: core::mem::take(&mut self.lists) })
     }
     unsafe fn reset_all<I>(&mut self, command_buffers: I) {
@@ -337,7 +372,7 @@ impl crate::CommandEncoder for CommandEncoder {
     where
         T: Iterator<Item = crate::BufferBarrier<'a, Buffer>>,
     {
-        if barriers.into_iter().next().is_some() {
+        if barriers.into_iter().any(|b| buffer_needs_barrier(&b.usage)) {
             self.barrier();
         }
     }
@@ -346,7 +381,7 @@ impl crate::CommandEncoder for CommandEncoder {
     where
         T: Iterator<Item = crate::TextureBarrier<'a, Texture>>,
     {
-        if barriers.into_iter().next().is_some() {
+        if barriers.into_iter().any(|b| texture_needs_barrier(&b.usage)) {
             self.barrier();
         }
     }
@@ -705,8 +740,9 @@ impl crate::CommandEncoder for CommandEncoder {
         let Some(prim) = self.state.primitive else { return };
         self.bind_textures();
         self.write_first_instance(0);
-        let c = self.cmd();
         for i in 0..draw_count as u64 {
+            let c = self.cmd();
+            self.indirect();
             unsafe { dkCmdBufDrawIndirect(c, prim, buffer.gpu + offset + i * 16) };
         }
     }
@@ -718,6 +754,8 @@ impl crate::CommandEncoder for CommandEncoder {
         let restart_index = if self.state.index_format == Some(DkIdxFormat::DkIdxFormat_Uint16) { 0xffff } else { 0xffff_ffff };
         unsafe { dkCmdBufSetPrimitiveRestart(c, self.state.strip, restart_index) };
         for i in 0..draw_count as u64 {
+            let c = self.cmd();
+            self.indirect();
             unsafe { dkCmdBufDrawIndexedIndirect(c, prim, buffer.gpu + offset + i * 20) };
         }
     }
@@ -782,6 +820,7 @@ impl crate::CommandEncoder for CommandEncoder {
     unsafe fn dispatch_indirect(&mut self, buffer: &Buffer, offset: wgt::BufferAddress) {
         self.bind_textures();
         let c = self.cmd();
+        self.indirect();
         unsafe { dkCmdBufDispatchComputeIndirect(c, buffer.gpu + offset) };
     }
 
