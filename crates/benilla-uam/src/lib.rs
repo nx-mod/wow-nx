@@ -2,7 +2,7 @@
 //!
 //! uam keeps global state and recurses deeply, so every compile runs on one thread of its own with an 8 MB stack;
 //! [`compile`] hands it the work and waits. [`compile_cached`] keeps the results on the SD card
-//! (`sdmc:/wow-nx/shaders/<hash>.dksh`), so a shader compiles once per console, and leaves the GLSL of a shader that
+//! (`sdmc:/wow-nx/shaders/<hash>.dksh`, with its GLSL as `<hash>.glsl`), so a shader compiles once per console, and leaves the GLSL of a shader that
 //! fails beside them (`<hash>.error.glsl`, with uam's log at the end).
 
 #[cfg(any(target_os = "horizon", all(target_os = "linux", feature = "host")))]

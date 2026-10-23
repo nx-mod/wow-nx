@@ -96,6 +96,8 @@ pub fn compile_cached(stage: Stage, glsl: &str) -> Result<Vec<u8>, String> {
     match &r {
         Ok(dksh) => {
             let _ = std::fs::write(format!("{path}.dksh"), dksh);
+            // Its source too, once: the whole set can be rechecked on the host (switch/shadercheck takes .glsl).
+            let _ = std::fs::write(format!("{path}.glsl"), glsl);
         }
         Err(log) => {
             let _ = std::fs::write(format!("{path}.error.glsl"), format!("{glsl}\n/* uam:\n{log}\n*/\n"));
