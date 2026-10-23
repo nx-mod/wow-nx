@@ -4,7 +4,8 @@
 //! - left, a triangle from a vertex buffer: red at the top, green bottom left, blue bottom right;
 //! - right, a quad with a 4x4 black and white checker texture, tinted by a uniform buffer, and placed by
 //!   `instance_index` (drawn as instance 1 of 1..2, so a lost first instance puts it on the left instead).
-//! Frame 30 is read back and written to sdmc:/wow-nx/clear.bmp. Each step and deko3d's messages go to
+//! Frames 0-59 only clear, 60-119 add the triangle, 120 on the quad (a GPU fault then names its draw). Frame 150 is
+//! read back and written to sdmc:/wow-nx/clear.bmp. Each step and deko3d's messages go to
 //! sdmc:/wow-nx/clear.txt, flushed line by line, so a crash leaves the last step reached.
 
 extern crate benilla_horizon;
@@ -264,14 +265,20 @@ fn main() {
                 })],
                 ..Default::default()
             });
-            pase.set_pipeline(&triangulo);
-            pase.set_vertex_buffer(0, vb.slice(..));
-            pase.draw(0..3, 0..1);
-            pase.set_pipeline(&cuadro);
-            pase.set_bind_group(0, &grupo, &[]);
-            pase.draw(0..6, 1..2);
+            // In stages, so a GPU fault names its draw: frames 0-59 only clear, 60-119 add the triangle,
+            // 120 on the quad too.
+            if cuadro_n >= 60 {
+                pase.set_pipeline(&triangulo);
+                pase.set_vertex_buffer(0, vb.slice(..));
+                pase.draw(0..3, 0..1);
+            }
+            if cuadro_n >= 120 {
+                pase.set_pipeline(&cuadro);
+                pase.set_bind_group(0, &grupo, &[]);
+                pase.draw(0..6, 1..2);
+            }
         }
-        if cuadro_n == 30 {
+        if cuadro_n == 150 {
             enc.copy_texture_to_buffer(
                 frame.texture.as_image_copy(),
                 wgpu::TexelCopyBufferInfo {
@@ -283,18 +290,18 @@ fn main() {
         }
         queue.submit([enc.finish()]);
         frame.present();
-        if cuadro_n == 30 {
+        if cuadro_n == 150 {
             lectura.slice(..).map_async(wgpu::MapMode::Read, |_| {});
             let _ = device.poll(wgpu::PollType::wait_indefinitely());
             let datos = lectura.slice(..).get_mapped_range();
             match guardar_bmp("sdmc:/wow-nx/clear.bmp", ancho, alto, fila, &datos) {
-                Ok(()) => anotar("frame 30 saved to clear.bmp"),
+                Ok(()) => anotar("frame 150 saved to clear.bmp"),
                 Err(e) => anotar(&format!("clear.bmp: {e}")),
             }
             drop(datos);
             lectura.unmap();
         }
-        if cuadro_n % 60 == 0 {
+        if cuadro_n < 3 || cuadro_n % 60 == 0 || (60..63).contains(&cuadro_n) || (120..123).contains(&cuadro_n) {
             anotar(&format!("frame {cuadro_n}"));
         }
     }

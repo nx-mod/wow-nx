@@ -29,5 +29,6 @@ PY
 fi
 export __CARGO_TESTS_ONLY_SRC_ROOT="$SRC"
 # getrandom 0.3/0.4 do not know aarch64 Horizon: their custom backend, defined in crates/benilla-horizon.
-export CARGO_TARGET_AARCH64_NINTENDO_SWITCH_NEWLIB_RUSTFLAGS='--cfg getrandom_backend="custom"'
+# Frame pointers: Atmosphere's crash reports walk them, and without them a report stops after a few frames.
+export CARGO_TARGET_AARCH64_NINTENDO_SWITCH_NEWLIB_RUSTFLAGS='--cfg getrandom_backend="custom" -C force-frame-pointers=yes'
 BUILD_STD="-Zbuild-std=std,panic_abort -Zjson-target-spec --target $OBJETIVO"

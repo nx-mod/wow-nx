@@ -171,18 +171,10 @@ unsafe impl Send for Compartido {}
 unsafe impl Sync for Compartido {}
 
 impl Drop for Compartido {
+    /// Waits for the GPU and leaves the rest to the process's exit: the device goes last in wgpu, after the surface
+    /// and encoders that still hold memory blocks, and deko3d refuses to destroy a device with blocks alive.
     fn drop(&mut self) {
-        unsafe {
-            dkQueueWaitIdle(self.cola);
-            dkQueueDestroy(self.cola);
-            dkMemBlockDestroy(self.ceros);
-            dkMemBlockDestroy(self.codigo.get_mut().bloque);
-            let d = self.descriptores.get_mut();
-            dkMemBlockDestroy(d.imagenes);
-            dkMemBlockDestroy(d.muestreadores);
-            dkMemBlockDestroy(self.ubo);
-            dkDeviceDestroy(self.device);
-        }
+        unsafe { dkQueueWaitIdle(self.cola) };
     }
 }
 
@@ -659,6 +651,15 @@ impl crate::Queue for Queue {
         unsafe {
             dkQueueSignalFence(cola, &mut *dk, true);
             dkQueueFlush(cola);
+        }
+        #[cfg(deko3d_depurar)]
+        {
+            static ENVIOS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+            let n = ENVIOS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            unsafe { dkQueueWaitIdle(cola) };
+            if unsafe { dkQueueIsInErrorState(cola) } {
+                log::error!("deko3d: the GPU faulted in submission {n} ({} command buffers)", command_buffers.len());
+            }
         }
         fence.estado.lock().vuelo.push((fence_value, dk));
         Ok(())

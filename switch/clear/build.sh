@@ -4,6 +4,8 @@ set -e
 RAIZ=$(cd "$(dirname "$0")/../.." && pwd)
 . "$RAIZ/switch/entorno.sh"
 cd "$RAIZ/switch/clear"
+# deko3d's debug build and a check after every submission (third_party/wgpu-hal/build.rs).
+export WOWNX_DEKO3D_DEBUG=1
 cargo build --release $BUILD_STD "$@"
 T=/opt/devkitpro/tools/bin
 # An NRO without an asset section (no --nacp) is refused at load by Sphaira/hbl (2026-10-20).

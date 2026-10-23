@@ -23,6 +23,29 @@ unsafe extern "C" {
 
 const REGISTRO: &str = "sdmc:/wow-nx/cubo.txt";
 
+/// The log, created once and held: appending to a file fails on the Switch's SD card.
+static ARCHIVO: Mutex<Option<std::fs::File>> = Mutex::new(None);
+
+/// Writes to [`ARCHIVO`], for Bevy's log layer.
+struct Escritor;
+
+impl std::io::Write for Escritor {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        if let Some(f) = ARCHIVO.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            f.write_all(b)?;
+            let _ = f.sync_all();
+        }
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn anotar(texto: &str) {
+    let _ = std::io::Write::write_all(&mut Escritor, format!("{texto}\n").as_bytes());
+}
+
 /// libnx's default window, as raw-window-handle sees it (an Android NDK window: the deko3d backend takes its pointer).
 struct VentanaNx;
 
@@ -72,8 +95,7 @@ fn bucle(mut app: App) -> AppExit {
 }
 
 fn registro(_: &mut App) -> Option<BoxedLayer> {
-    let f = std::fs::OpenOptions::new().append(true).create(true).open(REGISTRO).ok()?;
-    Some(Box::new(bevy::log::tracing_subscriber::fmt::layer().with_ansi(false).with_writer(Mutex::new(f))))
+    Some(Box::new(bevy::log::tracing_subscriber::fmt::layer().with_ansi(false).with_writer(|| Escritor)))
 }
 
 fn escena(mut commands: Commands, mut mallas: ResMut<Assets<Mesh>>, mut materiales: ResMut<Assets<StandardMaterial>>) {
@@ -128,13 +150,11 @@ fn contar(mut n: Local<u32>, time: Res<Time>, mut salir: MessageWriter<AppExit>)
 
 fn main() {
     let _ = std::fs::create_dir_all("sdmc:/wow-nx");
-    let _ = std::fs::write(REGISTRO, "");
-    std::panic::set_hook(Box::new(|p| {
-        let _ = std::fs::OpenOptions::new()
-            .append(true)
-            .open(REGISTRO)
-            .and_then(|mut f| std::io::Write::write_all(&mut f, format!("PANIC: {p}\n").as_bytes()));
-    }));
+    *ARCHIVO.lock().unwrap() = std::fs::File::create(REGISTRO).ok();
+    std::panic::set_hook(Box::new(|p| anotar(&format!("PANIC: {p}"))));
+    anotar("start");
+    // No executable path on the Switch: bevy_asset's root.
+    std::env::set_var("BEVY_ASSET_ROOT", "sdmc:/wow-nx");
 
     App::new()
         .add_plugins(

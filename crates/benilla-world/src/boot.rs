@@ -85,7 +85,8 @@ pub fn tuned_default_plugins(primary_window: Window) -> PluginGroupBuilder {
         .set(bevy::log::LogPlugin {
             filter: "wgpu=error,naga=warn".into(),
             custom_layer: |_| {
-                let f = std::fs::OpenOptions::new().append(true).create(true).open("sdmc:/wow-nx/benilla.txt").ok()?;
+                // Created, not appended: appending fails on the Switch's SD card.
+                let f = std::fs::File::create("sdmc:/wow-nx/benilla.txt").ok()?;
                 Some(Box::new(
                     bevy::log::tracing_subscriber::fmt::layer().with_ansi(false).with_writer(std::sync::Mutex::new(f)),
                 ))

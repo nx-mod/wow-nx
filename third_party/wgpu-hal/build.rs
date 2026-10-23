@@ -10,7 +10,16 @@ fn main() {
             .define("__SWITCH__", None)
             .compile("deko3d_inline");
         println!("cargo:rustc-link-search=native={devkitpro}/libnx/lib");
-        println!("cargo:rustc-link-lib=static=deko3d");
+        // WOWNX_DEKO3D_DEBUG=1: deko3d's debug build, which checks every call and reports through the debug
+        // callback, and a wait after every submission that names the one that faulted the GPU (src/deko3d).
+        println!("cargo:rerun-if-env-changed=WOWNX_DEKO3D_DEBUG");
+        println!("cargo:rustc-check-cfg=cfg(deko3d_depurar)");
+        if std::env::var_os("WOWNX_DEKO3D_DEBUG").is_some() {
+            println!("cargo:rustc-link-lib=static=deko3dd");
+            println!("cargo:rustc-cfg=deko3d_depurar");
+        } else {
+            println!("cargo:rustc-link-lib=static=deko3d");
+        }
         println!("cargo:rerun-if-changed=src/deko3d/ffi_inline.c");
     }
     cfg_aliases::cfg_aliases! {

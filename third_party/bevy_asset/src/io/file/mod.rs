@@ -21,6 +21,9 @@ pub(crate) fn get_base_path() -> PathBuf {
         PathBuf::from(manifest_dir)
     } else if let Ok(manifest_dir) = env::var("CARGO_MANIFEST_DIR") {
         PathBuf::from(manifest_dir)
+    } else if cfg!(target_os = "horizon") {
+        // wow-nx: the Switch has no executable path (`current_exe` is unsupported); assets sit beside the NRO.
+        PathBuf::from("sdmc:/wow-nx")
     } else {
         env::current_exe()
             .map(|path| path.parent().map(ToOwned::to_owned).unwrap())

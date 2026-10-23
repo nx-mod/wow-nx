@@ -209,8 +209,12 @@ impl super::Device {
     }
 
     pub(super) fn nuevo_muestreador(&self, desc: &crate::SamplerDescriptor) -> Result<Sampler, crate::DeviceError> {
-        let mut s = unsafe { core::mem::zeroed::<DkSampler>() };
-        unsafe { dkSamplerDefaults(&mut s) };
+        // Not zeroed: DkFilter and DkCompareOp have no 0. deko3d's defaults fill every field.
+        let mut s = unsafe {
+            let mut m = core::mem::MaybeUninit::<DkSampler>::uninit();
+            dkSamplerDefaults(m.as_mut_ptr());
+            m.assume_init()
+        };
         let filtro = |f: wgt::FilterMode| match f {
             wgt::FilterMode::Nearest => DkFilter::DkFilter_Nearest,
             wgt::FilterMode::Linear => DkFilter::DkFilter_Linear,
@@ -468,7 +472,8 @@ impl super::Device {
             tira: p.strip_index_format.is_some() || matches!(p.topology, T::LineStrip | T::TriangleStrip),
             rasterizador,
             multimuestra,
-            mascara_muestras: desc.multisample.mask as u32,
+            // WebGPU's mask is 64 bits of ones by default; Maxwell's method takes 16 (a GPU method error otherwise).
+            mascara_muestras: (desc.multisample.mask & 0xffff) as u32,
             color,
             escritura,
             mezclas,
