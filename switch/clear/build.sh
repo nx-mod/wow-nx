@@ -1,9 +1,9 @@
 #!/bin/sh
 # Builds wow-nx-clear.nro, the wgpu-on-deko3d screen clear (docs/SWITCH-RENDER.md).
 set -e
-RAIZ=$(cd "$(dirname "$0")/../.." && pwd)
-. "$RAIZ/switch/entorno.sh"
-cd "$RAIZ/switch/clear"
+ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+. "$ROOT/switch/env.sh"
+cd "$ROOT/switch/clear"
 # deko3d's debug build and a check after every submission (third_party/wgpu-hal/build.rs).
 export WOWNX_DEKO3D_DEBUG=1
 cargo build --release $BUILD_STD "$@"

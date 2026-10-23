@@ -7,13 +7,13 @@ path `std` already has for the 3DS), linked by devkitA64's gcc with libnx's `swi
 `std` the two C functions newlib lacks (`getrandom`, `sysconf`) from libnx. libnx and newlib both define `fcntl`; the link keeps
 the first (libnx's), and the program links libnx itself so it comes first.
 
-`./build.sh` makes `target/wow-nx-hello.nro` (`../entorno.sh` sets the toolchain up; `../build-crates.sh` builds
+`./build.sh` makes `target/wow-nx-hello.nro` (`../env.sh` sets the toolchain up; `../build-crates.sh` builds
 benilla's crates that do not draw, the same way).
 
 **libc:** the `libc` crate's Horizon support was written for the 32-bit 3DS. On the Switch its `struct stat` read the
 file size at the wrong offset, and its pthread condition attribute was half the size devkitA64 writes into it.
-`third_party/libc` fixes the types for aarch64 Horizon; `src/tipos.rs` checks every size, alignment and offset at compile
-time against devkitA64's gcc. std gets the same libc through a patched copy of its source (`../entorno.sh`), since
+`third_party/libc` fixes the types for aarch64 Horizon; `src/layouts.rs` checks every size, alignment and offset at compile
+time against devkitA64's gcc. std gets the same libc through a patched copy of its source (`../env.sh`), since
 `-Zbuild-std` ignores the workspace's `[patch]`. On the console it prints its checks and writes them to
 `sdmc:/wow-nx/hello.txt`: allocation, a thread, a HashMap (std's random seed), a file written and read back.
 

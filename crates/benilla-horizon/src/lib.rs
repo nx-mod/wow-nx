@@ -36,11 +36,11 @@ mod horizon {
         }
     }
 
-    fn aleatorio(buf: &mut [u8]) -> Result<(), getrandom::Error> {
+    fn random_fill(buf: &mut [u8]) -> Result<(), getrandom::Error> {
         unsafe { randomGet(buf.as_mut_ptr().cast(), buf.len()) };
         Ok(())
     }
-    getrandom::register_custom_getrandom!(aleatorio);
+    getrandom::register_custom_getrandom!(random_fill);
 
     /// getrandom 0.3 and 0.4's custom backend (both name this symbol).
     #[no_mangle]

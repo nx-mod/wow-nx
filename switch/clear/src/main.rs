@@ -18,89 +18,89 @@ unsafe extern "C" {
     fn nwindowGetDefault() -> *mut core::ffi::c_void;
 }
 
-static REGISTRO: Mutex<Option<std::fs::File>> = Mutex::new(None);
+static LOG_PATH: Mutex<Option<std::fs::File>> = Mutex::new(None);
 
-fn anotar(texto: &str) {
-    if let Some(f) = REGISTRO.lock().unwrap().as_mut() {
-        let _ = writeln!(f, "{texto}");
+fn log_line(text: &str) {
+    if let Some(f) = LOG_PATH.lock().unwrap().as_mut() {
+        let _ = writeln!(f, "{text}");
         let _ = f.sync_all();
     }
 }
 
-struct Registro;
-impl log::Log for Registro {
+struct FileLogger;
+impl log::Log for FileLogger {
     fn enabled(&self, m: &log::Metadata) -> bool {
         m.level() <= log::Level::Warn
     }
     fn log(&self, r: &log::Record) {
         if self.enabled(r.metadata()) {
-            anotar(&format!("{} {}: {}", r.level(), r.target(), r.args()));
+            log_line(&format!("{} {}: {}", r.level(), r.target(), r.args()));
         }
     }
     fn flush(&self) {}
 }
 
 const SHADER: &str = r#"
-struct Salida { @builtin(position) pos: vec4f, @location(0) color: vec3f, @location(1) uv: vec2f };
+struct VsOut { @builtin(position) pos: vec4f, @location(0) color: vec3f, @location(1) uv: vec2f };
 
-@vertex fn vs_triangulo(@location(0) pos: vec2f, @location(1) color: vec3f) -> Salida {
-    return Salida(vec4f(pos, 0.0, 1.0), color, vec2f(0.0));
+@vertex fn vs_triangle(@location(0) pos: vec2f, @location(1) color: vec3f) -> VsOut {
+    return VsOut(vec4f(pos, 0.0, 1.0), color, vec2f(0.0));
 }
-@fragment fn fs_triangulo(e: Salida) -> @location(0) vec4f {
+@fragment fn fs_triangle(e: VsOut) -> @location(0) vec4f {
     return vec4f(e.color, 1.0);
 }
 
-@group(0) @binding(0) var<uniform> tinte: vec4f;
-@group(0) @binding(1) var textura: texture_2d<f32>;
-@group(0) @binding(2) var muestreador: sampler;
+@group(0) @binding(0) var<uniform> tint: vec4f;
+@group(0) @binding(1) var tex: texture_2d<f32>;
+@group(0) @binding(2) var sampler: sampler;
 
-@vertex fn vs_cuadro(@builtin(vertex_index) v: u32, @builtin(instance_index) i: u32) -> Salida {
-    var esquinas = array(vec2f(0.0, 0.0), vec2f(1.0, 0.0), vec2f(0.0, 1.0), vec2f(1.0, 0.0), vec2f(1.0, 1.0), vec2f(0.0, 1.0));
-    let c = esquinas[v];
+@vertex fn vs_quad(@builtin(vertex_index) v: u32, @builtin(instance_index) i: u32) -> VsOut {
+    var corners = array(vec2f(0.0, 0.0), vec2f(1.0, 0.0), vec2f(0.0, 1.0), vec2f(1.0, 0.0), vec2f(1.0, 1.0), vec2f(0.0, 1.0));
+    let c = corners[v];
     // Instance 1 lands on the right half; instance 0 would land on the left.
     let x = -0.8 + f32(i) * 1.0 + c.x * 0.6;
     let y = -0.4 + c.y * 0.8;
-    return Salida(vec4f(x, y, 0.0, 1.0), vec3f(0.0), vec2f(c.x, 1.0 - c.y));
+    return VsOut(vec4f(x, y, 0.0, 1.0), vec3f(0.0), vec2f(c.x, 1.0 - c.y));
 }
-@fragment fn fs_cuadro(e: Salida) -> @location(0) vec4f {
-    return textureSample(textura, muestreador, e.uv) * tinte;
+@fragment fn fs_quad(e: VsOut) -> @location(0) vec4f {
+    return textureSample(tex, sampler, e.uv) * tint;
 }
 "#;
 
-fn guardar_bmp(ruta: &str, ancho: u32, alto: u32, fila: u32, rgba: &[u8]) -> std::io::Result<()> {
-    let tam = 54 + ancho * alto * 3;
-    let mut b = Vec::with_capacity(tam as usize);
+fn save_bmp(path: &str, width: u32, height: u32, row: u32, rgba: &[u8]) -> std::io::Result<()> {
+    let size_of_set = 54 + width * height * 3;
+    let mut b = Vec::with_capacity(size_of_set as usize);
     b.extend_from_slice(b"BM");
-    for v in [tam, 0, 54, 40, ancho, alto] {
+    for v in [size_of_set, 0, 54, 40, width, height] {
         b.extend_from_slice(&v.to_le_bytes());
     }
     b.extend_from_slice(&1u16.to_le_bytes());
     b.extend_from_slice(&24u16.to_le_bytes());
-    for v in [0u32, ancho * alto * 3, 2835, 2835, 0, 0] {
+    for v in [0u32, width * height * 3, 2835, 2835, 0, 0] {
         b.extend_from_slice(&v.to_le_bytes());
     }
-    for y in (0..alto).rev() {
-        let f = &rgba[(y * fila) as usize..];
-        for x in 0..ancho as usize {
+    for y in (0..height).rev() {
+        let f = &rgba[(y * row) as usize..];
+        for x in 0..width as usize {
             b.extend_from_slice(&[f[x * 4 + 2], f[x * 4 + 1], f[x * 4]]);
         }
     }
-    std::fs::write(ruta, b)
+    std::fs::write(path, b)
 }
 
 fn main() {
     let _ = std::fs::create_dir_all("sdmc:/wow-nx");
-    *REGISTRO.lock().unwrap() = std::fs::File::create("sdmc:/wow-nx/clear.txt").ok();
-    let _ = log::set_logger(&Registro).map(|()| log::set_max_level(log::LevelFilter::Warn));
-    std::panic::set_hook(Box::new(|p| anotar(&format!("PANIC: {p}"))));
+    *LOG_PATH.lock().unwrap() = std::fs::File::create("sdmc:/wow-nx/clear.txt").ok();
+    let _ = log::set_logger(&FileLogger).map(|()| log::set_max_level(log::LevelFilter::Warn));
+    std::panic::set_hook(Box::new(|p| log_line(&format!("PANIC: {p}"))));
 
-    anotar("instance");
+    log_line("instance");
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor { backends: wgpu::Backends::GL, ..Default::default() });
-    let ventana = core::ptr::NonNull::new(unsafe { nwindowGetDefault() }).expect("no default window");
+    let window = core::ptr::NonNull::new(unsafe { nwindowGetDefault() }).expect("no default window");
     let surface = unsafe {
         instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
             raw_display_handle: raw_window_handle::RawDisplayHandle::Android(raw_window_handle::AndroidDisplayHandle::new()),
-            raw_window_handle: raw_window_handle::RawWindowHandle::AndroidNdk(raw_window_handle::AndroidNdkWindowHandle::new(ventana)),
+            raw_window_handle: raw_window_handle::RawWindowHandle::AndroidNdk(raw_window_handle::AndroidNdkWindowHandle::new(window)),
         })
     }
     .expect("surface");
@@ -109,30 +109,30 @@ fn main() {
         ..Default::default()
     }))
     .expect("adapter");
-    anotar(&format!("adapter: {:?}", adapter.get_info()));
+    log_line(&format!("adapter: {:?}", adapter.get_info()));
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).expect("device");
-    device.on_uncaptured_error(std::sync::Arc::new(|e| anotar(&format!("wgpu error: {e}"))));
-    anotar("device");
+    device.on_uncaptured_error(std::sync::Arc::new(|e| log_line(&format!("wgpu error: {e}"))));
+    log_line("device");
 
-    let (ancho, alto) = (1280u32, 720u32);
-    let formato = surface.get_capabilities(&adapter).formats[0];
+    let (width, height) = (1280u32, 720u32);
+    let format = surface.get_capabilities(&adapter).formats[0];
     surface.configure(
         &device,
         &wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            format: formato,
-            width: ancho,
-            height: alto,
+            format: format,
+            width: width,
+            height: height,
             present_mode: wgpu::PresentMode::Fifo,
             desired_maximum_frame_latency: 2,
             alpha_mode: wgpu::CompositeAlphaMode::Opaque,
             view_formats: vec![],
         },
     );
-    anotar(&format!("configured {formato:?}"));
+    log_line(&format!("configured {format:?}"));
 
     use wgpu::util::DeviceExt;
-    let modulo = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("prueba"),
         source: wgpu::ShaderSource::Wgsl(SHADER.into()),
     });
@@ -142,12 +142,12 @@ fn main() {
         contents: bytemuck_bytes(&vertices),
         usage: wgpu::BufferUsages::VERTEX,
     });
-    let triangulo = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("triangulo"),
+    let triangle = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("triangle"),
         layout: None,
         vertex: wgpu::VertexState {
-            module: &modulo,
-            entry_point: Some("vs_triangulo"),
+            module: &module,
+            entry_point: Some("vs_triangle"),
             compilation_options: Default::default(),
             buffers: &[wgpu::VertexBufferLayout {
                 array_stride: 20,
@@ -156,10 +156,10 @@ fn main() {
             }],
         },
         fragment: Some(wgpu::FragmentState {
-            module: &modulo,
-            entry_point: Some("fs_triangulo"),
+            module: &module,
+            entry_point: Some("fs_triangle"),
             compilation_options: Default::default(),
-            targets: &[Some(formato.into())],
+            targets: &[Some(format.into())],
         }),
         primitive: Default::default(),
         depth_stencil: None,
@@ -167,21 +167,21 @@ fn main() {
         multiview: None,
         cache: None,
     });
-    anotar("pipeline triangulo");
-    let cuadro = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("cuadro"),
+    log_line("pipeline triangle");
+    let quad = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("quad"),
         layout: None,
         vertex: wgpu::VertexState {
-            module: &modulo,
-            entry_point: Some("vs_cuadro"),
+            module: &module,
+            entry_point: Some("vs_quad"),
             compilation_options: Default::default(),
             buffers: &[],
         },
         fragment: Some(wgpu::FragmentState {
-            module: &modulo,
-            entry_point: Some("fs_cuadro"),
+            module: &module,
+            entry_point: Some("fs_quad"),
             compilation_options: Default::default(),
-            targets: &[Some(formato.into())],
+            targets: &[Some(format.into())],
         }),
         primitive: Default::default(),
         depth_stencil: None,
@@ -189,16 +189,16 @@ fn main() {
         multiview: None,
         cache: None,
     });
-    anotar("pipeline cuadro");
+    log_line("pipeline quad");
 
-    let mut texeles = Vec::new();
+    let mut texels = Vec::new();
     for y in 0..4 {
         for x in 0..4 {
             let v = if (x + y) % 2 == 0 { 255 } else { 0 };
-            texeles.extend_from_slice(&[v, v, v, 255]);
+            texels.extend_from_slice(&[v, v, v, 255]);
         }
     }
-    let textura = device.create_texture_with_data(
+    let tex = device.create_texture_with_data(
         &queue,
         &wgpu::TextureDescriptor {
             label: None,
@@ -211,51 +211,51 @@ fn main() {
             view_formats: &[],
         },
         Default::default(),
-        &texeles,
+        &texels,
     );
-    let tinte = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+    let tint = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: None,
         // Yellow: the checker's white squares come out yellow.
         contents: bytemuck_bytes(&[1.0f32, 1.0, 0.0, 1.0]),
         usage: wgpu::BufferUsages::UNIFORM,
     });
-    let muestreador = device.create_sampler(&Default::default());
-    let grupo = device.create_bind_group(&wgpu::BindGroupDescriptor {
+    let sampler = device.create_sampler(&Default::default());
+    let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: None,
-        layout: &cuadro.get_bind_group_layout(0),
+        layout: &quad.get_bind_group_layout(0),
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: tinte.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 0, resource: tint.as_entire_binding() },
             wgpu::BindGroupEntry {
                 binding: 1,
-                resource: wgpu::BindingResource::TextureView(&textura.create_view(&Default::default())),
+                resource: wgpu::BindingResource::TextureView(&tex.create_view(&Default::default())),
             },
-            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&muestreador) },
+            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&sampler) },
         ],
     });
-    anotar("resources");
+    log_line("resources");
 
-    let fila = (ancho * 4).div_ceil(256) * 256;
-    let lectura = device.create_buffer(&wgpu::BufferDescriptor {
+    let row = (width * 4).div_ceil(256) * 256;
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
-        size: (fila * alto) as u64,
+        size: (row * height) as u64,
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
 
-    for cuadro_n in 0..300 {
+    for frame_n in 0..300 {
         let frame = match surface.get_current_texture() {
             Ok(f) => f,
             Err(e) => {
-                anotar(&format!("frame {cuadro_n}: {e}"));
+                log_line(&format!("frame {frame_n}: {e}"));
                 break;
             }
         };
-        let vista = frame.texture.create_view(&Default::default());
+        let view = frame.texture.create_view(&Default::default());
         let mut enc = device.create_command_encoder(&Default::default());
         {
-            let mut pase = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &vista,
+                    view: &view,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -267,45 +267,45 @@ fn main() {
             });
             // In stages, so a GPU fault names its draw: frames 0-59 only clear, 60-119 add the triangle,
             // 120 on the quad too.
-            if cuadro_n >= 60 {
-                pase.set_pipeline(&triangulo);
-                pase.set_vertex_buffer(0, vb.slice(..));
-                pase.draw(0..3, 0..1);
+            if frame_n >= 60 {
+                pass.set_pipeline(&triangle);
+                pass.set_vertex_buffer(0, vb.slice(..));
+                pass.draw(0..3, 0..1);
             }
-            if cuadro_n >= 120 {
-                pase.set_pipeline(&cuadro);
-                pase.set_bind_group(0, &grupo, &[]);
-                pase.draw(0..6, 1..2);
+            if frame_n >= 120 {
+                pass.set_pipeline(&quad);
+                pass.set_bind_group(0, &group, &[]);
+                pass.draw(0..6, 1..2);
             }
         }
-        if cuadro_n == 150 {
+        if frame_n == 150 {
             enc.copy_texture_to_buffer(
                 frame.texture.as_image_copy(),
                 wgpu::TexelCopyBufferInfo {
-                    buffer: &lectura,
-                    layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(fila), rows_per_image: None },
+                    buffer: &readback,
+                    layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: None },
                 },
-                wgpu::Extent3d { width: ancho, height: alto, depth_or_array_layers: 1 },
+                wgpu::Extent3d { width: width, height: height, depth_or_array_layers: 1 },
             );
         }
         queue.submit([enc.finish()]);
         frame.present();
-        if cuadro_n == 150 {
-            lectura.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        if frame_n == 150 {
+            readback.slice(..).map_async(wgpu::MapMode::Read, |_| {});
             let _ = device.poll(wgpu::PollType::wait_indefinitely());
-            let datos = lectura.slice(..).get_mapped_range();
-            match guardar_bmp("sdmc:/wow-nx/clear.bmp", ancho, alto, fila, &datos) {
-                Ok(()) => anotar("frame 150 saved to clear.bmp"),
-                Err(e) => anotar(&format!("clear.bmp: {e}")),
+            let data = readback.slice(..).get_mapped_range();
+            match save_bmp("sdmc:/wow-nx/clear.bmp", width, height, row, &data) {
+                Ok(()) => log_line("frame 150 saved to clear.bmp"),
+                Err(e) => log_line(&format!("clear.bmp: {e}")),
             }
-            drop(datos);
-            lectura.unmap();
+            drop(data);
+            readback.unmap();
         }
-        if cuadro_n < 3 || cuadro_n % 60 == 0 || (60..63).contains(&cuadro_n) || (120..123).contains(&cuadro_n) {
-            anotar(&format!("frame {cuadro_n}"));
+        if frame_n < 3 || frame_n % 60 == 0 || (60..63).contains(&frame_n) || (120..123).contains(&frame_n) {
+            log_line(&format!("frame {frame_n}"));
         }
     }
-    anotar("done");
+    log_line("done");
 }
 
 fn bytemuck_bytes(v: &[f32]) -> &[u8] {

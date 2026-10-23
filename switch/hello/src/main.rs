@@ -10,8 +10,8 @@ extern "C" {
 fn main() {
     unsafe { consoleInit(core::ptr::null_mut()) };
     println!("wow-nx: Rust std on the Switch\n");
-    let fallos = hello::comprobar("hello.txt");
-    println!("\n{fallos} failed. Results in sdmc:/wow-nx/hello.txt. Closing in 10 s.");
+    let failures = hello::run_checks("hello.txt");
+    println!("\n{failures} failed. Results in sdmc:/wow-nx/hello.txt. Closing in 10 s.");
     unsafe { consoleUpdate(core::ptr::null_mut()) };
     std::thread::sleep(std::time::Duration::from_secs(10));
     unsafe { consoleExit(core::ptr::null_mut()) };

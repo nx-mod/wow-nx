@@ -4,7 +4,7 @@ use super::ffi::*;
 // TODO(wow-nx): sub-allocate small buffers from shared blocks; Bevy makes many of them.
 #[derive(Debug)]
 pub struct Buffer {
-    pub(super) bloque: DkMemBlock,
+    pub(super) mem_block: DkMemBlock,
     pub(super) gpu: DkGpuAddr,
     pub(super) cpu: *mut u8,
     pub(super) size: u64,
@@ -19,16 +19,16 @@ impl Buffer {
         device: DkDevice,
         desc: &crate::BufferDescriptor,
     ) -> Result<Self, crate::DeviceError> {
-        let tamano = super::alinear(desc.size.max(1), DK_MEMBLOCK_ALIGNMENT as u64);
-        let tamano = u32::try_from(tamano).map_err(|_| crate::DeviceError::OutOfMemory)?;
-        let bloque = unsafe {
-            super::bloque(device, tamano, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached)
+        let size = super::align_up(desc.size.max(1), DK_MEMBLOCK_ALIGNMENT as u64);
+        let size = u32::try_from(size).map_err(|_| crate::DeviceError::OutOfMemory)?;
+        let mem_block = unsafe {
+            super::mem_block(device, size, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached)
         }
         .ok_or(crate::DeviceError::OutOfMemory)?;
         Ok(Buffer {
-            bloque,
-            gpu: unsafe { dkMemBlockGetGpuAddr(bloque) },
-            cpu: unsafe { dkMemBlockGetCpuAddr(bloque) }.cast(),
+            mem_block,
+            gpu: unsafe { dkMemBlockGetGpuAddr(mem_block) },
+            cpu: unsafe { dkMemBlockGetCpuAddr(mem_block) }.cast(),
             size: desc.size,
         })
     }

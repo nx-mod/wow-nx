@@ -42,44 +42,44 @@ unsafe extern "C" {
 }
 
 /// Size of the zero-filled block buffer clears copy from.
-const CEROS: u32 = 64 * 1024;
+const ZEROS_SIZE: u32 = 64 * 1024;
 /// Command memory added to an encoder at a time.
-const MEMORIA_COMANDOS: u32 = 256 * 1024;
+const COMMAND_MEMORY_SIZE: u32 = 256 * 1024;
 /// Shader code memory.
-const MEMORIA_CODIGO: u32 = 32 << 20;
+const CODE_MEMORY_SIZE: u32 = 32 << 20;
 /// Descriptor set sizes: one image descriptor per sampled or storage view, one sampler descriptor per sampler.
-const IMAGENES: u32 = 8192;
-const MUESTREADORES: u32 = 2048;
+const MAX_IMAGES: u32 = 8192;
+const MAX_SAMPLERS: u32 = 2048;
 /// The driver's own uniform buffer: the first instance at 0, push constants at 256 (pipeline.rs).
-const UBO_DRIVER: u32 = 256;
+const DRIVER_UBO_SIZE: u32 = 256;
 
-pub(super) fn alinear(valor: u64, alineacion: u64) -> u64 {
-    (valor + alineacion - 1) & !(alineacion - 1)
+pub(super) fn align_up(value: u64, alignment: u64) -> u64 {
+    (value + alignment - 1) & !(alignment - 1)
 }
 
-/// A memory block of `tamano` bytes (a multiple of `DK_MEMBLOCK_ALIGNMENT`).
-pub(super) unsafe fn bloque(device: DkDevice, tamano: u32, flags: u32) -> Option<DkMemBlock> {
+/// A memory block of `size` bytes (a multiple of `DK_MEMBLOCK_ALIGNMENT`).
+pub(super) unsafe fn mem_block(device: DkDevice, size: u32, flags: u32) -> Option<DkMemBlock> {
     let mut maker = unsafe { core::mem::zeroed::<DkMemBlockMaker>() };
-    unsafe { dkMemBlockMakerDefaults(&mut maker, device, tamano) };
+    unsafe { dkMemBlockMakerDefaults(&mut maker, device, size) };
     maker.flags = flags;
-    let bloque = unsafe { dkMemBlockCreate(&maker) };
-    (!bloque.is_null()).then_some(bloque)
+    let mem_block = unsafe { dkMemBlockCreate(&maker) };
+    (!mem_block.is_null()).then_some(mem_block)
 }
 
-unsafe extern "C" fn depurar(
+unsafe extern "C" fn debug_callback(
     _user: *mut c_void,
-    contexto: *const core::ffi::c_char,
-    resultado: DkResult,
-    mensaje: *const core::ffi::c_char,
+    context: *const core::ffi::c_char,
+    result: DkResult,
+    message: *const core::ffi::c_char,
 ) {
-    let texto = |p: *const core::ffi::c_char| {
+    let text = |p: *const core::ffi::c_char| {
         if p.is_null() {
             String::new()
         } else {
             unsafe { core::ffi::CStr::from_ptr(p) }.to_string_lossy().into_owned()
         }
     };
-    log::error!("deko3d {}: {:?} {}", texto(contexto), resultado, texto(mensaje));
+    log::error!("deko3d {}: {:?} {}", text(context), result, text(message));
 }
 
 #[derive(Clone, Debug)]
@@ -93,32 +93,32 @@ pub struct Adapter;
 /// Shader code memory, filled from the start. Code is never freed.
 // TODO(wow-nx): recycle the code of destroyed pipelines.
 #[derive(Debug)]
-struct Codigo {
-    bloque: DkMemBlock,
-    usado: u32,
+struct CodeMemory {
+    mem_block: DkMemBlock,
+    used: u32,
 }
 
-impl Codigo {
+impl CodeMemory {
     /// Loads a one-program DKSH file: the control section stays on the CPU, the code goes to code memory.
-    fn cargar(&mut self, dksh: &[u8]) -> Option<Box<DkShader>> {
-        let palabra = |i: usize| -> Option<u32> { Some(u32::from_le_bytes(dksh.get(i * 4..i * 4 + 4)?.try_into().ok()?)) };
-        let [magia, _, control, codigo, _, programas] = [palabra(0)?, palabra(1)?, palabra(2)?, palabra(3)?, palabra(4)?, palabra(5)?];
-        if magia != 0x4853_4B44 || programas != 1 || control as usize + codigo as usize > dksh.len() {
+    fn load(&mut self, dksh: &[u8]) -> Option<Box<DkShader>> {
+        let word = |i: usize| -> Option<u32> { Some(u32::from_le_bytes(dksh.get(i * 4..i * 4 + 4)?.try_into().ok()?)) };
+        let [magic, _, control, code, _, programs] = [word(0)?, word(1)?, word(2)?, word(3)?, word(4)?, word(5)?];
+        if magic != 0x4853_4B44 || programs != 1 || control as usize + code as usize > dksh.len() {
             log::error!("deko3d: not a one-program DKSH ({} bytes)", dksh.len());
             return None;
         }
-        let en = alinear(self.usado as u64, DK_SHADER_CODE_ALIGNMENT as u64) as u32;
-        if en as u64 + codigo as u64 > (MEMORIA_CODIGO - DK_SHADER_CODE_UNUSABLE_SIZE) as u64 {
+        let offset = align_up(self.used as u64, DK_SHADER_CODE_ALIGNMENT as u64) as u32;
+        if offset as u64 + code as u64 > (CODE_MEMORY_SIZE - DK_SHADER_CODE_UNUSABLE_SIZE) as u64 {
             log::error!("deko3d: shader code memory full");
             return None;
         }
         unsafe {
-            let destino = dkMemBlockGetCpuAddr(self.bloque).cast::<u8>().add(en as usize);
-            ptr::copy_nonoverlapping(dksh.as_ptr().add(control as usize), destino, codigo as usize);
+            let dst = dkMemBlockGetCpuAddr(self.mem_block).cast::<u8>().add(offset as usize);
+            ptr::copy_nonoverlapping(dksh.as_ptr().add(control as usize), dst, code as usize);
         }
-        self.usado = en + codigo;
+        self.used = offset + code;
         let mut maker = unsafe { core::mem::zeroed::<DkShaderMaker>() };
-        unsafe { dkShaderMakerDefaults(&mut maker, self.bloque, en) };
+        unsafe { dkShaderMakerDefaults(&mut maker, self.mem_block, offset) };
         maker.control = dksh.as_ptr().cast();
         maker.programId = 0;
         let mut shader = Box::new(unsafe { core::mem::zeroed::<DkShader>() });
@@ -129,26 +129,26 @@ impl Codigo {
 
 /// The image and sampler descriptor sets every command buffer binds, with free lists.
 #[derive(Debug)]
-struct Descriptores {
-    imagenes: DkMemBlock,
-    muestreadores: DkMemBlock,
-    libres_imagenes: Vec<u32>,
-    libres_muestreadores: Vec<u32>,
+struct Descriptors {
+    images: DkMemBlock,
+    samplers: DkMemBlock,
+    free_images: Vec<u32>,
+    free_samplers: Vec<u32>,
 }
 
-impl Descriptores {
-    fn nueva_imagen(&mut self, vista: &DkImageView, carga_almacen: bool) -> Option<u32> {
-        let i = self.libres_imagenes.pop()?;
+impl Descriptors {
+    fn new_image(&mut self, view: &DkImageView, load_store: bool) -> Option<u32> {
+        let i = self.free_images.pop()?;
         unsafe {
-            let d = dkMemBlockGetCpuAddr(self.imagenes).cast::<DkImageDescriptor>().add(i as usize);
-            dkImageDescriptorInitialize(d, vista, carga_almacen, false);
+            let d = dkMemBlockGetCpuAddr(self.images).cast::<DkImageDescriptor>().add(i as usize);
+            dkImageDescriptorInitialize(d, view, load_store, false);
         }
         Some(i)
     }
-    fn nuevo_muestreador(&mut self, m: &DkSampler) -> Option<u32> {
-        let i = self.libres_muestreadores.pop()?;
+    fn new_sampler(&mut self, m: &DkSampler) -> Option<u32> {
+        let i = self.free_samplers.pop()?;
         unsafe {
-            let d = dkMemBlockGetCpuAddr(self.muestreadores).cast::<DkSamplerDescriptor>().add(i as usize);
+            let d = dkMemBlockGetCpuAddr(self.samplers).cast::<DkSamplerDescriptor>().add(i as usize);
             dkSamplerDescriptorInitialize(d, m);
         }
         Some(i)
@@ -158,73 +158,73 @@ impl Descriptores {
 /// What the device and its queue share: deko3d's device, the one queue, a block of zeros for clears, shader code
 /// memory, the descriptor sets and the driver's uniform buffer.
 #[derive(Debug)]
-struct Compartido {
+struct Shared {
     device: DkDevice,
-    cola: DkQueue,
-    ceros: DkMemBlock,
-    codigo: Mutex<Codigo>,
-    descriptores: Mutex<Descriptores>,
+    queue: DkQueue,
+    zeros: DkMemBlock,
+    code: Mutex<CodeMemory>,
+    descriptors: Mutex<Descriptors>,
     ubo: DkMemBlock,
 }
 
-unsafe impl Send for Compartido {}
-unsafe impl Sync for Compartido {}
+unsafe impl Send for Shared {}
+unsafe impl Sync for Shared {}
 
-impl Drop for Compartido {
+impl Drop for Shared {
     /// Waits for the GPU and leaves the rest to the process's exit: the device goes last in wgpu, after the surface
     /// and encoders that still hold memory blocks, and deko3d refuses to destroy a device with blocks alive.
     fn drop(&mut self) {
-        unsafe { dkQueueWaitIdle(self.cola) };
+        unsafe { dkQueueWaitIdle(self.queue) };
     }
 }
 
 #[derive(Debug)]
 pub struct Device {
-    compartido: Arc<Compartido>,
+    shared: Arc<Shared>,
 }
 #[derive(Debug)]
 pub struct Queue {
-    compartido: Arc<Compartido>,
+    shared: Arc<Shared>,
 }
 
 /// The window's swapchain, made by `Surface::configure`.
 #[derive(Debug)]
-struct Cadena {
+struct Swapchain {
     dk: DkSwapchain,
-    memoria: DkMemBlock,
-    imagenes: Vec<DkImage>,
-    cola: DkQueue,
-    formato: wgt::TextureFormat,
-    tamano: wgt::Extent3d,
+    memory: DkMemBlock,
+    images: Vec<DkImage>,
+    queue: DkQueue,
+    format: wgt::TextureFormat,
+    size: wgt::Extent3d,
 }
 
 #[derive(Debug)]
 pub struct Surface {
-    ventana: *mut c_void,
-    cadena: Mutex<Option<Cadena>>,
+    window: *mut c_void,
+    swapchain: Mutex<Option<Swapchain>>,
 }
 
 unsafe impl Send for Surface {}
 unsafe impl Sync for Surface {}
 
-/// A deko3d image. Views point at `imagen`, which is boxed so it keeps its address when the texture moves.
+/// A deko3d image. Views point at `image`, which is boxed so it keeps its address when the texture moves.
 #[derive(Debug)]
 pub struct Texture {
-    imagen: Box<DkImage>,
+    image: Box<DkImage>,
     /// `None` for swapchain images, whose memory belongs to the swapchain.
-    bloque: Option<DkMemBlock>,
-    formato: wgt::TextureFormat,
-    muestras: u32,
+    mem_block: Option<DkMemBlock>,
+    format: wgt::TextureFormat,
+    samples: u32,
     /// Width and height of mip 0.
-    tamano: (u32, u32),
-    tres_d: bool,
+    size: (u32, u32),
+    is_3d: bool,
     /// The swapchain slot of an acquired surface texture.
-    ranura: Option<i32>,
+    slot: Option<i32>,
 }
 
 impl Texture {
-    fn dimension_3d(&self) -> bool {
-        self.tres_d
+    fn is_3d(&self) -> bool {
+        self.is_3d
     }
 }
 
@@ -233,12 +233,12 @@ unsafe impl Sync for Texture {}
 
 #[derive(Debug)]
 pub struct TextureView {
-    vista: DkImageView,
+    view: DkImageView,
     /// Index in the image descriptor set, for views that are sampled or stored to.
     descriptor: Option<u32>,
-    formato: wgt::TextureFormat,
+    format: wgt::TextureFormat,
     /// Size of the viewed mip level, for render passes.
-    tamano: (u32, u32),
+    size: (u32, u32),
 }
 
 unsafe impl Send for TextureView {}
@@ -249,14 +249,14 @@ pub struct Resource;
 
 /// Fence values, each signalled by a deko3d fence after a submission.
 #[derive(Debug, Default)]
-struct Pendientes {
-    completado: crate::FenceValue,
-    vuelo: Vec<(crate::FenceValue, Box<DkFence>)>,
+struct Pending {
+    completed: crate::FenceValue,
+    in_flight: Vec<(crate::FenceValue, Box<DkFence>)>,
 }
 
 #[derive(Debug)]
 pub struct Fence {
-    estado: Mutex<Pendientes>,
+    state: Mutex<Pending>,
 }
 
 unsafe impl Send for Fence {}
@@ -264,17 +264,17 @@ unsafe impl Sync for Fence {}
 
 impl Fence {
     /// Retires every fence that has signalled, in order, and returns the last value reached.
-    fn sondear(&self) -> crate::FenceValue {
-        let mut estado = self.estado.lock();
-        while let Some((valor, fence)) = estado.vuelo.first_mut() {
+    fn poll(&self) -> crate::FenceValue {
+        let mut state = self.state.lock();
+        while let Some((value, fence)) = state.in_flight.first_mut() {
             if unsafe { dkFenceWait(&mut **fence, 0) } != DkResult::DkResult_Success {
                 break;
             }
-            let valor = *valor;
-            estado.completado = estado.completado.max(valor);
-            estado.vuelo.remove(0);
+            let value = *value;
+            state.completed = state.completed.max(value);
+            state.in_flight.remove(0);
         }
-        estado.completado
+        state.completed
     }
 }
 
@@ -367,13 +367,13 @@ impl crate::Instance for Instance {
         _display_handle: raw_window_handle::RawDisplayHandle,
         window_handle: raw_window_handle::RawWindowHandle,
     ) -> Result<Surface, crate::InstanceError> {
-        let ventana = match window_handle {
+        let window = match window_handle {
             raw_window_handle::RawWindowHandle::AndroidNdk(h) => h.a_native_window.as_ptr(),
             _ => unsafe { nwindowGetDefault() },
         };
         Ok(Surface {
-            ventana,
-            cadena: Mutex::new(None),
+            window,
+            swapchain: Mutex::new(None),
         })
     }
     unsafe fn enumerate_adapters(&self, _surface_hint: Option<&Surface>) -> Vec<crate::ExposedAdapter<Api>> {
@@ -438,16 +438,16 @@ fn capabilities() -> crate::Capabilities {
 }
 
 /// Formats the swapchain can present.
-const FORMATOS_PANTALLA: [wgt::TextureFormat; 2] =
+const SURFACE_FORMATS: [wgt::TextureFormat; 2] =
     [wgt::TextureFormat::Rgba8UnormSrgb, wgt::TextureFormat::Rgba8Unorm];
 
 impl Surface {
-    unsafe fn soltar(&self) {
-        if let Some(c) = self.cadena.lock().take() {
+    unsafe fn release(&self) {
+        if let Some(c) = self.swapchain.lock().take() {
             unsafe {
-                dkQueueWaitIdle(c.cola);
+                dkQueueWaitIdle(c.queue);
                 dkSwapchainDestroy(c.dk);
-                dkMemBlockDestroy(c.memoria);
+                dkMemBlockDestroy(c.memory);
             }
         }
     }
@@ -457,53 +457,53 @@ impl crate::Surface for Surface {
     type A = Api;
 
     unsafe fn configure(&self, device: &Device, config: &crate::SurfaceConfiguration) -> Result<(), crate::SurfaceError> {
-        unsafe { self.soltar() };
-        let dk = device.compartido.device;
-        let formato = conv::formato(config.format).ok_or(crate::SurfaceError::Other("format"))?;
+        unsafe { self.release() };
+        let dk = device.shared.device;
+        let format = conv::dk_format(config.format).ok_or(crate::SurfaceError::Other("format"))?;
 
         let mut maker = unsafe { core::mem::zeroed::<DkImageLayoutMaker>() };
         unsafe { dkImageLayoutMakerDefaults(&mut maker, dk) };
         maker.flags = DkImageFlags_UsageRender | DkImageFlags_UsagePresent | DkImageFlags_HwCompression;
-        maker.format = formato;
+        maker.format = format;
         maker.dimensions = [config.extent.width, config.extent.height, 1];
         let mut layout = unsafe { core::mem::zeroed::<DkImageLayout>() };
         unsafe { dkImageLayoutInitialize(&mut layout, &maker) };
-        let alineacion = unsafe { dkImageLayoutGetAlignment(&layout) } as u64;
-        let tamano = alinear(unsafe { dkImageLayoutGetSize(&layout) }, alineacion.max(1));
+        let alignment = unsafe { dkImageLayoutGetAlignment(&layout) } as u64;
+        let size = align_up(unsafe { dkImageLayoutGetSize(&layout) }, alignment.max(1));
 
-        let cuenta = (config.maximum_frame_latency + 1).clamp(2, 3);
-        let total = alinear(tamano * cuenta as u64, DK_MEMBLOCK_ALIGNMENT as u64);
+        let count = (config.maximum_frame_latency + 1).clamp(2, 3);
+        let total = align_up(size * count as u64, DK_MEMBLOCK_ALIGNMENT as u64);
         let total = u32::try_from(total).map_err(|_| crate::SurfaceError::Outdated)?;
-        let memoria = unsafe { bloque(dk, total, DkMemBlockFlags_GpuCached | DkMemBlockFlags_Image) }
+        let memory = unsafe { mem_block(dk, total, DkMemBlockFlags_GpuCached | DkMemBlockFlags_Image) }
             .ok_or(crate::SurfaceError::Device(crate::DeviceError::OutOfMemory))?;
 
-        let mut imagenes = vec![unsafe { core::mem::zeroed::<DkImage>() }; cuenta as usize];
-        for (i, imagen) in imagenes.iter_mut().enumerate() {
-            unsafe { dkImageInitialize(imagen, &layout, memoria, (i as u64 * tamano) as u32) };
+        let mut images = vec![unsafe { core::mem::zeroed::<DkImage>() }; count as usize];
+        for (i, image) in images.iter_mut().enumerate() {
+            unsafe { dkImageInitialize(image, &layout, memory, (i as u64 * size) as u32) };
         }
-        let punteros: Vec<*const DkImage> = imagenes.iter().map(ptr::from_ref).collect();
+        let pointers: Vec<*const DkImage> = images.iter().map(ptr::from_ref).collect();
         let mut sm = unsafe { core::mem::zeroed::<DkSwapchainMaker>() };
-        unsafe { dkSwapchainMakerDefaults(&mut sm, dk, self.ventana, punteros.as_ptr(), cuenta) };
-        let cadena = unsafe { dkSwapchainCreate(&sm) };
-        if cadena.is_null() {
-            unsafe { dkMemBlockDestroy(memoria) };
+        unsafe { dkSwapchainMakerDefaults(&mut sm, dk, self.window, pointers.as_ptr(), count) };
+        let swapchain = unsafe { dkSwapchainCreate(&sm) };
+        if swapchain.is_null() {
+            unsafe { dkMemBlockDestroy(memory) };
             return Err(crate::SurfaceError::Other("dkSwapchainCreate"));
         }
-        let intervalo = if config.present_mode == wgt::PresentMode::Immediate { 0 } else { 1 };
-        unsafe { dkSwapchainSetSwapInterval(cadena, intervalo) };
-        *self.cadena.lock() = Some(Cadena {
-            dk: cadena,
-            memoria,
-            imagenes,
-            cola: device.compartido.cola,
-            formato: config.format,
-            tamano: config.extent,
+        let interval = if config.present_mode == wgt::PresentMode::Immediate { 0 } else { 1 };
+        unsafe { dkSwapchainSetSwapInterval(swapchain, interval) };
+        *self.swapchain.lock() = Some(Swapchain {
+            dk: swapchain,
+            memory,
+            images,
+            queue: device.shared.queue,
+            format: config.format,
+            size: config.extent,
         });
         Ok(())
     }
 
     unsafe fn unconfigure(&self, device: &Device) {
-        unsafe { self.soltar() };
+        unsafe { self.release() };
     }
 
     unsafe fn acquire_texture(
@@ -511,21 +511,21 @@ impl crate::Surface for Surface {
         timeout: Option<Duration>,
         fence: &Fence,
     ) -> Result<Option<crate::AcquiredSurfaceTexture<Api>>, crate::SurfaceError> {
-        let guarda = self.cadena.lock();
-        let c = guarda.as_ref().ok_or(crate::SurfaceError::Outdated)?;
-        let ranura = unsafe { dkQueueAcquireImage(c.cola, c.dk) };
-        if ranura < 0 {
+        let guard = self.swapchain.lock();
+        let c = guard.as_ref().ok_or(crate::SurfaceError::Outdated)?;
+        let slot = unsafe { dkQueueAcquireImage(c.queue, c.dk) };
+        if slot < 0 {
             return Err(crate::SurfaceError::Lost);
         }
         Ok(Some(crate::AcquiredSurfaceTexture {
             texture: Texture {
-                imagen: Box::new(c.imagenes[ranura as usize]),
-                bloque: None,
-                formato: c.formato,
-                muestras: 1,
-                tamano: (c.tamano.width, c.tamano.height),
-                tres_d: false,
-                ranura: Some(ranura),
+                image: Box::new(c.images[slot as usize]),
+                mem_block: None,
+                format: c.format,
+                samples: 1,
+                size: (c.size.width, c.size.height),
+                is_3d: false,
+                slot: Some(slot),
             },
             suboptimal: false,
         }))
@@ -546,7 +546,7 @@ impl crate::Adapter for Adapter {
         let mut dm = unsafe { core::mem::zeroed::<DkDeviceMaker>() };
         // Depth [0, 1] and an upper-left origin: WebGPU's conventions.
         unsafe { dkDeviceMakerDefaults(&mut dm) };
-        dm.cbDebug = Some(depurar);
+        dm.cbDebug = Some(debug_callback);
         let device = unsafe { dkDeviceCreate(&dm) };
         if device.is_null() {
             return Err(crate::DeviceError::Lost);
@@ -554,63 +554,63 @@ impl crate::Adapter for Adapter {
         let mut qm = unsafe { core::mem::zeroed::<DkQueueMaker>() };
         unsafe { dkQueueMakerDefaults(&mut qm, device) };
         qm.flags = DkQueueFlags_Graphics | DkQueueFlags_Compute | DkQueueFlags_HighPrio;
-        let cola = unsafe { dkQueueCreate(&qm) };
-        let ceros = unsafe {
-            bloque(device, CEROS, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached | DkMemBlockFlags_ZeroFillInit)
+        let queue = unsafe { dkQueueCreate(&qm) };
+        let zeros = unsafe {
+            mem_block(device, ZEROS_SIZE, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached | DkMemBlockFlags_ZeroFillInit)
         };
-        let normal = DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached;
-        let codigo = unsafe { bloque(device, MEMORIA_CODIGO, normal | DkMemBlockFlags_Code) };
-        let tam = |n: u32, t: usize| alinear(n as u64 * t as u64, DK_MEMBLOCK_ALIGNMENT as u64) as u32;
-        let imagenes = unsafe { bloque(device, tam(IMAGENES, core::mem::size_of::<DkImageDescriptor>()), normal) };
-        let muestreadores = unsafe { bloque(device, tam(MUESTREADORES, core::mem::size_of::<DkSamplerDescriptor>()), normal) };
-        let ubo = unsafe { bloque(device, DK_MEMBLOCK_ALIGNMENT, normal) };
-        let (false, Some(ceros), Some(codigo), Some(imagenes), Some(muestreadores), Some(ubo)) =
-            (cola.is_null(), ceros, codigo, imagenes, muestreadores, ubo)
+        let plain = DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached;
+        let code = unsafe { mem_block(device, CODE_MEMORY_SIZE, plain | DkMemBlockFlags_Code) };
+        let size_of_set = |n: u32, t: usize| align_up(n as u64 * t as u64, DK_MEMBLOCK_ALIGNMENT as u64) as u32;
+        let images = unsafe { mem_block(device, size_of_set(MAX_IMAGES, core::mem::size_of::<DkImageDescriptor>()), plain) };
+        let samplers = unsafe { mem_block(device, size_of_set(MAX_SAMPLERS, core::mem::size_of::<DkSamplerDescriptor>()), plain) };
+        let ubo = unsafe { mem_block(device, DK_MEMBLOCK_ALIGNMENT, plain) };
+        let (false, Some(zeros), Some(code), Some(images), Some(samplers), Some(ubo)) =
+            (queue.is_null(), zeros, code, images, samplers, ubo)
         else {
             unsafe { dkDeviceDestroy(device) };
             return Err(crate::DeviceError::OutOfMemory);
         };
-        let compartido = Arc::new(Compartido {
+        let shared = Arc::new(Shared {
             device,
-            cola,
-            ceros,
-            codigo: Mutex::new(Codigo { bloque: codigo, usado: 0 }),
-            descriptores: Mutex::new(Descriptores {
-                imagenes,
-                muestreadores,
-                libres_imagenes: (0..IMAGENES).rev().collect(),
-                libres_muestreadores: (0..MUESTREADORES).rev().collect(),
+            queue,
+            zeros,
+            code: Mutex::new(CodeMemory { mem_block: code, used: 0 }),
+            descriptors: Mutex::new(Descriptors {
+                images,
+                samplers,
+                free_images: (0..MAX_IMAGES).rev().collect(),
+                free_samplers: (0..MAX_SAMPLERS).rev().collect(),
             }),
             ubo,
         });
         Ok(crate::OpenDevice {
             device: Device {
-                compartido: compartido.clone(),
+                shared: shared.clone(),
             },
-            queue: Queue { compartido },
+            queue: Queue { shared },
         })
     }
 
     unsafe fn texture_format_capabilities(&self, format: wgt::TextureFormat) -> crate::TextureFormatCapabilities {
         use crate::TextureFormatCapabilities as C;
-        if conv::formato(format).is_none() {
+        if conv::dk_format(format).is_none() {
             return C::empty();
         }
         let mut caps = C::SAMPLED | C::COPY_SRC | C::COPY_DST;
-        let entero = matches!(
+        let integer = matches!(
             format.sample_type(None, None),
             Some(wgt::TextureSampleType::Uint | wgt::TextureSampleType::Sint)
         );
-        let multimuestra = C::MULTISAMPLE_X2 | C::MULTISAMPLE_X4 | C::MULTISAMPLE_X8;
+        let multisample = C::MULTISAMPLE_X2 | C::MULTISAMPLE_X4 | C::MULTISAMPLE_X8;
         if format.is_depth_stencil_format() {
-            caps |= C::DEPTH_STENCIL_ATTACHMENT | multimuestra;
+            caps |= C::DEPTH_STENCIL_ATTACHMENT | multisample;
         } else if !format.is_compressed() {
-            caps |= C::COLOR_ATTACHMENT | multimuestra | C::STORAGE_READ_ONLY | C::STORAGE_WRITE_ONLY | C::STORAGE_READ_WRITE;
-            if !entero {
+            caps |= C::COLOR_ATTACHMENT | multisample | C::STORAGE_READ_ONLY | C::STORAGE_WRITE_ONLY | C::STORAGE_READ_WRITE;
+            if !integer {
                 caps |= C::COLOR_ATTACHMENT_BLEND | C::MULTISAMPLE_RESOLVE;
             }
         }
-        if !entero {
+        if !integer {
             caps |= C::SAMPLED_LINEAR;
         }
         caps
@@ -618,7 +618,7 @@ impl crate::Adapter for Adapter {
 
     unsafe fn surface_capabilities(&self, surface: &Surface) -> Option<crate::SurfaceCapabilities> {
         Some(crate::SurfaceCapabilities {
-            formats: FORMATOS_PANTALLA.to_vec(),
+            formats: SURFACE_FORMATS.to_vec(),
             maximum_frame_latency: 1..=2,
             current_extent: None,
             usage: wgt::TextureUses::COLOR_TARGET | wgt::TextureUses::COPY_SRC | wgt::TextureUses::COPY_DST,
@@ -641,34 +641,34 @@ impl crate::Queue for Queue {
         surface_textures: &[&Texture],
         (fence, fence_value): (&mut Fence, crate::FenceValue),
     ) -> DeviceResult<()> {
-        let cola = self.compartido.cola;
+        let queue = self.shared.queue;
         for cb in command_buffers {
-            if cb.lista != 0 {
-                unsafe { dkQueueSubmitCommands(cola, cb.lista) };
+            if cb.list != 0 {
+                unsafe { dkQueueSubmitCommands(queue, cb.list) };
             }
         }
         let mut dk = Box::new(unsafe { core::mem::zeroed::<DkFence>() });
         unsafe {
-            dkQueueSignalFence(cola, &mut *dk, true);
-            dkQueueFlush(cola);
+            dkQueueSignalFence(queue, &mut *dk, true);
+            dkQueueFlush(queue);
         }
         #[cfg(deko3d_depurar)]
         {
-            static ENVIOS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-            let n = ENVIOS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            unsafe { dkQueueWaitIdle(cola) };
-            if unsafe { dkQueueIsInErrorState(cola) } {
+            static SUBMISSIONS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+            let n = SUBMISSIONS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            unsafe { dkQueueWaitIdle(queue) };
+            if unsafe { dkQueueIsInErrorState(queue) } {
                 log::error!("deko3d: the GPU faulted in submission {n} ({} command buffers)", command_buffers.len());
             }
         }
-        fence.estado.lock().vuelo.push((fence_value, dk));
+        fence.state.lock().in_flight.push((fence_value, dk));
         Ok(())
     }
     unsafe fn present(&self, surface: &Surface, texture: Texture) -> Result<(), crate::SurfaceError> {
-        let guarda = surface.cadena.lock();
-        let c = guarda.as_ref().ok_or(crate::SurfaceError::Outdated)?;
-        let ranura = texture.ranura.ok_or(crate::SurfaceError::Other("not a surface texture"))?;
-        unsafe { dkQueuePresentImage(c.cola, c.dk, ranura) };
+        let guard = surface.swapchain.lock();
+        let c = guard.as_ref().ok_or(crate::SurfaceError::Outdated)?;
+        let slot = texture.slot.ok_or(crate::SurfaceError::Other("not a surface texture"))?;
+        unsafe { dkQueuePresentImage(c.queue, c.dk, slot) };
         Ok(())
     }
 
@@ -682,11 +682,11 @@ impl crate::Device for Device {
     type A = Api;
 
     unsafe fn create_buffer(&self, desc: &crate::BufferDescriptor) -> DeviceResult<Buffer> {
-        unsafe { Buffer::new(self.compartido.device, desc) }
+        unsafe { Buffer::new(self.shared.device, desc) }
     }
 
     unsafe fn destroy_buffer(&self, buffer: Buffer) {
-        unsafe { dkMemBlockDestroy(buffer.bloque) };
+        unsafe { dkMemBlockDestroy(buffer.mem_block) };
     }
     unsafe fn add_raw_buffer(&self, _buffer: &Buffer) {}
 
@@ -701,23 +701,23 @@ impl crate::Device for Device {
     unsafe fn invalidate_mapped_ranges<I>(&self, buffer: &Buffer, ranges: I) {}
 
     unsafe fn create_texture(&self, desc: &crate::TextureDescriptor) -> DeviceResult<Texture> {
-        let dk = self.compartido.device;
-        let formato = conv::formato(desc.format).ok_or(crate::DeviceError::Unexpected)?;
+        let dk = self.shared.device;
+        let format = conv::dk_format(desc.format).ok_or(crate::DeviceError::Unexpected)?;
         let mut maker = unsafe { core::mem::zeroed::<DkImageLayoutMaker>() };
         unsafe { dkImageLayoutMakerDefaults(&mut maker, dk) };
-        maker.type_ = conv::tipo_imagen(desc);
-        maker.format = formato;
-        maker.msMode = conv::muestras(desc.sample_count);
+        maker.type_ = conv::image_type(desc);
+        maker.format = format;
+        maker.msMode = conv::ms_mode(desc.sample_count);
         maker.mipLevels = desc.mip_level_count;
         maker.dimensions = [
             desc.size.width,
             if desc.dimension == wgt::TextureDimension::D1 { 1 } else { desc.size.height },
             desc.size.depth_or_array_layers,
         ];
-        let objetivo = wgt::TextureUses::COLOR_TARGET
+        let render_usage = wgt::TextureUses::COLOR_TARGET
             | wgt::TextureUses::DEPTH_STENCIL_READ
             | wgt::TextureUses::DEPTH_STENCIL_WRITE;
-        if desc.usage.intersects(objetivo) || !desc.format.is_compressed() {
+        if desc.usage.intersects(render_usage) || !desc.format.is_compressed() {
             // Renderable formats always get render usage, so clears to zero can be fast clears.
             maker.flags |= DkImageFlags_UsageRender;
         }
@@ -728,101 +728,101 @@ impl crate::Device for Device {
 
         let mut layout = unsafe { core::mem::zeroed::<DkImageLayout>() };
         unsafe { dkImageLayoutInitialize(&mut layout, &maker) };
-        let alineacion = (unsafe { dkImageLayoutGetAlignment(&layout) } as u64).max(DK_MEMBLOCK_ALIGNMENT as u64);
-        let tamano = alinear(unsafe { dkImageLayoutGetSize(&layout) }, alineacion);
-        let tamano = u32::try_from(tamano).map_err(|_| crate::DeviceError::OutOfMemory)?;
-        let memoria = unsafe { bloque(dk, tamano, DkMemBlockFlags_GpuCached | DkMemBlockFlags_Image) }
+        let alignment = (unsafe { dkImageLayoutGetAlignment(&layout) } as u64).max(DK_MEMBLOCK_ALIGNMENT as u64);
+        let size = align_up(unsafe { dkImageLayoutGetSize(&layout) }, alignment);
+        let size = u32::try_from(size).map_err(|_| crate::DeviceError::OutOfMemory)?;
+        let memory = unsafe { mem_block(dk, size, DkMemBlockFlags_GpuCached | DkMemBlockFlags_Image) }
             .ok_or(crate::DeviceError::OutOfMemory)?;
-        let mut imagen = Box::new(unsafe { core::mem::zeroed::<DkImage>() });
-        unsafe { dkImageInitialize(&mut *imagen, &layout, memoria, 0) };
+        let mut image = Box::new(unsafe { core::mem::zeroed::<DkImage>() });
+        unsafe { dkImageInitialize(&mut *image, &layout, memory, 0) };
         Ok(Texture {
-            imagen,
-            bloque: Some(memoria),
-            formato: desc.format,
-            muestras: desc.sample_count,
-            tamano: (desc.size.width, desc.size.height),
-            tres_d: desc.dimension == wgt::TextureDimension::D3,
-            ranura: None,
+            image,
+            mem_block: Some(memory),
+            format: desc.format,
+            samples: desc.sample_count,
+            size: (desc.size.width, desc.size.height),
+            is_3d: desc.dimension == wgt::TextureDimension::D3,
+            slot: None,
         })
     }
     unsafe fn destroy_texture(&self, texture: Texture) {
-        if let Some(b) = texture.bloque {
+        if let Some(b) = texture.mem_block {
             unsafe { dkMemBlockDestroy(b) };
         }
     }
     unsafe fn add_raw_texture(&self, _texture: &Texture) {}
 
     unsafe fn create_texture_view(&self, texture: &Texture, desc: &crate::TextureViewDescriptor) -> DeviceResult<TextureView> {
-        let mut vista = unsafe { core::mem::zeroed::<DkImageView>() };
-        unsafe { dkImageViewDefaults(&mut vista, &*texture.imagen) };
-        vista.type_ = conv::tipo_vista(desc.dimension, texture.muestras > 1);
-        if desc.format != texture.formato {
-            vista.format = conv::formato(desc.format).ok_or(crate::DeviceError::Unexpected)?;
+        let mut view = unsafe { core::mem::zeroed::<DkImageView>() };
+        unsafe { dkImageViewDefaults(&mut view, &*texture.image) };
+        view.type_ = conv::view_type(desc.dimension, texture.samples > 1);
+        if desc.format != texture.format {
+            view.format = conv::dk_format(desc.format).ok_or(crate::DeviceError::Unexpected)?;
         }
         if desc.range.aspect == wgt::TextureAspect::StencilOnly {
-            vista.dsSource = DkDsSource::DkDsSource_Stencil;
+            view.dsSource = DkDsSource::DkDsSource_Stencil;
         }
         let mip = desc.range.base_mip_level;
-        vista.mipLevelOffset = mip as u8;
-        vista.mipLevelCount = desc.range.mip_level_count.unwrap_or(0) as u8;
-        vista.layerOffset = desc.range.base_array_layer as u16;
-        vista.layerCount = desc.range.array_layer_count.unwrap_or(0) as u16;
-        let (ancho, alto) = texture.tamano;
-        let almacen = wgt::TextureUses::STORAGE_READ_ONLY | wgt::TextureUses::STORAGE_WRITE_ONLY | wgt::TextureUses::STORAGE_READ_WRITE;
-        let descriptor = if desc.usage.intersects(wgt::TextureUses::RESOURCE | almacen) {
-            let d = self.compartido.descriptores.lock().nueva_imagen(&vista, desc.usage.intersects(almacen));
+        view.mipLevelOffset = mip as u8;
+        view.mipLevelCount = desc.range.mip_level_count.unwrap_or(0) as u8;
+        view.layerOffset = desc.range.base_array_layer as u16;
+        view.layerCount = desc.range.array_layer_count.unwrap_or(0) as u16;
+        let (width, height) = texture.size;
+        let storage = wgt::TextureUses::STORAGE_READ_ONLY | wgt::TextureUses::STORAGE_WRITE_ONLY | wgt::TextureUses::STORAGE_READ_WRITE;
+        let descriptor = if desc.usage.intersects(wgt::TextureUses::RESOURCE | storage) {
+            let d = self.shared.descriptors.lock().new_image(&view, desc.usage.intersects(storage));
             Some(d.ok_or(crate::DeviceError::OutOfMemory)?)
         } else {
             None
         };
         Ok(TextureView {
-            vista,
+            view,
             descriptor,
-            formato: desc.format,
-            tamano: ((ancho >> mip).max(1), (alto >> mip).max(1)),
+            format: desc.format,
+            size: ((width >> mip).max(1), (height >> mip).max(1)),
         })
     }
     unsafe fn destroy_texture_view(&self, view: TextureView) {
         if let Some(d) = view.descriptor {
-            self.compartido.descriptores.lock().libres_imagenes.push(d);
+            self.shared.descriptors.lock().free_images.push(d);
         }
     }
     unsafe fn create_sampler(&self, desc: &crate::SamplerDescriptor) -> DeviceResult<Sampler> {
-        self.nuevo_muestreador(desc)
+        self.new_sampler(desc)
     }
     unsafe fn destroy_sampler(&self, sampler: Sampler) {
-        self.compartido.descriptores.lock().libres_muestreadores.push(sampler.descriptor);
+        self.shared.descriptors.lock().free_samplers.push(sampler.descriptor);
     }
 
     unsafe fn create_command_encoder(&self, desc: &crate::CommandEncoderDescriptor<Queue>) -> DeviceResult<CommandEncoder> {
-        let c = &self.compartido;
-        let d = c.descriptores.lock();
+        let c = &self.shared;
+        let d = c.descriptors.lock();
         unsafe {
             CommandEncoder::new(
                 c.device,
-                command::Fijos {
-                    ceros: (dkMemBlockGetGpuAddr(c.ceros), CEROS),
-                    imagenes: (dkMemBlockGetGpuAddr(d.imagenes), IMAGENES),
-                    muestreadores: (dkMemBlockGetGpuAddr(d.muestreadores), MUESTREADORES),
-                    ubo: (dkMemBlockGetGpuAddr(c.ubo), UBO_DRIVER),
+                command::DeviceAddrs {
+                    zeros: (dkMemBlockGetGpuAddr(c.zeros), ZEROS_SIZE),
+                    images: (dkMemBlockGetGpuAddr(d.images), MAX_IMAGES),
+                    samplers: (dkMemBlockGetGpuAddr(d.samplers), MAX_SAMPLERS),
+                    ubo: (dkMemBlockGetGpuAddr(c.ubo), DRIVER_UBO_SIZE),
                 },
             )
         }
     }
 
     unsafe fn create_bind_group_layout(&self, desc: &crate::BindGroupLayoutDescriptor) -> DeviceResult<BindGroupLayout> {
-        Ok(self.nuevo_layout_grupos(desc))
+        Ok(self.new_bind_group_layout(desc))
     }
     unsafe fn destroy_bind_group_layout(&self, bg_layout: BindGroupLayout) {}
     unsafe fn create_pipeline_layout(&self, desc: &crate::PipelineLayoutDescriptor<BindGroupLayout>) -> DeviceResult<PipelineLayout> {
-        Ok(self.nuevo_layout(desc))
+        Ok(self.new_pipeline_layout(desc))
     }
     unsafe fn destroy_pipeline_layout(&self, pipeline_layout: PipelineLayout) {}
     unsafe fn create_bind_group(
         &self,
         desc: &crate::BindGroupDescriptor<BindGroupLayout, Buffer, Sampler, TextureView, Resource>,
     ) -> DeviceResult<BindGroup> {
-        Ok(self.nuevo_grupo(desc))
+        Ok(self.new_bind_group(desc))
     }
     unsafe fn destroy_bind_group(&self, group: BindGroup) {}
 
@@ -841,14 +841,14 @@ impl crate::Device for Device {
         &self,
         desc: &crate::RenderPipelineDescriptor<PipelineLayout, ShaderModule, Resource>,
     ) -> Result<RenderPipeline, crate::PipelineError> {
-        self.nueva_tuberia(desc)
+        self.new_render_pipeline(desc)
     }
     unsafe fn destroy_render_pipeline(&self, pipeline: RenderPipeline) {}
     unsafe fn create_compute_pipeline(
         &self,
         desc: &crate::ComputePipelineDescriptor<PipelineLayout, ShaderModule, Resource>,
     ) -> Result<ComputePipeline, crate::PipelineError> {
-        self.nueva_tuberia_computo(desc)
+        self.new_compute_pipeline(desc)
     }
     unsafe fn destroy_compute_pipeline(&self, pipeline: ComputePipeline) {}
     unsafe fn create_pipeline_cache(&self, desc: &crate::PipelineCacheDescriptor<'_>) -> Result<Resource, crate::PipelineCacheError> {
@@ -862,21 +862,21 @@ impl crate::Device for Device {
     unsafe fn destroy_query_set(&self, set: Resource) {}
     unsafe fn create_fence(&self) -> DeviceResult<Fence> {
         Ok(Fence {
-            estado: Mutex::new(Pendientes::default()),
+            state: Mutex::new(Pending::default()),
         })
     }
     unsafe fn destroy_fence(&self, fence: Fence) {}
     unsafe fn get_fence_value(&self, fence: &Fence) -> DeviceResult<crate::FenceValue> {
-        Ok(fence.sondear())
+        Ok(fence.poll())
     }
     unsafe fn wait(&self, fence: &Fence, value: crate::FenceValue, timeout: Option<Duration>) -> DeviceResult<bool> {
-        if fence.sondear() >= value {
+        if fence.poll() >= value {
             return Ok(true);
         }
         let ns = timeout.map_or(-1, |t| i64::try_from(t.as_nanos()).unwrap_or(i64::MAX));
         {
-            let mut estado = fence.estado.lock();
-            let Some((_, dk)) = estado.vuelo.iter_mut().find(|(v, _)| *v >= value) else {
+            let mut state = fence.state.lock();
+            let Some((_, dk)) = state.in_flight.iter_mut().find(|(v, _)| *v >= value) else {
                 // Not submitted yet: nothing to wait on.
                 return Ok(false);
             };
@@ -884,7 +884,7 @@ impl crate::Device for Device {
                 return Ok(false);
             }
         }
-        Ok(fence.sondear() >= value)
+        Ok(fence.poll() >= value)
     }
 
     unsafe fn start_graphics_debugger_capture(&self) -> bool {

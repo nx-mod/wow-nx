@@ -2,7 +2,7 @@
 //!
 //! Without winit, two things are ours: the primary window gets a raw handle to libnx's default `NWindow` (the deko3d
 //! backend presents to it), and the runner steps the app inside libnx's applet loop. Bevy's log and any panic go to
-//! sdmc:/wow-nx/cubo.txt.
+//! sdmc:/wow-nx/cube.txt.
 
 extern crate benilla_horizon;
 
@@ -21,17 +21,17 @@ unsafe extern "C" {
     fn appletMainLoop() -> bool;
 }
 
-const REGISTRO: &str = "sdmc:/wow-nx/cubo.txt";
+const LOG_PATH: &str = "sdmc:/wow-nx/cube.txt";
 
 /// The log, created once and held: appending to a file fails on the Switch's SD card.
-static ARCHIVO: Mutex<Option<std::fs::File>> = Mutex::new(None);
+static LOG_FILE: Mutex<Option<std::fs::File>> = Mutex::new(None);
 
-/// Writes to [`ARCHIVO`], for Bevy's log layer.
-struct Escritor;
+/// Writes to [`LOG_FILE`], for Bevy's log layer.
+struct LogWriter;
 
-impl std::io::Write for Escritor {
+impl std::io::Write for LogWriter {
     fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-        if let Some(f) = ARCHIVO.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        if let Some(f) = LOG_FILE.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
             f.write_all(b)?;
             let _ = f.sync_all();
         }
@@ -42,14 +42,14 @@ impl std::io::Write for Escritor {
     }
 }
 
-fn anotar(texto: &str) {
-    let _ = std::io::Write::write_all(&mut Escritor, format!("{texto}\n").as_bytes());
+fn log_line(text: &str) {
+    let _ = std::io::Write::write_all(&mut LogWriter, format!("{text}\n").as_bytes());
 }
 
 /// libnx's default window, as raw-window-handle sees it (an Android NDK window: the deko3d backend takes its pointer).
-struct VentanaNx;
+struct NxWindow;
 
-impl raw_window_handle::HasWindowHandle for VentanaNx {
+impl raw_window_handle::HasWindowHandle for NxWindow {
     fn window_handle(&self) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
         let v = core::ptr::NonNull::new(unsafe { nwindowGetDefault() }).ok_or(raw_window_handle::HandleError::Unavailable)?;
         let h = raw_window_handle::RawWindowHandle::AndroidNdk(raw_window_handle::AndroidNdkWindowHandle::new(v));
@@ -57,7 +57,7 @@ impl raw_window_handle::HasWindowHandle for VentanaNx {
     }
 }
 
-impl raw_window_handle::HasDisplayHandle for VentanaNx {
+impl raw_window_handle::HasDisplayHandle for NxWindow {
     fn display_handle(&self) -> Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError> {
         let h = raw_window_handle::RawDisplayHandle::Android(raw_window_handle::AndroidDisplayHandle::new());
         Ok(unsafe { raw_window_handle::DisplayHandle::borrow_raw(h) })
@@ -65,9 +65,9 @@ impl raw_window_handle::HasDisplayHandle for VentanaNx {
 }
 
 /// Gives each new window the handle to libnx's.
-fn dar_ventana(mut commands: Commands, nuevas: Query<Entity, (With<Window>, Without<RawHandleWrapper>)>) {
-    for e in &nuevas {
-        match RawHandleWrapper::new(&WindowWrapper::new(VentanaNx)) {
+fn give_window_handle(mut commands: Commands, new_windows: Query<Entity, (With<Window>, Without<RawHandleWrapper>)>) {
+    for e in &new_windows {
+        match RawHandleWrapper::new(&WindowWrapper::new(NxWindow)) {
             Ok(h) => {
                 commands.entity(e).insert(h);
             }
@@ -77,7 +77,7 @@ fn dar_ventana(mut commands: Commands, nuevas: Query<Entity, (With<Window>, With
 }
 
 /// Steps the app inside libnx's applet loop (which handles HOME, sleep and exit requests).
-fn bucle(mut app: App) -> AppExit {
+fn run_loop(mut app: App) -> AppExit {
     while app.plugins_state() == bevy::app::PluginsState::Adding {
         bevy::tasks::tick_global_task_pools_on_main_thread();
     }
@@ -88,26 +88,26 @@ fn bucle(mut app: App) -> AppExit {
             return AppExit::Success;
         }
         app.update();
-        if let Some(salida) = app.should_exit() {
-            return salida;
+        if let Some(output) = app.should_exit() {
+            return output;
         }
     }
 }
 
-fn registro(_: &mut App) -> Option<BoxedLayer> {
-    Some(Box::new(bevy::log::tracing_subscriber::fmt::layer().with_ansi(false).with_writer(|| Escritor)))
+fn log_layer(_: &mut App) -> Option<BoxedLayer> {
+    Some(Box::new(bevy::log::tracing_subscriber::fmt::layer().with_ansi(false).with_writer(|| LogWriter)))
 }
 
-fn escena(mut commands: Commands, mut mallas: ResMut<Assets<Mesh>>, mut materiales: ResMut<Assets<StandardMaterial>>) {
+fn setup_scene(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>, mut materials: ResMut<Assets<StandardMaterial>>) {
     commands.spawn((
-        Mesh3d(mallas.add(Cuboid::new(1.0, 1.0, 1.0))),
-        MeshMaterial3d(materiales.add(StandardMaterial::from_color(Color::srgb(0.8, 0.5, 0.2)))),
+        Mesh3d(meshes.add(Cuboid::new(1.0, 1.0, 1.0))),
+        MeshMaterial3d(materials.add(StandardMaterial::from_color(Color::srgb(0.8, 0.5, 0.2)))),
         Transform::default(),
-        Gira,
+        Spin,
     ));
     commands.spawn((
-        Mesh3d(mallas.add(Plane3d::default().mesh().size(4.0, 4.0))),
-        MeshMaterial3d(materiales.add(StandardMaterial::from_color(Color::srgb(0.3, 0.5, 0.3)))),
+        Mesh3d(meshes.add(Plane3d::default().mesh().size(4.0, 4.0))),
+        MeshMaterial3d(materials.add(StandardMaterial::from_color(Color::srgb(0.3, 0.5, 0.3)))),
         Transform::from_xyz(0.0, -0.75, 0.0),
     ));
     commands.spawn((
@@ -129,30 +129,30 @@ fn escena(mut commands: Commands, mut mallas: ResMut<Assets<Mesh>>, mut material
 }
 
 #[derive(Component)]
-struct Gira;
+struct Spin;
 
-fn girar(time: Res<Time>, mut q: Query<&mut Transform, With<Gira>>) {
+fn spin(time: Res<Time>, mut q: Query<&mut Transform, With<Spin>>) {
     for mut t in &mut q {
         t.rotate_y(time.delta_secs());
     }
 }
 
-fn contar(mut n: Local<u32>, time: Res<Time>, mut salir: MessageWriter<AppExit>) {
+fn count_frames(mut n: Local<u32>, time: Res<Time>, mut exit: MessageWriter<AppExit>) {
     *n += 1;
     if *n % 120 == 0 {
         info!("frame {} at {:.1} s", *n, time.elapsed_secs());
     }
     if time.elapsed_secs() > 20.0 {
         info!("done after {} frames", *n);
-        salir.write(AppExit::Success);
+        exit.write(AppExit::Success);
     }
 }
 
 fn main() {
     let _ = std::fs::create_dir_all("sdmc:/wow-nx");
-    *ARCHIVO.lock().unwrap() = std::fs::File::create(REGISTRO).ok();
-    std::panic::set_hook(Box::new(|p| anotar(&format!("PANIC: {p}"))));
-    anotar("start");
+    *LOG_FILE.lock().unwrap() = std::fs::File::create(LOG_PATH).ok();
+    std::panic::set_hook(Box::new(|p| log_line(&format!("PANIC: {p}"))));
+    log_line("start");
     // No executable path on the Switch: bevy_asset's root.
     std::env::set_var("BEVY_ASSET_ROOT", "sdmc:/wow-nx");
 
@@ -160,7 +160,7 @@ fn main() {
         .add_plugins(
             DefaultPlugins
                 .set(LogPlugin {
-                    custom_layer: registro,
+                    custom_layer: log_layer,
                     ..default()
                 })
                 .set(WindowPlugin {
@@ -181,9 +181,9 @@ fn main() {
                     ..default()
                 }),
         )
-        .add_systems(Startup, escena)
-        .add_systems(PreUpdate, dar_ventana)
-        .add_systems(Update, (girar, contar))
-        .set_runner(bucle)
+        .add_systems(Startup, setup_scene)
+        .add_systems(PreUpdate, give_window_handle)
+        .add_systems(Update, (spin, count_frames))
+        .set_runner(run_loop)
         .run();
 }

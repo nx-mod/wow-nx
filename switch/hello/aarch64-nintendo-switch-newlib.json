@@ -7,7 +7,7 @@
   "exe-suffix": ".elf",
   "executables": true,
   "features": "+v8a,+neon,+crypto,+crc",
-  "has-thread-local": false,
+  "has-thread-local": true,
   "linker": "/opt/devkitpro/devkitA64/bin/aarch64-none-elf-gcc",
   "linker-flavor": "gnu-cc",
   "llvm-target": "aarch64-unknown-none",
@@ -39,6 +39,7 @@
   },
   "relocation-model": "pic",
   "relro-level": "off",
+  "tls-model": "local-exec",
   "stack-probes": {
     "kind": "inline"
   },

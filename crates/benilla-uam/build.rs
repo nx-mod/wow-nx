@@ -25,10 +25,10 @@ fn main() {
         let mb = std::fs::read_to_string(mesa.join(sub).join("meson.build")).unwrap();
         println!("cargo:rerun-if-changed={}", mesa.join(sub).join("meson.build").display());
         // every 'name' inside files(...)
-        for bloque in mb.split("files(").skip(1) {
-            let bloque = &bloque[..bloque.find(')').unwrap_or(bloque.len())];
-            for nombre in bloque.split('\'').skip(1).step_by(2) {
-                let f = mesa.join(sub).join(nombre);
+        for block in mb.split("files(").skip(1) {
+            let block = &block[..block.find(')').unwrap_or(block.len())];
+            for name in block.split('\'').skip(1).step_by(2) {
+                let f = mesa.join(sub).join(name);
                 match f.extension().and_then(|e| e.to_str()) {
                     Some("c") => c.push(f),
                     Some("cpp" | "cc") => cpp.push(f),
@@ -37,9 +37,9 @@ fn main() {
             }
         }
     }
-    let incluir = [uam.clone(), uam.join("source"), mesa.clone(), gen.clone(), gen.join("glsl"), gen.join("glsl/glcpp")];
-    let comun = |b: &mut cc::Build| {
-        b.includes(&incluir)
+    let includes = [uam.clone(), uam.join("source"), mesa.clone(), gen.clone(), gen.join("glsl"), gen.join("glsl/glcpp")];
+    let common = |b: &mut cc::Build| {
+        b.includes(&includes)
             .define("PACKAGE_STRING", "\"uam 1.1.0\"")
             .define("DESKTOP", None)
             .define("_USE_MATH_DEFINES", None)
@@ -54,10 +54,10 @@ fn main() {
             .warnings(false);
     };
     let mut bc = cc::Build::new();
-    comun(&mut bc);
+    common(&mut bc);
     bc.std("c99").flag("-Werror=implicit-function-declaration").files(&c).compile("uam_c");
     let mut bx = cc::Build::new();
-    comun(&mut bx);
+    common(&mut bx);
     // c++11: the flex output uses 'register', gone in C++17
     bx.cpp(true).std("c++11").cpp_link_stdlib("stdc++").files(&cpp).compile("uam");
     println!("cargo:rerun-if-changed=uam_c.cpp");

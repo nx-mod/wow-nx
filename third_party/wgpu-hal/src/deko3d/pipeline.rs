@@ -14,12 +14,12 @@ use super::ffi::*;
 
 /// The vertex stage's uniform buffer slot for the draw's first instance (`naga_vs_first_instance`): Maxwell's
 /// `gl_InstanceID` does not include it, and WebGPU's `instance_index` does.
-pub(super) const SLOT_PRIMERA_INSTANCIA: u32 = benilla_uam::SLOT_PRIMERA_INSTANCIA;
+pub(super) const FIRST_INSTANCE_SLOT: u32 = benilla_uam::FIRST_INSTANCE_SLOT;
 /// Every stage's uniform buffer slot for push constants, which naga writes as a loose uniform.
-pub(super) const SLOT_CONSTANTES: u32 = benilla_uam::SLOT_CONSTANTES;
+pub(super) const PUSH_CONSTANT_SLOT: u32 = benilla_uam::PUSH_CONSTANT_SLOT;
 /// Where they live in the driver's uniform buffer (the first instance is at 0).
-pub(super) const DESPLAZAMIENTO_CONSTANTES: u64 = 256;
-pub(super) const TAMANO_CONSTANTES: u32 = 256;
+pub(super) const PUSH_CONSTANT_OFFSET: u64 = 256;
+pub(super) const PUSH_CONSTANT_SIZE: u32 = 256;
 
 #[derive(Debug)]
 pub struct ShaderModule {
@@ -28,49 +28,49 @@ pub struct ShaderModule {
 
 #[derive(Debug)]
 pub struct BindGroupLayout {
-    pub(super) entradas: Arc<[wgt::BindGroupLayoutEntry]>,
+    pub(super) entries: Arc<[wgt::BindGroupLayoutEntry]>,
 }
 
 #[derive(Debug)]
-pub(super) struct Grupo {
-    pub(super) entradas: Arc<[wgt::BindGroupLayoutEntry]>,
+pub(super) struct GroupLayout {
+    pub(super) entries: Arc<[wgt::BindGroupLayoutEntry]>,
     /// The slot of each binding number (`!0` for numbers the group does not use).
-    pub(super) ranuras: Box<[u8]>,
+    pub(super) slots: Box<[u8]>,
 }
 
 #[derive(Debug)]
 pub struct PipelineLayout {
-    pub(super) grupos: Box<[Grupo]>,
-    mapa: glsl::BindingMap,
+    pub(super) groups: Box<[GroupLayout]>,
+    binding_map: glsl::BindingMap,
 }
 
 impl PipelineLayout {
-    fn ranura(&self, br: &naga::ResourceBinding) -> u8 {
-        self.grupos[br.group as usize].ranuras[br.binding as usize]
+    fn slot(&self, br: &naga::ResourceBinding) -> u8 {
+        self.groups[br.group as usize].slots[br.binding as usize]
     }
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(super) enum Tipo {
-    Uniforme { gpu: DkGpuAddr, tamano: u32, dinamico: bool },
-    Almacen { gpu: DkGpuAddr, tamano: u32, dinamico: bool },
-    Textura { descriptor: u32 },
-    Imagen { descriptor: u32 },
-    Muestreador { descriptor: u32 },
+pub(super) enum Kind {
+    Uniform { gpu: DkGpuAddr, size: u32, dynamic: bool },
+    Storage { gpu: DkGpuAddr, size: u32, dynamic: bool },
+    SampledTexture { descriptor: u32 },
+    StorageImage { descriptor: u32 },
+    BoundSampler { descriptor: u32 },
 }
 
 /// One resource of a bind group. Its slot comes from the pipeline layout it is bound with: the binding's slot plus
-/// `indice` (its place in a binding array).
+/// `array_index` (its place in a binding array).
 #[derive(Clone, Copy, Debug)]
-pub(super) struct Recurso {
+pub(super) struct BoundResource {
     pub(super) binding: u32,
-    pub(super) indice: u8,
-    pub(super) tipo: Tipo,
+    pub(super) array_index: u8,
+    pub(super) kind: Kind,
 }
 
 #[derive(Debug)]
 pub struct BindGroup {
-    pub(super) recursos: Box<[Recurso]>,
+    pub(super) resources: Box<[BoundResource]>,
 }
 
 #[derive(Debug)]
@@ -80,44 +80,44 @@ pub struct Sampler {
 
 /// One compiled stage: deko3d's shader object, its code in the device's code memory.
 #[derive(Debug)]
-pub(super) struct Etapa {
+pub(super) struct CompiledStage {
     pub(super) shader: Box<DkShader>,
 }
 
 /// What a pipeline's shaders read, besides buffers: per texture slot, the sampler slot it is combined with.
 #[derive(Debug, Default, Clone)]
-pub(super) struct Muestreo {
-    pub(super) texturas: Vec<(u8, Option<u8>)>,
-    pub(super) imagenes: Vec<u8>,
+pub(super) struct Sampling {
+    pub(super) textures: Vec<(u8, Option<u8>)>,
+    pub(super) images: Vec<u8>,
 }
 
 #[derive(Debug)]
 pub struct RenderPipeline {
-    pub(super) vs: Etapa,
-    pub(super) fs: Option<Etapa>,
-    pub(super) muestreo: Muestreo,
-    pub(super) primera_instancia: bool,
-    pub(super) constantes: bool,
-    pub(super) primitiva: DkPrimitive,
-    pub(super) tira: bool,
-    pub(super) rasterizador: DkRasterizerState,
-    pub(super) multimuestra: DkMultisampleState,
-    pub(super) mascara_muestras: u32,
+    pub(super) vs: CompiledStage,
+    pub(super) fs: Option<CompiledStage>,
+    pub(super) sampling: Sampling,
+    pub(super) first_instance: bool,
+    pub(super) push_constants: bool,
+    pub(super) primitive: DkPrimitive,
+    pub(super) strip: bool,
+    pub(super) rasterizer: DkRasterizerState,
+    pub(super) multisample: DkMultisampleState,
+    pub(super) sample_mask: u32,
     pub(super) color: DkColorState,
-    pub(super) escritura: DkColorWriteState,
-    pub(super) mezclas: Vec<DkBlendState>,
-    pub(super) profundidad: DkDepthStencilState,
-    pub(super) sesgo: (f32, f32, f32),
-    pub(super) plantilla: (u8, u8),
-    pub(super) atributos: Vec<DkVtxAttribState>,
-    pub(super) buferes: Vec<DkVtxBufferState>,
+    pub(super) color_write: DkColorWriteState,
+    pub(super) blends: Vec<DkBlendState>,
+    pub(super) depth: DkDepthStencilState,
+    pub(super) depth_bias: (f32, f32, f32),
+    pub(super) stencil: (u8, u8),
+    pub(super) attribs: Vec<DkVtxAttribState>,
+    pub(super) vertex_buffers: Vec<DkVtxBufferState>,
 }
 
 #[derive(Debug)]
 pub struct ComputePipeline {
-    pub(super) cs: Etapa,
-    pub(super) constantes: bool,
-    pub(super) muestreo: Muestreo,
+    pub(super) cs: CompiledStage,
+    pub(super) push_constants: bool,
+    pub(super) sampling: Sampling,
 }
 
 unsafe impl Send for RenderPipeline {}
@@ -126,21 +126,21 @@ unsafe impl Send for ComputePipeline {}
 unsafe impl Sync for ComputePipeline {}
 
 impl super::Device {
-    pub(super) fn nuevo_layout_grupos(&self, desc: &crate::BindGroupLayoutDescriptor) -> BindGroupLayout {
+    pub(super) fn new_bind_group_layout(&self, desc: &crate::BindGroupLayoutDescriptor) -> BindGroupLayout {
         BindGroupLayout {
-            entradas: Arc::from(desc.entries),
+            entries: Arc::from(desc.entries),
         }
     }
 
-    pub(super) fn nuevo_layout(&self, desc: &crate::PipelineLayoutDescriptor<BindGroupLayout>) -> PipelineLayout {
-        let mut cuentas = [0u8; 5];
-        let mut mapa = glsl::BindingMap::default();
-        let mut grupos = Vec::with_capacity(desc.bind_group_layouts.len());
+    pub(super) fn new_pipeline_layout(&self, desc: &crate::PipelineLayoutDescriptor<BindGroupLayout>) -> PipelineLayout {
+        let mut counts = [0u8; 5];
+        let mut binding_map = glsl::BindingMap::default();
+        let mut groups = Vec::with_capacity(desc.bind_group_layouts.len());
         for (g, bgl) in desc.bind_group_layouts.iter().enumerate() {
-            let maximo = bgl.entradas.iter().map(|e| e.binding as usize + 1).max().unwrap_or(0);
-            let mut ranuras = alloc::vec![!0u8; maximo].into_boxed_slice();
-            for e in bgl.entradas.iter() {
-                let tipo = match e.ty {
+            let max_binding = bgl.entries.iter().map(|e| e.binding as usize + 1).max().unwrap_or(0);
+            let mut slots = alloc::vec![!0u8; max_binding].into_boxed_slice();
+            for e in bgl.entries.iter() {
+                let kind = match e.ty {
                     wgt::BindingType::Buffer { ty: wgt::BufferBindingType::Uniform, .. } => 0,
                     wgt::BindingType::Buffer { .. } => 1,
                     wgt::BindingType::Texture { .. } => 2,
@@ -148,79 +148,79 @@ impl super::Device {
                     wgt::BindingType::StorageTexture { .. } => 4,
                     _ => continue,
                 };
-                ranuras[e.binding as usize] = cuentas[tipo];
-                mapa.insert(naga::ResourceBinding { group: g as u32, binding: e.binding }, cuentas[tipo]);
-                cuentas[tipo] += e.count.map_or(1, |c| c.get() as u8);
+                slots[e.binding as usize] = counts[kind];
+                binding_map.insert(naga::ResourceBinding { group: g as u32, binding: e.binding }, counts[kind]);
+                counts[kind] += e.count.map_or(1, |c| c.get() as u8);
             }
-            grupos.push(Grupo {
-                entradas: bgl.entradas.clone(),
-                ranuras,
+            groups.push(GroupLayout {
+                entries: bgl.entries.clone(),
+                slots,
             });
         }
         PipelineLayout {
-            grupos: grupos.into_boxed_slice(),
-            mapa,
+            groups: groups.into_boxed_slice(),
+            binding_map,
         }
     }
 
-    pub(super) fn nuevo_grupo(
+    pub(super) fn new_bind_group(
         &self,
         desc: &crate::BindGroupDescriptor<BindGroupLayout, super::Buffer, Sampler, super::TextureView, super::Resource>,
     ) -> BindGroup {
-        let mut recursos = Vec::new();
-        for entrada in desc.entries {
-            let Some(layout) = desc.layout.entradas.iter().find(|e| e.binding == entrada.binding) else {
+        let mut resources = Vec::new();
+        for entry in desc.entries {
+            let Some(layout) = desc.layout.entries.iter().find(|e| e.binding == entry.binding) else {
                 continue;
             };
-            for k in 0..entrada.count.max(1) {
-                let i = (entrada.resource_index + k) as usize;
-                let tipo = match layout.ty {
+            for k in 0..entry.count.max(1) {
+                let i = (entry.resource_index + k) as usize;
+                let kind = match layout.ty {
                     wgt::BindingType::Buffer { ty, has_dynamic_offset, .. } => {
                         let b = &desc.buffers[i];
-                        let tamano = b.size.map_or(b.buffer.size - b.offset, |s| s.get()) as u32;
+                        let size = b.size.map_or(b.buffer.size - b.offset, |s| s.get()) as u32;
                         let gpu = b.buffer.gpu + b.offset;
                         if ty == wgt::BufferBindingType::Uniform {
-                            Tipo::Uniforme { gpu, tamano: tamano.min(DK_UNIFORM_BUF_MAX_SIZE), dinamico: has_dynamic_offset }
+                            Kind::Uniform { gpu, size: size.min(DK_UNIFORM_BUF_MAX_SIZE), dynamic: has_dynamic_offset }
                         } else {
-                            Tipo::Almacen { gpu, tamano, dinamico: has_dynamic_offset }
+                            Kind::Storage { gpu, size, dynamic: has_dynamic_offset }
                         }
                     }
-                    wgt::BindingType::Texture { .. } => Tipo::Textura {
+                    wgt::BindingType::Texture { .. } => Kind::SampledTexture {
                         descriptor: desc.textures[i].view.descriptor.unwrap_or(0),
                     },
-                    wgt::BindingType::StorageTexture { .. } => Tipo::Imagen {
+                    wgt::BindingType::StorageTexture { .. } => Kind::StorageImage {
                         descriptor: desc.textures[i].view.descriptor.unwrap_or(0),
                     },
-                    wgt::BindingType::Sampler(_) => Tipo::Muestreador {
+                    wgt::BindingType::Sampler(_) => Kind::BoundSampler {
                         descriptor: desc.samplers[i].descriptor,
                     },
                     _ => continue,
                 };
-                recursos.push(Recurso {
-                    binding: entrada.binding,
-                    indice: k as u8,
-                    tipo,
+                resources.push(BoundResource {
+                    binding: entry.binding,
+                    array_index: k as u8,
+                    kind,
                 });
             }
         }
         BindGroup {
-            recursos: recursos.into_boxed_slice(),
+            resources: resources.into_boxed_slice(),
         }
     }
 
-    pub(super) fn nuevo_muestreador(&self, desc: &crate::SamplerDescriptor) -> Result<Sampler, crate::DeviceError> {
+    pub(super) fn new_sampler(&self, desc: &crate::SamplerDescriptor) -> Result<Sampler, crate::DeviceError> {
         // Not zeroed: DkFilter and DkCompareOp have no 0. deko3d's defaults fill every field.
         let mut s = unsafe {
             let mut m = core::mem::MaybeUninit::<DkSampler>::uninit();
             dkSamplerDefaults(m.as_mut_ptr());
             m.assume_init()
         };
-        let filtro = |f: wgt::FilterMode| match f {
+        let filter = |f: wgt::FilterMode| match f {
             wgt::FilterMode::Nearest => DkFilter::DkFilter_Nearest,
             wgt::FilterMode::Linear => DkFilter::DkFilter_Linear,
         };
-        s.minFilter = filtro(desc.min_filter);
-        s.magFilter = filtro(desc.mag_filter);
+        s.minFilter = filter(desc.min_filter);
+        s.magFilter = filter(desc.mag_filter);
         s.mipFilter = match desc.mipmap_filter {
             wgt::FilterMode::Nearest => DkMipFilter::DkMipFilter_Nearest,
             wgt::FilterMode::Linear => DkMipFilter::DkMipFilter_Linear,
@@ -237,269 +237,269 @@ impl super::Device {
         s.lodClampMax = desc.lod_clamp.end;
         if let Some(c) = desc.compare {
             s.compareEnable = true;
-            s.compareOp = comparacion(c);
+            s.compareOp = compare_op(c);
         }
         s.maxAnisotropy = desc.anisotropy_clamp.max(1) as f32;
-        let borde = match desc.border_color {
+        let border = match desc.border_color {
             Some(wgt::SamplerBorderColor::OpaqueBlack) => [0.0, 0.0, 0.0, 1.0],
             Some(wgt::SamplerBorderColor::OpaqueWhite) => [1.0; 4],
             _ => [0.0; 4],
         };
-        for (d, v) in s.borderColor.iter_mut().zip(borde) {
+        for (d, v) in s.borderColor.iter_mut().zip(border) {
             d.value_f = v;
         }
-        let descriptor = self.compartido.descriptores.lock().nuevo_muestreador(&s).ok_or(crate::DeviceError::OutOfMemory)?;
+        let descriptor = self.shared.descriptors.lock().new_sampler(&s).ok_or(crate::DeviceError::OutOfMemory)?;
         Ok(Sampler { descriptor })
     }
 
     /// GLSL for one stage, with the texture/sampler pairs naga combined.
     fn glsl(
         &self,
-        etapa: &crate::ProgrammableStage<ShaderModule>,
-        naga_etapa: naga::ShaderStage,
+        stage: &crate::ProgrammableStage<ShaderModule>,
+        naga_stage: naga::ShaderStage,
         layout: &PipelineLayout,
-        muestreo: &mut Muestreo,
+        sampling: &mut Sampling,
     ) -> Result<String, crate::PipelineError> {
-        let wgt_etapa = etapa_wgt(naga_etapa);
+        let wgt_stage_flags = wgt_stage(naga_stage);
         let (module, info) = naga::back::pipeline_constants::process_overrides(
-            &etapa.module.naga.module,
-            &etapa.module.naga.info,
-            Some((naga_etapa, etapa.entry_point)),
-            etapa.constants,
+            &stage.module.naga.module,
+            &stage.module.naga.info,
+            Some((naga_stage, stage.entry_point)),
+            stage.constants,
         )
-        .map_err(|e| crate::PipelineError::PipelineConstants(wgt_etapa, format!("{e}")))?;
-        let (salida, reflejo, _, _) = benilla_uam::escribir_glsl(
+        .map_err(|e| crate::PipelineError::PipelineConstants(wgt_stage_flags, format!("{e}")))?;
+        let (output, reflection, _, _) = benilla_uam::write_glsl(
             &module,
             &info,
-            naga_etapa,
-            etapa.entry_point,
-            layout.mapa.clone(),
-            etapa.zero_initialize_workgroup_memory,
+            naga_stage,
+            stage.entry_point,
+            layout.binding_map.clone(),
+            stage.zero_initialize_workgroup_memory,
         )
-        .map_err(|e| crate::PipelineError::Linkage(wgt_etapa, e))?;
-        for (_, m) in reflejo.texture_mapping {
+        .map_err(|e| crate::PipelineError::Linkage(wgt_stage_flags, e))?;
+        for (_, m) in reflection.texture_mapping {
             let var = &module.global_variables[m.texture];
-            let ranura = layout.ranura(var.binding.as_ref().unwrap());
-            let almacen = matches!(module.types[var.ty].inner, naga::TypeInner::Image { class: naga::ImageClass::Storage { .. }, .. });
-            if almacen {
-                if !muestreo.imagenes.contains(&ranura) {
-                    muestreo.imagenes.push(ranura);
+            let slot = layout.slot(var.binding.as_ref().unwrap());
+            let storage = matches!(module.types[var.ty].inner, naga::TypeInner::Image { class: naga::ImageClass::Storage { .. }, .. });
+            if storage {
+                if !sampling.images.contains(&slot) {
+                    sampling.images.push(slot);
                 }
                 continue;
             }
-            let muestreador = m.sampler.map(|s| layout.ranura(module.global_variables[s].binding.as_ref().unwrap()));
-            if !muestreo.texturas.iter().any(|(t, _)| *t == ranura) {
-                muestreo.texturas.push((ranura, muestreador));
+            let sampler = m.sampler.map(|s| layout.slot(module.global_variables[s].binding.as_ref().unwrap()));
+            if !sampling.textures.iter().any(|(t, _)| *t == slot) {
+                sampling.textures.push((slot, sampler));
             }
         }
-        Ok(salida)
+        Ok(output)
     }
 
-    fn compilar(&self, glsl: &str, naga_etapa: naga::ShaderStage) -> Result<Etapa, crate::PipelineError> {
-        let etapa = match naga_etapa {
-            naga::ShaderStage::Vertex => benilla_uam::Etapa::Vertices,
-            naga::ShaderStage::Fragment => benilla_uam::Etapa::Fragmentos,
-            _ => benilla_uam::Etapa::Computo,
+    fn compile(&self, glsl: &str, naga_stage: naga::ShaderStage) -> Result<CompiledStage, crate::PipelineError> {
+        let stage = match naga_stage {
+            naga::ShaderStage::Vertex => benilla_uam::Stage::Vertex,
+            naga::ShaderStage::Fragment => benilla_uam::Stage::Fragment,
+            _ => benilla_uam::Stage::Compute,
         };
-        let dksh = benilla_uam::compilar_con_cache(etapa, glsl).map_err(|log| {
-            log::error!("uam ({naga_etapa:?}): {log}\n{glsl}");
-            crate::PipelineError::Linkage(etapa_wgt(naga_etapa), log)
+        let dksh = benilla_uam::compile_cached(stage, glsl).map_err(|log| {
+            log::error!("uam ({naga_stage:?}): {log}\n{glsl}");
+            crate::PipelineError::Linkage(wgt_stage(naga_stage), log)
         })?;
         let shader = self
-            .compartido
-            .codigo
+            .shared
+            .code
             .lock()
-            .cargar(&dksh)
-            .ok_or_else(|| crate::PipelineError::Linkage(etapa_wgt(naga_etapa), "code memory full".into()))?;
-        Ok(Etapa { shader })
+            .load(&dksh)
+            .ok_or_else(|| crate::PipelineError::Linkage(wgt_stage(naga_stage), "code memory full".into()))?;
+        Ok(CompiledStage { shader })
     }
 
-    pub(super) fn nueva_tuberia(
+    pub(super) fn new_render_pipeline(
         &self,
         desc: &crate::RenderPipelineDescriptor<PipelineLayout, ShaderModule, super::Resource>,
     ) -> Result<RenderPipeline, crate::PipelineError> {
         let crate::VertexProcessor::Standard { vertex_buffers, vertex_stage } = &desc.vertex_processor else {
             return Err(crate::PipelineError::EntryPoint(naga::ShaderStage::Task));
         };
-        let mut muestreo = Muestreo::default();
-        let glsl_vs = self.glsl(vertex_stage, naga::ShaderStage::Vertex, desc.layout, &mut muestreo)?;
-        let primera_instancia = glsl_vs.contains(glsl::FIRST_INSTANCE_BINDING);
-        let mut constantes = glsl_vs.contains("_push_constant_binding_");
-        let vs = self.compilar(&glsl_vs, naga::ShaderStage::Vertex)?;
+        let mut sampling = Sampling::default();
+        let glsl_vs = self.glsl(vertex_stage, naga::ShaderStage::Vertex, desc.layout, &mut sampling)?;
+        let first_instance = glsl_vs.contains(glsl::FIRST_INSTANCE_BINDING);
+        let mut push_constants = glsl_vs.contains("_push_constant_binding_");
+        let vs = self.compile(&glsl_vs, naga::ShaderStage::Vertex)?;
         let fs = match &desc.fragment_stage {
             Some(f) => {
-                let g = self.glsl(f, naga::ShaderStage::Fragment, desc.layout, &mut muestreo)?;
-                constantes |= g.contains("_push_constant_binding_");
-                Some(self.compilar(&g, naga::ShaderStage::Fragment)?)
+                let g = self.glsl(f, naga::ShaderStage::Fragment, desc.layout, &mut sampling)?;
+                push_constants |= g.contains("_push_constant_binding_");
+                Some(self.compile(&g, naga::ShaderStage::Fragment)?)
             }
             None => None,
         };
 
         let p = &desc.primitive;
         use wgt::PrimitiveTopology as T;
-        let primitiva = match p.topology {
+        let primitive = match p.topology {
             T::PointList => DkPrimitive::DkPrimitive_Points,
             T::LineList => DkPrimitive::DkPrimitive_Lines,
             T::LineStrip => DkPrimitive::DkPrimitive_LineStrip,
             T::TriangleList => DkPrimitive::DkPrimitive_Triangles,
             T::TriangleStrip => DkPrimitive::DkPrimitive_TriangleStrip,
         };
-        let mut rasterizador = unsafe { core::mem::zeroed::<DkRasterizerState>() };
-        unsafe { dkRasterizerStateDefaults(&mut rasterizador) };
-        rasterizador.set_cullMode(
+        let mut rasterizer = unsafe { core::mem::zeroed::<DkRasterizerState>() };
+        unsafe { dkRasterizerStateDefaults(&mut rasterizer) };
+        rasterizer.set_cullMode(
             match p.cull_mode {
                 None => DkFace::DkFace_None,
                 Some(wgt::Face::Front) => DkFace::DkFace_Front,
                 Some(wgt::Face::Back) => DkFace::DkFace_Back,
             },
         );
-        rasterizador.set_frontFace(
+        rasterizer.set_frontFace(
             match p.front_face {
                 wgt::FrontFace::Ccw => DkFrontFace::DkFrontFace_CCW,
                 wgt::FrontFace::Cw => DkFrontFace::DkFrontFace_CW,
             },
         );
-        let modo = match p.polygon_mode {
+        let mode = match p.polygon_mode {
             wgt::PolygonMode::Fill => DkPolygonMode::DkPolygonMode_Fill,
             wgt::PolygonMode::Line => DkPolygonMode::DkPolygonMode_Line,
             wgt::PolygonMode::Point => DkPolygonMode::DkPolygonMode_Point,
         };
-        rasterizador.set_polygonModeFront(modo);
-        rasterizador.set_polygonModeBack(modo);
-        rasterizador.set_depthClampEnable(p.unclipped_depth as u32);
+        rasterizer.set_polygonModeFront(mode);
+        rasterizer.set_polygonModeBack(mode);
+        rasterizer.set_depthClampEnable(p.unclipped_depth as u32);
 
-        let mut multimuestra = unsafe { core::mem::zeroed::<DkMultisampleState>() };
-        unsafe { dkMultisampleStateDefaults(&mut multimuestra) };
-        multimuestra.set_mode(super::conv::muestras(desc.multisample.count));
-        multimuestra.set_alphaToCoverageEnable(desc.multisample.alpha_to_coverage_enabled as u32);
+        let mut multisample = unsafe { core::mem::zeroed::<DkMultisampleState>() };
+        unsafe { dkMultisampleStateDefaults(&mut multisample) };
+        multisample.set_mode(super::conv::ms_mode(desc.multisample.count));
+        multisample.set_alphaToCoverageEnable(desc.multisample.alpha_to_coverage_enabled as u32);
 
         let mut color = unsafe { core::mem::zeroed::<DkColorState>() };
         unsafe { dkColorStateDefaults(&mut color) };
-        let mut escritura = unsafe { core::mem::zeroed::<DkColorWriteState>() };
-        unsafe { dkColorWriteStateDefaults(&mut escritura) };
-        let mut mezclas = Vec::with_capacity(desc.color_targets.len());
+        let mut color_write = unsafe { core::mem::zeroed::<DkColorWriteState>() };
+        unsafe { dkColorWriteStateDefaults(&mut color_write) };
+        let mut blends = Vec::with_capacity(desc.color_targets.len());
         for (i, t) in desc.color_targets.iter().enumerate() {
             let mut m = unsafe { core::mem::zeroed::<DkBlendState>() };
             unsafe { dkBlendStateDefaults(&mut m) };
             let mascara = t.as_ref().map_or(0, |t| t.write_mask.bits());
-            unsafe { dkColorWriteStateSetMask(&mut escritura, i as u32, mascara) };
+            unsafe { dkColorWriteStateSetMask(&mut color_write, i as u32, mascara) };
             if let Some(b) = t.as_ref().and_then(|t| t.blend) {
                 unsafe {
                     dkColorStateSetBlendEnable(&mut color, i as u32, true);
-                    dkBlendStateSetOps(&mut m, operacion(b.color.operation), operacion(b.alpha.operation));
+                    dkBlendStateSetOps(&mut m, blend_op(b.color.operation), blend_op(b.alpha.operation));
                     dkBlendStateSetFactors(
                         &mut m,
-                        factor(b.color.src_factor),
-                        factor(b.color.dst_factor),
-                        factor(b.alpha.src_factor),
-                        factor(b.alpha.dst_factor),
+                        blend_factor(b.color.src_factor),
+                        blend_factor(b.color.dst_factor),
+                        blend_factor(b.alpha.src_factor),
+                        blend_factor(b.alpha.dst_factor),
                     );
                 }
             }
-            mezclas.push(m);
+            blends.push(m);
         }
 
-        let mut profundidad = unsafe { core::mem::zeroed::<DkDepthStencilState>() };
-        unsafe { dkDepthStencilStateDefaults(&mut profundidad) };
-        let (mut sesgo, mut plantilla) = ((0.0, 0.0, 0.0), (0xff, 0xff));
+        let mut depth = unsafe { core::mem::zeroed::<DkDepthStencilState>() };
+        unsafe { dkDepthStencilStateDefaults(&mut depth) };
+        let (mut depth_bias, mut stencil) = ((0.0, 0.0, 0.0), (0xff, 0xff));
         match &desc.depth_stencil {
             Some(ds) => {
-                let compara = ds.depth_compare;
-                let escribe = ds.depth_write_enabled;
-                profundidad.set_depthTestEnable((compara != wgt::CompareFunction::Always || escribe) as u32);
-                profundidad.set_depthWriteEnable(escribe as u32);
-                profundidad.set_depthCompareOp(comparacion(compara));
+                let compare = ds.depth_compare;
+                let writes = ds.depth_write_enabled;
+                depth.set_depthTestEnable((compare != wgt::CompareFunction::Always || writes) as u32);
+                depth.set_depthWriteEnable(writes as u32);
+                depth.set_depthCompareOp(compare_op(compare));
                 if ds.stencil.is_enabled() {
-                    profundidad.set_stencilTestEnable(1);
+                    depth.set_stencilTestEnable(1);
                     let (f, b) = (&ds.stencil.front, &ds.stencil.back);
-                    profundidad.set_stencilFrontFailOp(op_plantilla(f.fail_op));
-                    profundidad.set_stencilFrontPassOp(op_plantilla(f.pass_op));
-                    profundidad.set_stencilFrontDepthFailOp(op_plantilla(f.depth_fail_op));
-                    profundidad.set_stencilFrontCompareOp(comparacion(f.compare));
-                    profundidad.set_stencilBackFailOp(op_plantilla(b.fail_op));
-                    profundidad.set_stencilBackPassOp(op_plantilla(b.pass_op));
-                    profundidad.set_stencilBackDepthFailOp(op_plantilla(b.depth_fail_op));
-                    profundidad.set_stencilBackCompareOp(comparacion(b.compare));
-                    plantilla = (ds.stencil.read_mask as u8, ds.stencil.write_mask as u8);
+                    depth.set_stencilFrontFailOp(stencil_op(f.fail_op));
+                    depth.set_stencilFrontPassOp(stencil_op(f.pass_op));
+                    depth.set_stencilFrontDepthFailOp(stencil_op(f.depth_fail_op));
+                    depth.set_stencilFrontCompareOp(compare_op(f.compare));
+                    depth.set_stencilBackFailOp(stencil_op(b.fail_op));
+                    depth.set_stencilBackPassOp(stencil_op(b.pass_op));
+                    depth.set_stencilBackDepthFailOp(stencil_op(b.depth_fail_op));
+                    depth.set_stencilBackCompareOp(compare_op(b.compare));
+                    stencil = (ds.stencil.read_mask as u8, ds.stencil.write_mask as u8);
                 }
                 if ds.bias.is_enabled() {
-                    rasterizador.set_depthBiasEnableMask(DkPolygonFlag_All);
-                    sesgo = (ds.bias.constant as f32, ds.bias.clamp, ds.bias.slope_scale);
+                    rasterizer.set_depthBiasEnableMask(DkPolygonFlag_All);
+                    depth_bias = (ds.bias.constant as f32, ds.bias.clamp, ds.bias.slope_scale);
                 }
             }
             None => {
-                profundidad.set_depthTestEnable(0);
-                profundidad.set_depthWriteEnable(0);
+                depth.set_depthTestEnable(0);
+                depth.set_depthWriteEnable(0);
             }
         }
 
-        let mut atributos = Vec::new();
-        let mut buferes = Vec::new();
+        let mut attribs = Vec::new();
+        let mut buffer_states = Vec::new();
         for (i, vb) in vertex_buffers.iter().enumerate() {
-            buferes.push(DkVtxBufferState {
+            buffer_states.push(DkVtxBufferState {
                 stride: vb.array_stride as u32,
                 divisor: (vb.step_mode == wgt::VertexStepMode::Instance) as u32,
             });
             for a in vb.attributes {
-                let (tamano, tipo, bgra) = formato_vertice(a.format);
+                let (size, kind, bgra) = vertex_format(a.format);
                 let mut s = unsafe { core::mem::zeroed::<DkVtxAttribState>() };
                 s.set_bufferId(i as u32);
                 s.set_isFixed(0);
                 s.set_offset(a.offset as u32);
-                s.set_size(tamano);
-                s.set_type(tipo);
+                s.set_size(size);
+                s.set_type(kind);
                 s.set_isBgra(bgra as u32);
                 let l = a.shader_location as usize;
-                if atributos.len() <= l {
+                if attribs.len() <= l {
                     // Locations the shader does not read stay fixed (constant zero).
-                    let mut fijo = unsafe { core::mem::zeroed::<DkVtxAttribState>() };
-                    fijo.set_isFixed(1);
-                    fijo.set_size(DkVtxAttribSize::DkVtxAttribSize_1x32);
-                    fijo.set_type(DkVtxAttribType::DkVtxAttribType_Float);
-                    atributos.resize(l + 1, fijo);
+                    let mut fixed = unsafe { core::mem::zeroed::<DkVtxAttribState>() };
+                    fixed.set_isFixed(1);
+                    fixed.set_size(DkVtxAttribSize::DkVtxAttribSize_1x32);
+                    fixed.set_type(DkVtxAttribType::DkVtxAttribType_Float);
+                    attribs.resize(l + 1, fixed);
                 }
-                atributos[l] = s;
+                attribs[l] = s;
             }
         }
 
         Ok(RenderPipeline {
             vs,
             fs,
-            muestreo,
-            primera_instancia,
-            constantes,
-            primitiva,
-            tira: p.strip_index_format.is_some() || matches!(p.topology, T::LineStrip | T::TriangleStrip),
-            rasterizador,
-            multimuestra,
+            sampling,
+            first_instance,
+            push_constants,
+            primitive,
+            strip: p.strip_index_format.is_some() || matches!(p.topology, T::LineStrip | T::TriangleStrip),
+            rasterizer,
+            multisample,
             // WebGPU's mask is 64 bits of ones by default; Maxwell's method takes 16 (a GPU method error otherwise).
-            mascara_muestras: (desc.multisample.mask & 0xffff) as u32,
+            sample_mask: (desc.multisample.mask & 0xffff) as u32,
             color,
-            escritura,
-            mezclas,
-            profundidad,
-            sesgo,
-            plantilla,
-            atributos,
-            buferes,
+            color_write,
+            blends,
+            depth,
+            depth_bias,
+            stencil,
+            attribs,
+            vertex_buffers: buffer_states,
         })
     }
 
-    pub(super) fn nueva_tuberia_computo(
+    pub(super) fn new_compute_pipeline(
         &self,
         desc: &crate::ComputePipelineDescriptor<PipelineLayout, ShaderModule, super::Resource>,
     ) -> Result<ComputePipeline, crate::PipelineError> {
-        let mut muestreo = Muestreo::default();
-        let g = self.glsl(&desc.stage, naga::ShaderStage::Compute, desc.layout, &mut muestreo)?;
+        let mut sampling = Sampling::default();
+        let g = self.glsl(&desc.stage, naga::ShaderStage::Compute, desc.layout, &mut sampling)?;
         Ok(ComputePipeline {
-            constantes: g.contains("_push_constant_binding_"),
-            cs: self.compilar(&g, naga::ShaderStage::Compute)?,
-            muestreo,
+            push_constants: g.contains("_push_constant_binding_"),
+            cs: self.compile(&g, naga::ShaderStage::Compute)?,
+            sampling,
         })
     }
 }
 
-fn etapa_wgt(e: naga::ShaderStage) -> wgt::ShaderStages {
+fn wgt_stage(e: naga::ShaderStage) -> wgt::ShaderStages {
     match e {
         naga::ShaderStage::Vertex => wgt::ShaderStages::VERTEX,
         naga::ShaderStage::Fragment => wgt::ShaderStages::FRAGMENT,
@@ -507,7 +507,7 @@ fn etapa_wgt(e: naga::ShaderStage) -> wgt::ShaderStages {
     }
 }
 
-pub(super) fn comparacion(c: wgt::CompareFunction) -> DkCompareOp {
+pub(super) fn compare_op(c: wgt::CompareFunction) -> DkCompareOp {
     use wgt::CompareFunction as C;
     use DkCompareOp as D;
     match c {
@@ -522,7 +522,7 @@ pub(super) fn comparacion(c: wgt::CompareFunction) -> DkCompareOp {
     }
 }
 
-fn op_plantilla(o: wgt::StencilOperation) -> DkStencilOp {
+fn stencil_op(o: wgt::StencilOperation) -> DkStencilOp {
     use wgt::StencilOperation as S;
     use DkStencilOp as D;
     match o {
@@ -537,7 +537,7 @@ fn op_plantilla(o: wgt::StencilOperation) -> DkStencilOp {
     }
 }
 
-fn operacion(o: wgt::BlendOperation) -> DkBlendOp {
+fn blend_op(o: wgt::BlendOperation) -> DkBlendOp {
     use wgt::BlendOperation as B;
     use DkBlendOp as D;
     match o {
@@ -549,7 +549,7 @@ fn operacion(o: wgt::BlendOperation) -> DkBlendOp {
     }
 }
 
-fn factor(f: wgt::BlendFactor) -> DkBlendFactor {
+fn blend_factor(f: wgt::BlendFactor) -> DkBlendFactor {
     use wgt::BlendFactor as B;
     use DkBlendFactor as D;
     match f {
@@ -573,7 +573,7 @@ fn factor(f: wgt::BlendFactor) -> DkBlendFactor {
     }
 }
 
-fn formato_vertice(f: wgt::VertexFormat) -> (DkVtxAttribSize, DkVtxAttribType, bool) {
+fn vertex_format(f: wgt::VertexFormat) -> (DkVtxAttribSize, DkVtxAttribType, bool) {
     use wgt::VertexFormat as V;
     use DkVtxAttribSize as S;
     use DkVtxAttribType as T;

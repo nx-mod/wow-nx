@@ -13,7 +13,7 @@ crate-type = ["rlib", "staticlib"]
 benilla-horizon = { path = "../../crates/benilla-horizon" }
 # Step 2's first crate on the console: the game's MPQ archives, if they are on the SD card.
 benilla-mpq = { path = "../../crates/benilla-mpq" }
-# Only for src/tipos.rs, the compile-time check of its C types against devkitA64's newlib.
+# Only for src/layouts.rs, the compile-time check of its C types against devkitA64's newlib.
 libc = "0.2"
 
 

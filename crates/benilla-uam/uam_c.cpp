@@ -4,22 +4,22 @@
 
 #include "uam_api.h"
 
-extern "C" int benilla_uam_compilar(int etapa, const char* glsl, unsigned char** dksh, size_t* tamano, char** registro) {
-    static bool iniciado = false;
-    if (!iniciado) {
+extern "C" int benilla_uam_compile(int stage, const char* glsl, unsigned char** dksh, size_t* size, char** log) {
+    static bool initialized = false;
+    if (!initialized) {
         uam::init(true);
-        iniciado = true;
+        initialized = true;
     }
-    uam::Result r = uam::compile(static_cast<uam::Stage>(etapa), glsl);
+    uam::Result r = uam::compile(static_cast<uam::Stage>(stage), glsl);
     *dksh = nullptr;
-    *tamano = 0;
+    *size = 0;
     if (r.ok && !r.dksh.empty()) {
         *dksh = static_cast<unsigned char*>(std::malloc(r.dksh.size()));
         std::memcpy(*dksh, r.dksh.data(), r.dksh.size());
-        *tamano = r.dksh.size();
+        *size = r.dksh.size();
     }
-    *registro = strdup(r.log.c_str());
+    *log = strdup(r.log.c_str());
     return r.ok ? 1 : 0;
 }
 
-extern "C" void benilla_uam_liberar(void* p) { std::free(p); }
+extern "C" void benilla_uam_free(void* p) { std::free(p); }

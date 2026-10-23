@@ -2,7 +2,7 @@
 
 use super::ffi::{DkImageFormat, DkImageType};
 
-pub(super) fn formato(format: wgt::TextureFormat) -> Option<DkImageFormat> {
+pub(super) fn dk_format(format: wgt::TextureFormat) -> Option<DkImageFormat> {
     use wgt::TextureFormat as T;
     use DkImageFormat as F;
     Some(match format {
@@ -74,14 +74,14 @@ pub(super) fn formato(format: wgt::TextureFormat) -> Option<DkImageFormat> {
 }
 
 /// The type an image is laid out as. Cube textures are 2D arrays; their views say cube.
-pub(super) fn tipo_imagen(desc: &crate::TextureDescriptor) -> DkImageType {
+pub(super) fn image_type(desc: &crate::TextureDescriptor) -> DkImageType {
     use DkImageType as I;
-    let capas = desc.size.depth_or_array_layers;
+    let layers = desc.size.depth_or_array_layers;
     match desc.dimension {
-        wgt::TextureDimension::D1 if capas > 1 => I::DkImageType_1DArray,
+        wgt::TextureDimension::D1 if layers > 1 => I::DkImageType_1DArray,
         wgt::TextureDimension::D1 => I::DkImageType_1D,
         wgt::TextureDimension::D3 => I::DkImageType_3D,
-        wgt::TextureDimension::D2 => match (desc.sample_count > 1, capas > 1) {
+        wgt::TextureDimension::D2 => match (desc.sample_count > 1, layers > 1) {
             (true, true) => I::DkImageType_2DMSArray,
             (true, false) => I::DkImageType_2DMS,
             (false, true) => I::DkImageType_2DArray,
@@ -90,14 +90,14 @@ pub(super) fn tipo_imagen(desc: &crate::TextureDescriptor) -> DkImageType {
     }
 }
 
-pub(super) fn tipo_vista(dim: wgt::TextureViewDimension, multimuestra: bool) -> DkImageType {
+pub(super) fn view_type(dim: wgt::TextureViewDimension, multisample: bool) -> DkImageType {
     use wgt::TextureViewDimension as V;
     use DkImageType as I;
     match dim {
         V::D1 => I::DkImageType_1D,
-        V::D2 if multimuestra => I::DkImageType_2DMS,
+        V::D2 if multisample => I::DkImageType_2DMS,
         V::D2 => I::DkImageType_2D,
-        V::D2Array if multimuestra => I::DkImageType_2DMSArray,
+        V::D2Array if multisample => I::DkImageType_2DMSArray,
         V::D2Array => I::DkImageType_2DArray,
         V::Cube => I::DkImageType_Cubemap,
         V::CubeArray => I::DkImageType_CubemapArray,
@@ -105,9 +105,9 @@ pub(super) fn tipo_vista(dim: wgt::TextureViewDimension, multimuestra: bool) -> 
     }
 }
 
-pub(super) fn muestras(cuenta: u32) -> super::ffi::DkMsMode {
+pub(super) fn ms_mode(count: u32) -> super::ffi::DkMsMode {
     use super::ffi::DkMsMode as M;
-    match cuenta {
+    match count {
         2 => M::DkMsMode_2x,
         4 => M::DkMsMode_4x,
         8 => M::DkMsMode_8x,
