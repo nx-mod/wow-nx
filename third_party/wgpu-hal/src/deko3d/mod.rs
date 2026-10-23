@@ -53,6 +53,46 @@ const MAX_SAMPLERS: u32 = 2048;
 /// The driver's own uniform buffer: the first instance at 0, push constants at 256 (pipeline.rs).
 const DRIVER_UBO_SIZE: u32 = 256;
 
+/// Live objects that own memory blocks, for finding what keeps the device alive at exit ([`live_objects`]).
+pub(super) mod live {
+    use core::sync::atomic::AtomicIsize;
+    pub static BUFFERS: AtomicIsize = AtomicIsize::new(0);
+    pub static TEXTURES: AtomicIsize = AtomicIsize::new(0);
+    pub static ENCODERS: AtomicIsize = AtomicIsize::new(0);
+    pub static SWAPCHAINS: AtomicIsize = AtomicIsize::new(0);
+    pub static DEVICES: AtomicIsize = AtomicIsize::new(0);
+}
+
+/// What still owns deko3d memory: buffers, textures, encoders, swapchains, devices.
+pub fn live_objects() -> String {
+    use core::sync::atomic::Ordering::Relaxed;
+    alloc::format!(
+        "buffers {} textures {} encoders {} swapchains {} devices {}",
+        live::BUFFERS.load(Relaxed),
+        live::TEXTURES.load(Relaxed),
+        live::ENCODERS.load(Relaxed),
+        live::SWAPCHAINS.load(Relaxed),
+        live::DEVICES.load(Relaxed)
+    )
+}
+
+/// Counts one live object of a kind while it lives.
+#[derive(Debug)]
+pub(super) struct Counted(&'static core::sync::atomic::AtomicIsize);
+
+impl Counted {
+    pub(super) fn new(c: &'static core::sync::atomic::AtomicIsize) -> Self {
+        c.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        Counted(c)
+    }
+}
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 pub(super) fn align_up(value: u64, alignment: u64) -> u64 {
     (value + alignment - 1) & !(alignment - 1)
 }
@@ -165,6 +205,7 @@ pub(super) struct Shared {
     code: Mutex<CodeMemory>,
     descriptors: Mutex<Descriptors>,
     ubo: DkMemBlock,
+    _counted: Counted,
 }
 
 unsafe impl Send for Shared {}
@@ -186,6 +227,7 @@ impl Drop for Shared {
             dkMemBlockDestroy(self.ubo);
             dkDeviceDestroy(self.device);
         }
+        log::warn!("deko3d: device destroyed");
     }
 }
 
@@ -204,6 +246,7 @@ struct Swapchain {
     dk: DkSwapchain,
     memory: DkMemBlock,
     _shared: Arc<Shared>,
+    _counted: Counted,
     images: Vec<DkImage>,
     queue: DkQueue,
     format: wgt::TextureFormat,
@@ -226,6 +269,7 @@ pub struct Texture {
     /// `None` for swapchain images, whose memory belongs to the swapchain.
     mem_block: Option<DkMemBlock>,
     _shared: Option<Arc<Shared>>,
+    _counted: Option<Counted>,
     format: wgt::TextureFormat,
     samples: u32,
     /// Width and height of mip 0.
@@ -413,7 +457,14 @@ pub fn adapter_info() -> wgt::AdapterInfo {
 
 // No INDIRECT_FIRST_INSTANCE: the first instance reaches shaders through the driver's uniform buffer, which an
 // indirect draw does not update.
-const FEATURES: wgt::Features = wgt::Features::TEXTURE_COMPRESSION_BC.union(wgt::Features::DEPTH32FLOAT_STENCIL8);
+// TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES: Bevy requires it on the GL backend; texture_format_capabilities reports
+// what each format does. The rest are what Maxwell and this backend do.
+const FEATURES: wgt::Features = wgt::Features::TEXTURE_COMPRESSION_BC
+    .union(wgt::Features::DEPTH32FLOAT_STENCIL8)
+    .union(wgt::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES)
+    .union(wgt::Features::FLOAT32_FILTERABLE)
+    .union(wgt::Features::RG11B10UFLOAT_RENDERABLE)
+    .union(wgt::Features::DEPTH_CLIP_CONTROL);
 
 /// Maxwell's limits as deko3d exposes them, within WebGPU's defaults where those are lower.
 fn capabilities() -> crate::Capabilities {
@@ -514,6 +565,7 @@ impl crate::Surface for Surface {
             dk: swapchain,
             memory,
             _shared: device.shared.clone(),
+            _counted: Counted::new(&live::SWAPCHAINS),
             images,
             queue: device.shared.queue,
             format: config.format,
@@ -542,6 +594,7 @@ impl crate::Surface for Surface {
                 image: Box::new(c.images[slot as usize]),
                 mem_block: None,
                 _shared: None,
+                _counted: None,
                 format: c.format,
                 samples: 1,
                 size: (c.size.width, c.size.height),
@@ -603,6 +656,7 @@ impl crate::Adapter for Adapter {
                 free_samplers: (0..MAX_SAMPLERS).rev().collect(),
             }),
             ubo,
+            _counted: Counted::new(&live::DEVICES),
         });
         Ok(crate::OpenDevice {
             device: Device {
@@ -760,6 +814,7 @@ impl crate::Device for Device {
             image,
             mem_block: Some(memory),
             _shared: Some(self.shared.clone()),
+            _counted: Some(Counted::new(&live::TEXTURES)),
             format: desc.format,
             samples: desc.sample_count,
             size: (desc.size.width, desc.size.height),

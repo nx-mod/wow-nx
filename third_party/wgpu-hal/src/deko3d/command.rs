@@ -63,6 +63,7 @@ pub struct CommandEncoder {
     cmdbuf: DkCmdBuf,
     /// Dropped after the command memory is freed (`Drop`), so the device outlives it.
     shared: alloc::sync::Arc<super::Shared>,
+    _counted: super::Counted,
     memory: Box<CommandMemory>,
     addrs: DeviceAddrs,
     empty: bool,
@@ -95,6 +96,7 @@ impl CommandEncoder {
         Ok(Self {
             cmdbuf,
             shared,
+            _counted: super::Counted::new(&super::live::ENCODERS),
             memory,
             addrs,
             empty: true,

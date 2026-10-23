@@ -1,17 +1,17 @@
-//! shadercheck: WGSL through naga's desktop GLSL and uam, as the Switch's deko3d backend compiles it
+//! shadercheck: WGSL (or the backend's GLSL, `.glsl`) through naga's desktop GLSL and uam, as the Switch's deko3d backend compiles it
 //! (benilla_uam::write_glsl), on the host. Bindings are numbered per kind across groups, as a pipeline layout made
 //! from the shader's own bindings would number them. A failure's GLSL and uam's log go to target/shadercheck/.
 
 use std::path::{Path, PathBuf};
 
-fn collect_wgsl(path: &Path, output: &mut Vec<PathBuf>) {
+fn collect_shaders(path: &Path, output: &mut Vec<PathBuf>) {
     if path.is_dir() {
         let mut children: Vec<_> = std::fs::read_dir(path).into_iter().flatten().flatten().map(|e| e.path()).collect();
         children.sort();
         for h in children {
-            collect_wgsl(&h, output);
+            collect_shaders(&h, output);
         }
-    } else if path.extension().is_some_and(|e| e == "wgsl") {
+    } else if path.extension().is_some_and(|e| e == "wgsl" || e == "glsl") {
         output.push(path.to_path_buf());
     }
 }
@@ -46,12 +46,36 @@ fn binding_map(module: &naga::Module) -> naga::back::glsl::BindingMap {
 fn main() {
     let mut files = Vec::new();
     for a in std::env::args().skip(1) {
-        collect_wgsl(Path::new(&a), &mut files);
+        collect_shaders(Path::new(&a), &mut files);
     }
     let _ = std::fs::create_dir_all("target/shadercheck");
     let (mut passed, mut failed) = (0, 0);
     for f in &files {
         let source = std::fs::read_to_string(f).unwrap_or_default();
+        if f.extension().is_some_and(|e| e == "glsl") {
+            // GLSL as the backend wrote it (a console `.error.glsl`): uam's log appended as a comment is cut off,
+            // the fix-ups run again, and the stage comes from the source.
+            let mut glsl = source.split("\n/* uam:").next().unwrap_or("").to_string();
+            benilla_uam::adapt_glsl(&mut glsl);
+            let stage = if glsl.contains("layout(local_size_x") {
+                benilla_uam::Stage::Compute
+            } else if glsl.contains("gl_Position") {
+                benilla_uam::Stage::Vertex
+            } else {
+                benilla_uam::Stage::Fragment
+            };
+            match benilla_uam::compile(stage, &glsl) {
+                Ok(dksh) => {
+                    println!("ok   {} ({stage:?}, {} bytes)", f.display(), dksh.len());
+                    passed += 1;
+                }
+                Err(log) => {
+                    println!("FAIL {} ({stage:?}): {}", f.display(), log.lines().find(|l| !l.trim().is_empty()).unwrap_or(""));
+                    failed += 1;
+                }
+            }
+            continue;
+        }
         let module = match naga::front::wgsl::parse_str(&source) {
             Ok(m) => m,
             Err(e) => {

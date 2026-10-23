@@ -1,4 +1,4 @@
-// wow-nx: ELF TLS for Rust on the Switch.
+// wow-nx: what Rust needs from libnx on the Switch: ELF TLS, and a clean exit.
 //
 // libnx is built with -mtp=soft: its TLS accesses call __aarch64_read_tp(), which returns the thread's TLS pointer
 // from libnx's ThreadVars, and nothing loads tpidr_el0. LLVM's AArch64 backend has no soft thread pointer, so Rust's
@@ -16,7 +16,23 @@ static inline void set_thread_pointer(void) {
     __asm__ volatile("msr tpidr_el0, %0" ::"r"(tp));
 }
 
-__attribute__((constructor(101))) static void main_thread_pointer(void) { set_thread_pointer(); }
+// Exit: Rust leaves threads running in statics (Bevy's task pools, the uam worker), and returning to hbl with them
+// alive lets hbmenu load into memory their stacks still use. The process has to end, and an application must ask the
+// system for that (svcExitProcess is reported as "closed because an error occurred"): with __nx_applet_exit_mode = 1,
+// libnx closes its services and sends ISelfController::Exit. The same exit as rexglue-sdk-nx's
+// windowed_app_main_switch.cpp. Registered first, so it runs after every other exit handler.
+extern unsigned int __nx_applet_exit_mode;
+extern void __libnx_exit(int rc) __attribute__((noreturn));
+
+static void exit_through_applet(void) {
+    __nx_applet_exit_mode = 1;
+    __libnx_exit(0);
+}
+
+__attribute__((constructor(101))) static void main_thread_pointer(void) {
+    set_thread_pointer();
+    atexit(exit_through_applet);
+}
 
 typedef struct {
     void* (*start)(void*);

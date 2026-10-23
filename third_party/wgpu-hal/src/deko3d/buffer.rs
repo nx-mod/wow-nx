@@ -9,6 +9,7 @@ pub struct Buffer {
     pub(super) cpu: *mut u8,
     pub(super) size: u64,
     _shared: alloc::sync::Arc<super::Shared>,
+    _counted: super::Counted,
 }
 
 // SAFETY: the block is only freed by `Device::destroy_buffer`; wgpu-core orders access to it.
@@ -33,6 +34,7 @@ impl Buffer {
             cpu: unsafe { dkMemBlockGetCpuAddr(mem_block) }.cast(),
             size: desc.size,
             _shared: shared.clone(),
+            _counted: super::Counted::new(&super::live::BUFFERS),
         })
     }
 
