@@ -1,0 +1,70 @@
+[package]
+name = "cubo"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# wow-nx: Bevy on the Switch (docs/SWITCH-RENDER.md, step 4): a lit, spinning cube through Bevy's 3D renderer on wgpu's
+# deko3d backend. Bevy has benilla's features minus `default_platform` (winit, gilrs, the desktop and Android layers),
+# listed one by one: the `*_api` bundles bring `default_app`, whose `custom_cursor` turns winit back on. The window
+# handle and the main loop are ours (src/main.rs). The lock starts from benilla's.
+[dependencies]
+bevy = { version = "0.18.1", default-features = false, features = [
+    "std",
+    "multi_threaded",
+    "async_executor",
+    "bevy_asset",
+    "bevy_log",
+    "bevy_state",
+    "bevy_window",
+    "bevy_input_focus",
+    "reflect_auto_register",
+    "bevy_animation",
+    "bevy_camera",
+    "bevy_color",
+    "bevy_gizmos",
+    "bevy_image",
+    "bevy_mesh",
+    "bevy_shader",
+    "bevy_text",
+    "hdr",
+    "png",
+    "bevy_light",
+    "bevy_mikktspace",
+    "ktx2",
+    "morph_animation",
+    "morph",
+    "smaa_luts",
+    "tonemapping_luts",
+    "zstd_rust",
+    "bevy_render",
+    "bevy_core_pipeline",
+    "bevy_gizmos_render",
+    "bevy_anti_alias",
+    "bevy_gltf",
+    "bevy_pbr",
+    "bevy_post_process",
+    "gltf_animation",
+    "bevy_sprite",
+    "bevy_sprite_render",
+    "bevy_ui",
+    "bevy_ui_render",
+    "default_font",
+] }
+benilla-horizon = { path = "../../crates/benilla-horizon" }
+raw-window-handle = "0.6"
+
+[workspace]
+
+[profile.release]
+panic = "abort"
+opt-level = 3
+codegen-units = 1
+
+[patch.crates-io]
+libc = { path = "../../third_party/libc" }
+wgpu-hal = { path = "../../third_party/wgpu-hal" }
+wgpu = { path = "../../third_party/wgpu" }
+wgpu-core = { path = "../../third_party/wgpu-core" }
+bevy_asset = { path = "../../third_party/bevy_asset" }
+memmap2 = { path = "../../third_party/memmap2" }

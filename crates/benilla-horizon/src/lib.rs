@@ -41,4 +41,11 @@ mod horizon {
         Ok(())
     }
     getrandom::register_custom_getrandom!(aleatorio);
+
+    /// getrandom 0.3 and 0.4's custom backend (both name this symbol).
+    #[no_mangle]
+    unsafe extern "Rust" fn __getrandom_v03_custom(dest: *mut u8, len: usize) -> Result<(), getrandom03::Error> {
+        unsafe { randomGet(dest.cast(), len) };
+        Ok(())
+    }
 }

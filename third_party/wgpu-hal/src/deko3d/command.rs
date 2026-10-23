@@ -34,6 +34,8 @@ struct Estado {
     referencia: u8,
     indice: Option<DkIdxFormat>,
     computo: bool,
+    /// Multisampled targets and where the pass resolves them, at its end.
+    resoluciones: Vec<(DkImageView, DkImageView)>,
 }
 
 /// Command memory of one encoder: deko3d asks for more through `anadir_memoria`.
@@ -416,6 +418,12 @@ impl crate::CommandEncoder for CommandEncoder {
             .iter()
             .map(|v| v.as_ref().map_or(relleno.unwrap_or(core::ptr::null()), core::ptr::from_ref))
             .collect();
+        self.estado.resoluciones = desc
+            .color_attachments
+            .iter()
+            .flatten()
+            .filter_map(|a| Some((a.target.view.vista, a.resolve_target.as_ref()?.view.vista)))
+            .collect();
         let profundidad = desc.depth_stencil_attachment.as_ref().map(|d| {
             let mut v = d.target.view.vista;
             v.dsSource = DkDsSource::DkDsSource_Depth;
@@ -472,8 +480,11 @@ impl crate::CommandEncoder for CommandEncoder {
         Ok(())
     }
     unsafe fn end_render_pass(&mut self) {
-        // What the pass rendered may be sampled next.
         let c = self.cmd();
+        for (origen, destino) in core::mem::take(&mut self.estado.resoluciones) {
+            unsafe { dkCmdBufResolveImage(c, &origen, &destino) };
+        }
+        // What the pass rendered may be sampled next.
         unsafe { dkCmdBufBarrier(c, DkBarrier::DkBarrier_Fragments, DkInvalidateFlags_Image) };
     }
 
