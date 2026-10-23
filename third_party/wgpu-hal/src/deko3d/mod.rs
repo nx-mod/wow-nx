@@ -674,23 +674,27 @@ impl crate::Adapter for Adapter {
         if conv::dk_format(format).is_none() {
             return C::empty();
         }
-        let mut caps = C::SAMPLED | C::COPY_SRC | C::COPY_DST;
-        let integer = matches!(
-            format.sample_type(None, None),
-            Some(wgt::TextureSampleType::Uint | wgt::TextureSampleType::Sint)
-        );
-        let multisample = C::MULTISAMPLE_X2 | C::MULTISAMPLE_X4 | C::MULTISAMPLE_X8;
-        if format.is_depth_stencil_format() {
-            caps |= C::DEPTH_STENCIL_ATTACHMENT | multisample;
-        } else if !format.is_compressed() {
-            caps |= C::COLOR_ATTACHMENT | multisample | C::STORAGE_READ_ONLY | C::STORAGE_WRITE_ONLY | C::STORAGE_READ_WRITE;
-            if !integer {
-                caps |= C::COLOR_ATTACHMENT_BLEND | C::MULTISAMPLE_RESOLVE;
-            }
+        // What WebGPU guarantees for the format, and no more: every format Maxwell renders, stores or filters covers
+        // it, and claiming more makes deko3d refuse the image (dk_image.cpp's format traits).
+        use wgt::{TextureFormatFeatureFlags as F, TextureUsages as U};
+        let g = format.guaranteed_format_features(FEATURES);
+        let (u, f) = (g.allowed_usages, g.flags);
+        let mut caps = C::empty();
+        caps.set(C::SAMPLED, u.contains(U::TEXTURE_BINDING));
+        caps.set(C::COPY_SRC, u.contains(U::COPY_SRC));
+        caps.set(C::COPY_DST, u.contains(U::COPY_DST));
+        if u.contains(U::RENDER_ATTACHMENT) {
+            caps |= if format.is_depth_stencil_format() { C::DEPTH_STENCIL_ATTACHMENT } else { C::COLOR_ATTACHMENT };
         }
-        if !integer {
-            caps |= C::SAMPLED_LINEAR;
-        }
+        caps.set(C::COLOR_ATTACHMENT_BLEND, f.contains(F::BLENDABLE));
+        caps.set(C::SAMPLED_LINEAR, f.contains(F::FILTERABLE));
+        caps.set(C::MULTISAMPLE_X2, f.contains(F::MULTISAMPLE_X2));
+        caps.set(C::MULTISAMPLE_X4, f.contains(F::MULTISAMPLE_X4));
+        caps.set(C::MULTISAMPLE_X8, f.contains(F::MULTISAMPLE_X8));
+        caps.set(C::MULTISAMPLE_RESOLVE, f.contains(F::MULTISAMPLE_RESOLVE));
+        caps.set(C::STORAGE_READ_ONLY, f.contains(F::STORAGE_READ_ONLY));
+        caps.set(C::STORAGE_WRITE_ONLY, f.contains(F::STORAGE_WRITE_ONLY) || u.contains(U::STORAGE_BINDING));
+        caps.set(C::STORAGE_READ_WRITE, f.contains(F::STORAGE_READ_WRITE));
         caps
     }
 
@@ -795,8 +799,8 @@ impl crate::Device for Device {
         let render_usage = wgt::TextureUses::COLOR_TARGET
             | wgt::TextureUses::DEPTH_STENCIL_READ
             | wgt::TextureUses::DEPTH_STENCIL_WRITE;
-        if desc.usage.intersects(render_usage) || !desc.format.is_compressed() {
-            // Renderable formats always get render usage, so clears to zero can be fast clears.
+        // Render usage only where the texture is drawn to: deko3d refuses it on a format it cannot render.
+        if desc.usage.intersects(render_usage) {
             maker.flags |= DkImageFlags_UsageRender;
         }
         if desc.usage.intersects(wgt::TextureUses::STORAGE_READ_ONLY | wgt::TextureUses::STORAGE_WRITE_ONLY | wgt::TextureUses::STORAGE_READ_WRITE) {
