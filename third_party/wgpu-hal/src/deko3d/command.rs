@@ -2,7 +2,10 @@ use alloc::{boxed::Box, vec::Vec};
 use core::{ffi::c_void, ops::Range};
 
 use super::ffi::*;
-use super::pipeline::{BindGroup, ComputePipeline, Muestreo, PipelineLayout, RenderPipeline, Tipo, SLOT_PRIMERA_INSTANCIA};
+use super::pipeline::{
+    BindGroup, ComputePipeline, Muestreo, PipelineLayout, RenderPipeline, Tipo, DESPLAZAMIENTO_CONSTANTES, SLOT_CONSTANTES,
+    SLOT_PRIMERA_INSTANCIA, TAMANO_CONSTANTES,
+};
 use super::{Api, Buffer, DeviceResult, Resource, Texture, TextureView};
 
 /// The device's GPU addresses an encoder needs: zeros for clears, the descriptor sets, the driver's uniform buffer.
@@ -146,7 +149,16 @@ impl CommandEncoder {
         self.estado.primera_escrita = Some(primera);
         let (ubo, tamano) = self.fijos.ubo;
         let c = self.cmd();
-        unsafe { dkCmdBufPushConstants(c, ubo, tamano, 0, 4, (&primera as *const u32).cast()) };
+        unsafe { dkCmdBufPushConstants(c, ubo, tamano, 0, 4, core::ptr::from_ref(&primera).cast()) };
+    }
+
+    /// Binds the push constant block to the stages in use.
+    fn enlazar_constantes(&mut self) {
+        let c = self.cmd();
+        let gpu = self.fijos.ubo.0 + DESPLAZAMIENTO_CONSTANTES;
+        for &etapa in self.etapas() {
+            unsafe { dkCmdBufBindUniformBuffer(c, etapa, SLOT_CONSTANTES, gpu, TAMANO_CONSTANTES) };
+        }
     }
 
     /// Waits for earlier work and drops cached texels and shader data, so later reads see earlier writes.
@@ -512,7 +524,14 @@ impl crate::CommandEncoder for CommandEncoder {
         }
         self.estado.texturas_sucias = true;
     }
-    unsafe fn set_push_constants(&mut self, layout: &PipelineLayout, stages: wgt::ShaderStages, offset_bytes: u32, data: &[u32]) {}
+    unsafe fn set_push_constants(&mut self, layout: &PipelineLayout, stages: wgt::ShaderStages, offset_bytes: u32, data: &[u32]) {
+        let c = self.cmd();
+        let gpu = self.fijos.ubo.0 + DESPLAZAMIENTO_CONSTANTES;
+        let tamano = (data.len() * 4) as u32;
+        if offset_bytes + tamano <= TAMANO_CONSTANTES {
+            unsafe { dkCmdBufPushConstants(c, gpu, TAMANO_CONSTANTES, offset_bytes, tamano, data.as_ptr().cast()) };
+        }
+    }
 
     unsafe fn insert_debug_marker(&mut self, label: &str) {}
     unsafe fn begin_debug_marker(&mut self, group_label: &str) {}
@@ -541,9 +560,11 @@ impl crate::CommandEncoder for CommandEncoder {
             dkCmdBufBindVtxAttribState(c, p.atributos.as_ptr(), p.atributos.len() as u32);
             dkCmdBufBindVtxBufferState(c, p.buferes.as_ptr(), p.buferes.len() as u32);
             if p.primera_instancia {
-                let (ubo, tamano) = self.fijos.ubo;
-                dkCmdBufBindUniformBuffer(c, DkStage::DkStage_Vertex, SLOT_PRIMERA_INSTANCIA, ubo, tamano);
+                dkCmdBufBindUniformBuffer(c, DkStage::DkStage_Vertex, SLOT_PRIMERA_INSTANCIA, self.fijos.ubo.0, 256);
             }
+        }
+        if p.constantes {
+            self.enlazar_constantes();
         }
         let e = &mut self.estado;
         e.muestreo = p.muestreo.clone();
@@ -687,6 +708,9 @@ impl crate::CommandEncoder for CommandEncoder {
         let c = self.cmd();
         let cs: *const DkShader = &*p.cs.shader;
         unsafe { dkCmdBufBindShaders(c, DkStageFlag_Compute, &cs, 1) };
+        if p.constantes {
+            self.enlazar_constantes();
+        }
         self.estado.muestreo = p.muestreo.clone();
         self.estado.texturas_sucias = true;
     }

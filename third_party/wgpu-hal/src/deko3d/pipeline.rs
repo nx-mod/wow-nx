@@ -15,6 +15,11 @@ use super::ffi::*;
 /// The vertex stage's uniform buffer slot for the draw's first instance (`naga_vs_first_instance`): Maxwell's
 /// `gl_InstanceID` does not include it, and WebGPU's `instance_index` does.
 pub(super) const SLOT_PRIMERA_INSTANCIA: u32 = 15;
+/// Every stage's uniform buffer slot for push constants, which naga writes as a loose uniform.
+pub(super) const SLOT_CONSTANTES: u32 = 14;
+/// Where they live in the driver's uniform buffer (the first instance is at 0).
+pub(super) const DESPLAZAMIENTO_CONSTANTES: u64 = 256;
+pub(super) const TAMANO_CONSTANTES: u32 = 256;
 
 #[derive(Debug)]
 pub struct ShaderModule {
@@ -92,6 +97,7 @@ pub struct RenderPipeline {
     pub(super) fs: Option<Etapa>,
     pub(super) muestreo: Muestreo,
     pub(super) primera_instancia: bool,
+    pub(super) constantes: bool,
     pub(super) primitiva: DkPrimitive,
     pub(super) tira: bool,
     pub(super) rasterizador: DkRasterizerState,
@@ -110,6 +116,7 @@ pub struct RenderPipeline {
 #[derive(Debug)]
 pub struct ComputePipeline {
     pub(super) cs: Etapa,
+    pub(super) constantes: bool,
     pub(super) muestreo: Muestreo,
 }
 
@@ -302,6 +309,18 @@ impl super::Device {
                 ),
             );
         }
+        // Push constants are a loose uniform too: a block in the driver's uniform buffer, filled by
+        // `set_push_constants`.
+        while let Some(i) = salida.find("\nuniform ") {
+            let fin = i + salida[i..].find(';').unwrap_or(0);
+            let decl = &salida[i + 9..fin];
+            let Some((tipo, nombre)) = decl.split_once(' ') else { break };
+            if !nombre.starts_with("_push_constant_binding_") {
+                break;
+            }
+            let bloque = format!("\nlayout(std140, binding = {SLOT_CONSTANTES}) uniform {nombre}_block {{ {tipo} {nombre}; }}");
+            salida.replace_range(i..fin, &bloque);
+        }
         Ok(salida)
     }
 
@@ -334,10 +353,12 @@ impl super::Device {
         let mut muestreo = Muestreo::default();
         let glsl_vs = self.glsl(vertex_stage, naga::ShaderStage::Vertex, desc.layout, &mut muestreo)?;
         let primera_instancia = glsl_vs.contains(glsl::FIRST_INSTANCE_BINDING);
+        let mut constantes = glsl_vs.contains("_push_constant_binding_");
         let vs = self.compilar(&glsl_vs, naga::ShaderStage::Vertex)?;
         let fs = match &desc.fragment_stage {
             Some(f) => {
                 let g = self.glsl(f, naga::ShaderStage::Fragment, desc.layout, &mut muestreo)?;
+                constantes |= g.contains("_push_constant_binding_");
                 Some(self.compilar(&g, naga::ShaderStage::Fragment)?)
             }
             None => None,
@@ -475,6 +496,7 @@ impl super::Device {
             fs,
             muestreo,
             primera_instancia,
+            constantes,
             primitiva,
             tira: p.strip_index_format.is_some() || matches!(p.topology, T::LineStrip | T::TriangleStrip),
             rasterizador,
@@ -498,6 +520,7 @@ impl super::Device {
         let mut muestreo = Muestreo::default();
         let g = self.glsl(&desc.stage, naga::ShaderStage::Compute, desc.layout, &mut muestreo)?;
         Ok(ComputePipeline {
+            constantes: g.contains("_push_constant_binding_"),
             cs: self.compilar(&g, naga::ShaderStage::Compute)?,
             muestreo,
         })

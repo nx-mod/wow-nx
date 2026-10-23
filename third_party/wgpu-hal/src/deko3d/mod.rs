@@ -50,7 +50,7 @@ const MEMORIA_CODIGO: u32 = 32 << 20;
 /// Descriptor set sizes: one image descriptor per sampled or storage view, one sampler descriptor per sampler.
 const IMAGENES: u32 = 8192;
 const MUESTREADORES: u32 = 2048;
-/// The driver's own uniform buffer (the first instance).
+/// The driver's own uniform buffer: the first instance at 0, push constants at 256 (pipeline.rs).
 const UBO_DRIVER: u32 = 256;
 
 pub(super) fn alinear(valor: u64, alineacion: u64) -> u64 {
