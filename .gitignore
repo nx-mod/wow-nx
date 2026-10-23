@@ -43,5 +43,3 @@ __pycache__/
 # beside `WoW`, or `BENILLA_ADDON_CORPUS`.
 /wow-addons-vanilla
 
-# wow-nx: the forwarder icon, made from the player's own client art (switch/blpdump); never committed
-switch/icon.jpg

@@ -9,9 +9,5 @@ cargo build -p benilla --no-default-features --profile switch $BUILD_STD "$@"
 T=/opt/devkitpro/tools/bin
 # An NRO without an asset section (no --nacp) is refused at load by Sphaira/hbl (2026-10-20).
 $T/nacptool --create "wow-nx" "nx-mod" "0.1.0" target/wow-nx.nacp
-# switch/icon.jpg (256x256 baseline JPEG, made from your client's art with switch/blpdump; not in the repo): the
-# NRO's icon, which forwarders take.
-ICON=""
-[ -f "$ROOT/switch/icon.jpg" ] && ICON="--icon=$ROOT/switch/icon.jpg"
-$T/elf2nro target/aarch64-nintendo-switch-newlib/switch/benilla.elf target/wow-nx.nro --nacp=target/wow-nx.nacp $ICON
+$T/elf2nro target/aarch64-nintendo-switch-newlib/switch/benilla.elf target/wow-nx.nro --nacp=target/wow-nx.nacp
 echo "target/wow-nx.nro"
