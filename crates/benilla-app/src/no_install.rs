@@ -73,6 +73,13 @@ fn message(looked_in: &[PathBuf]) -> String {
 /// is `unattended`, so an instrumented run never waits on a click.
 pub(crate) fn fail(err: &NoInstall, unattended: bool) -> AppExit {
     eprintln!("benilla: {}", err.message());
+    #[cfg(target_os = "horizon")]
+    {
+        let _ = unattended;
+        let _ = std::fs::write("sdmc:/wow-nx/benilla.txt", format!("benilla: {}\n", err.message()));
+    }
+    // wow-nx: the Switch has no native message box; stderr and the log carry it.
+    #[cfg(not(target_os = "horizon"))]
     if !unattended {
         // Linux shows it through `zenity` and logs nothing when that is missing, which stderr covers.
         rfd::MessageDialog::new()

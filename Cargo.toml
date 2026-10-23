@@ -20,15 +20,26 @@ anyhow = "1.0.102"
 # bevy's default features spelled out without `audio`: `2d`, `3d` and `ui` each pull `bevy_audio`
 # and `vorbis`, and the client mixes through kira. Add a feature by name, never `2d`/`3d`/`ui`; a
 # plugin that takes bevy with its default features brings the audio stack back too.
+#
+# wow-nx: the bundles' features one by one, without `default_platform` or `custom_cursor` (which turn on winit): the
+# Switch has neither. benilla-app adds those two back everywhere else, so the PC build has the same set as upstream.
 bevy = { version = "0.18.1", default-features = false, features = [
-    "default_app",
-    "default_platform",
-    "2d_bevy_render",
-    "3d_bevy_render",
-    "ui_api",
-    "ui_bevy_render",
+    # default_app, without custom_cursor
+    "async_executor", "bevy_asset", "bevy_input_focus", "bevy_log", "bevy_state", "bevy_window", "reflect_auto_register",
+    # common_api
+    "bevy_animation", "bevy_camera", "bevy_color", "bevy_gizmos", "bevy_image", "bevy_mesh", "bevy_shader", "bevy_text",
+    "hdr", "png",
+    # 2d_bevy_render
+    "bevy_sprite", "bevy_sprite_render", "bevy_post_process", "bevy_gizmos_render",
+    # 3d_bevy_render
+    "bevy_light", "bevy_mikktspace", "ktx2", "morph_animation", "morph", "smaa_luts", "tonemapping_luts", "zstd_rust",
+    "bevy_render", "bevy_core_pipeline", "bevy_anti_alias", "bevy_gltf", "bevy_pbr", "gltf_animation",
+    # ui_api, ui_bevy_render
+    "bevy_ui", "bevy_ui_render",
     "scene",
     "picking",
+    # the Switch's part of default_platform
+    "std", "multi_threaded", "default_font",
 ] }
 # For the `WOW_GPU_MS` meter's query set, which bevy 0.18 does not wrap; must match bevy's wgpu.
 wgpu = "27"
@@ -50,6 +61,9 @@ wgpu-hal = { path = "third_party/wgpu-hal" }
 # wow-nx: wgpu and wgpu-core as upstream, except that their GL backend is built on Horizon too.
 wgpu = { path = "third_party/wgpu" }
 wgpu-core = { path = "third_party/wgpu-core" }
+# wow-nx: one cfg each for the Switch: bevy_asset without the async-io reactor, memmap2 without mmap.
+bevy_asset = { path = "third_party/bevy_asset" }
+memmap2 = { path = "third_party/memmap2" }
 
 # Dependencies at opt-level 3 in dev: at opt-level 0, avian/parry collision drops a run to <1 fps.
 [profile.dev.package."*"]
@@ -73,6 +87,18 @@ lto = "off"
 # The shipping build (`--profile ship`): fat LTO measures -1.0 cpu_ms (-5 %) against `release`,
 # which stays the measured profile because fat LTO's link time would tax every iteration.
 # `-Ctarget-cpu=native` is not set: it is not portable.
+# wow-nx: the Switch build (switch/build-benilla.sh), sized for the phone it is built on: no LTO and 16
+# codegen units, so with -j2 LLVM holds two small units at a time instead of one huge one.
+[profile.switch]
+inherits = "release"
+lto = "off"
+codegen-units = 16
+debug = false
+incremental = false
+
+[profile.switch.package."*"]
+codegen-units = 16
+
 [profile.ship]
 inherits = "release"
 lto = "fat"

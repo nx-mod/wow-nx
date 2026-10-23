@@ -107,6 +107,8 @@ mod sound;
 mod spell;
 /// The melee swing refusal's latch + 4 s repeat (`SMSG_ATTACKSWING_*`).
 mod swing_refusal;
+#[cfg(target_os = "horizon")]
+mod switch;
 mod target;
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -231,6 +233,8 @@ type Extension<'a> = Box<dyn FnOnce(&mut App) + 'a>;
 
 /// The one body behind [`run`] and [`run_with`], not generic, so a launcher compiles none of it.
 fn launch(build: BuildId, extend: Option<Extension<'_>>) -> AppExit {
+    #[cfg(target_os = "horizon")]
+    switch::prepare();
     // `WOW_HOVER_LOG_REPORT=<csv>` and `WOW_CAPTURE=list` print and exit before any setup.
     if let Ok(path) = std::env::var("WOW_HOVER_LOG_REPORT") {
         dev::report_recorded_hover_log(&path);
@@ -465,6 +469,9 @@ fn launch(build: BuildId, extend: Option<Extension<'_>>) -> AppExit {
     // The probe fleet, last so it observes the fully-built app; compiled out by
     // `--no-default-features`.
     app.add_plugins(dev::DevProbesPlugin);
+
+    #[cfg(target_os = "horizon")]
+    app.add_plugins(switch::SwitchPlugin);
 
     // Returns the app's exit status: a failed capture sets `AppExit::error()`
     // (`capture::drive_capture`), which must not exit 0 with no PNG on disk.

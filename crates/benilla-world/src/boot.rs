@@ -8,7 +8,7 @@ use crate::thread_qos;
 
 /// `DefaultPlugins` with benilla's engine tuning applied, around the caller's primary window.
 pub fn tuned_default_plugins(primary_window: Window) -> PluginGroupBuilder {
-    DefaultPlugins
+    let plugins = DefaultPlugins
         .set(WindowPlugin {
             primary_window: Some(primary_window),
             ..default()
@@ -66,7 +66,31 @@ pub fn tuned_default_plugins(primary_window: Window) -> PluginGroupBuilder {
         // M2/WMO/ADT load through our own `mpq://` loaders; there is no glTF.
         .disable::<bevy::gltf::GltfPlugin>()
         // No bevy AA: no Fxaa/TAA/SMAA/CAS component anywhere (MSAA is core render, unaffected).
-        .disable::<bevy::anti_alias::AntiAliasPlugin>()
-        // No gamepad input; 1.12's bindings are keyboard/mouse.
-        .disable::<bevy::gilrs::GilrsPlugin>()
+        .disable::<bevy::anti_alias::AntiAliasPlugin>();
+    // No gamepad input; 1.12's bindings are keyboard/mouse.
+    #[cfg(not(target_os = "horizon"))]
+    let plugins = plugins.disable::<bevy::gilrs::GilrsPlugin>();
+    // wow-nx: the Switch has no gilrs, and its GPU is wgpu's GL slot, where the deko3d backend lives
+    // (third_party/wgpu-hal). Bevy's log goes to the SD card, the only place a Switch run can be read back.
+    #[cfg(target_os = "horizon")]
+    let plugins = plugins
+        .set(bevy::render::RenderPlugin {
+            render_creation: bevy::render::settings::WgpuSettings {
+                backends: Some(bevy::render::settings::Backends::GL),
+                ..default()
+            }
+            .into(),
+            ..default()
+        })
+        .set(bevy::log::LogPlugin {
+            filter: "wgpu=error,naga=warn".into(),
+            custom_layer: |_| {
+                let f = std::fs::OpenOptions::new().append(true).create(true).open("sdmc:/wow-nx/benilla.txt").ok()?;
+                Some(Box::new(
+                    bevy::log::tracing_subscriber::fmt::layer().with_ansi(false).with_writer(std::sync::Mutex::new(f)),
+                ))
+            },
+            ..default()
+        });
+    plugins
 }

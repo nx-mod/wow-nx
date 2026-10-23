@@ -328,7 +328,7 @@ impl Plugin for CursorPlugin {
                     .after(crate::ui_script::UiInput)
                     .after(crate::target::TargetUpdate),
             );
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "horizon")))]
         app.init_resource::<other::PayloadCursorImages>()
             .add_systems(Startup, other::setup.after(AssetSet::Open))
             .add_systems(
@@ -349,8 +349,9 @@ impl Plugin for CursorPlugin {
     }
 }
 
-/// Non-macOS: winit's custom cursor, swapped on change; hide-on-look is in `player::control`.
-#[cfg(not(target_os = "macos"))]
+/// Non-macOS: winit's custom cursor, swapped on change; hide-on-look is in `player::control`. The Switch has no
+/// pointer cursor of the window's.
+#[cfg(not(any(target_os = "macos", target_os = "horizon")))]
 mod other {
     use super::{cursor_path, payload_icon, CURSOR_STEMS};
     use benilla_assets::{cursor_texture, WorldAssets};

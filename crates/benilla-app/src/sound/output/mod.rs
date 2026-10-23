@@ -32,11 +32,15 @@
 #[cfg(target_os = "macos")]
 #[path = "coreaudio.rs"]
 mod device;
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "horizon")))]
 #[path = "cpal.rs"]
 mod device;
+// wow-nx: the Switch's, silent for now.
+#[cfg(target_os = "horizon")]
+#[path = "switch.rs"]
+mod device;
 // The stand-ins `cpal.rs` tries for a default that will not open; tested on every platform.
-#[cfg(any(test, not(target_os = "macos")))]
+#[cfg(any(test, not(any(target_os = "macos", target_os = "horizon"))))]
 mod fallback;
 
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};

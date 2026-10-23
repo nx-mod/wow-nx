@@ -503,6 +503,7 @@ dependencies = [
  "avian3d",
  "benilla-assets",
  "benilla-formats",
+ "benilla-horizon",
  "benilla-protocol",
  "benilla-srp",
  "benilla-ui",
@@ -602,6 +603,7 @@ name = "benilla-horizon"
 version = "0.2.0"
 dependencies = [
  "getrandom 0.2.17",
+ "getrandom 0.3.4",
 ]
 
 [[package]]
@@ -663,6 +665,7 @@ name = "benilla-uam"
 version = "0.2.0"
 dependencies = [
  "cc",
+ "naga",
 ]
 
 [[package]]
@@ -842,8 +845,6 @@ dependencies = [
 [[package]]
 name = "bevy_asset"
 version = "0.18.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "29f86fed15972b9fb1a3f7b092cf0390e67131caaedab15a2707c043e3a3c886"
 dependencies = [
  "async-broadcast",
  "async-channel",
@@ -4341,8 +4342,6 @@ checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 [[package]]
 name = "memmap2"
 version = "0.9.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "714098028fe011992e1c3962653c96b2d578c4b4bce9036e15ff220319b1e0e3"
 dependencies = [
  "libc",
 ]
@@ -7302,6 +7301,7 @@ dependencies = [
  "android_system_properties",
  "arrayvec",
  "ash",
+ "benilla-uam",
  "bit-set",
  "bitflags 2.11.1",
  "block",

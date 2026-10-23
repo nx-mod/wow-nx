@@ -23,7 +23,6 @@ bevy_dynamic_linking = ["bevy/dynamic_linking"]
 [dependencies]
 anyhow.workspace = true
 # The EditBox clipboard, on the main thread as NSPasteboard requires; bevy_egui's 3.x.
-arboard = "3"
 benilla-ui = { path = "../benilla-ui" }
 bevy.workspace = true
 wgpu.workspace = true
@@ -46,7 +45,6 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 # The "no WoW install" error dialog (`no_install`): AppKit, Win32 and, on Linux, `zenity`; no GTK.
 # `xdg-portal` is the Linux backend that carries the message dialog; `wayland` is its file-dialog
 # parent handle, which a message dialog without a parent never reads.
-rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 # Thread-to-ECS channels: crossbeam's `Receiver` is `Sync`, so it is a resource without a mutex.
 crossbeam-channel = "0.5"
 benilla-assets = { path = "../benilla-assets", default-features = false }
@@ -64,7 +62,6 @@ cosmic-text = "0.16"
 zeno = "0.3.3"
 # The layout's unshifted character per key (`KeyEventExtModifierSupplement`), which bevy's
 # `KeyboardInput` drops; bevy_winit's own 0.30, whose features it sets.
-winit = { version = "0.30", default-features = false }
 # `cosmic-text`'s font database, named by `ui_text`; must stay the version it depends on.
 fontdb = "0.23"
 # The mixer. Its `cpal` backend stays off on every target: `sound::output` is our own backend.
@@ -81,11 +78,24 @@ rand = "0.8"
 
 # Wayland clipboard over the standard `wl_data_device`; arboard's speaks `wlr-data-control`,
 # which GNOME does not implement.
-[target.'cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))'.dependencies]
+[target.'cfg(all(unix, not(any(target_os = "macos", target_os = "android", target_os = "horizon"))))'.dependencies]
 raw-window-handle = "0.6"
 smithay-clipboard = "0.7"
 
 # A native NSCursor: winit's cursor rects revert to the arrow under a continuous render loop.
+# wow-nx: what the Switch has none of: winit (the window and keyboard; the Switch build brings its own window), the
+# clipboard, the native message dialog, and the platform half of bevy's features (workspace Cargo.toml).
+# wow-nx: the Switch's own (src/switch.rs): the window handle, and what libnx gives std (benilla-horizon).
+[target.'cfg(target_os = "horizon")'.dependencies]
+raw-window-handle = "0.6"
+benilla-horizon = { path = "../benilla-horizon" }
+
+[target.'cfg(not(target_os = "horizon"))'.dependencies]
+arboard = "3"
+winit = { version = "0.30", default-features = false }
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
+bevy = { workspace = true, features = ["default_platform", "custom_cursor"] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 # The audio device layer (`sound::output::coreaudio`), at the versions and features cpal uses.
 coreaudio-rs = { version = "0.13", default-features = false, features = ["audio_unit", "core_audio"] }
@@ -106,7 +116,7 @@ objc2-foundation = { version = "0.2", features = ["NSArray", "NSData", "NSGeomet
 
 # The audio device layer off macOS (`sound::output::cpal`); on macOS cpal cannot rebuild on a
 # lost default device and drops the IO-cycle timestamp.
-[target.'cfg(not(target_os = "macos"))'.dependencies]
+[target.'cfg(not(any(target_os = "macos", target_os = "horizon")))'.dependencies]
 cpal = "0.17"
 
 # Windows CPU clocks for `perf::clock`; `GetLocalTime` for the log stamp (`ui_chat::logging`); the
