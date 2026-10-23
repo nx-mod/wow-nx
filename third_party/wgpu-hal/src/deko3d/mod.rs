@@ -158,8 +158,8 @@ impl Descriptors {
 /// What the device and its queue share: deko3d's device, the one queue, a block of zeros for clears, shader code
 /// memory, the descriptor sets and the driver's uniform buffer.
 #[derive(Debug)]
-struct Shared {
-    device: DkDevice,
+pub(super) struct Shared {
+    pub(super) device: DkDevice,
     queue: DkQueue,
     zeros: DkMemBlock,
     code: Mutex<CodeMemory>,
@@ -170,11 +170,22 @@ struct Shared {
 unsafe impl Send for Shared {}
 unsafe impl Sync for Shared {}
 
+/// Everything that owns a memory block (the swapchain, encoders, buffers, textures) holds the shared state, so the
+/// device goes last: deko3d refuses to destroy a device with blocks alive, and hbl cannot hand the console back to
+/// the menu while a block stays mapped.
 impl Drop for Shared {
-    /// Waits for the GPU and leaves the rest to the process's exit: the device goes last in wgpu, after the surface
-    /// and encoders that still hold memory blocks, and deko3d refuses to destroy a device with blocks alive.
     fn drop(&mut self) {
-        unsafe { dkQueueWaitIdle(self.queue) };
+        unsafe {
+            dkQueueWaitIdle(self.queue);
+            dkQueueDestroy(self.queue);
+            dkMemBlockDestroy(self.zeros);
+            dkMemBlockDestroy(self.code.get_mut().mem_block);
+            let d = self.descriptors.get_mut();
+            dkMemBlockDestroy(d.images);
+            dkMemBlockDestroy(d.samplers);
+            dkMemBlockDestroy(self.ubo);
+            dkDeviceDestroy(self.device);
+        }
     }
 }
 
@@ -192,6 +203,7 @@ pub struct Queue {
 struct Swapchain {
     dk: DkSwapchain,
     memory: DkMemBlock,
+    _shared: Arc<Shared>,
     images: Vec<DkImage>,
     queue: DkQueue,
     format: wgt::TextureFormat,
@@ -213,6 +225,7 @@ pub struct Texture {
     image: Box<DkImage>,
     /// `None` for swapchain images, whose memory belongs to the swapchain.
     mem_block: Option<DkMemBlock>,
+    _shared: Option<Arc<Shared>>,
     format: wgt::TextureFormat,
     samples: u32,
     /// Width and height of mip 0.
@@ -453,6 +466,12 @@ impl Surface {
     }
 }
 
+impl Drop for Surface {
+    fn drop(&mut self) {
+        unsafe { self.release() };
+    }
+}
+
 impl crate::Surface for Surface {
     type A = Api;
 
@@ -494,6 +513,7 @@ impl crate::Surface for Surface {
         *self.swapchain.lock() = Some(Swapchain {
             dk: swapchain,
             memory,
+            _shared: device.shared.clone(),
             images,
             queue: device.shared.queue,
             format: config.format,
@@ -521,6 +541,7 @@ impl crate::Surface for Surface {
             texture: Texture {
                 image: Box::new(c.images[slot as usize]),
                 mem_block: None,
+                _shared: None,
                 format: c.format,
                 samples: 1,
                 size: (c.size.width, c.size.height),
@@ -682,7 +703,7 @@ impl crate::Device for Device {
     type A = Api;
 
     unsafe fn create_buffer(&self, desc: &crate::BufferDescriptor) -> DeviceResult<Buffer> {
-        unsafe { Buffer::new(self.shared.device, desc) }
+        unsafe { Buffer::new(&self.shared, desc) }
     }
 
     unsafe fn destroy_buffer(&self, buffer: Buffer) {
@@ -738,6 +759,7 @@ impl crate::Device for Device {
         Ok(Texture {
             image,
             mem_block: Some(memory),
+            _shared: Some(self.shared.clone()),
             format: desc.format,
             samples: desc.sample_count,
             size: (desc.size.width, desc.size.height),
@@ -799,7 +821,7 @@ impl crate::Device for Device {
         let d = c.descriptors.lock();
         unsafe {
             CommandEncoder::new(
-                c.device,
+                c.clone(),
                 command::DeviceAddrs {
                     zeros: (dkMemBlockGetGpuAddr(c.zeros), ZEROS_SIZE),
                     images: (dkMemBlockGetGpuAddr(d.images), MAX_IMAGES),

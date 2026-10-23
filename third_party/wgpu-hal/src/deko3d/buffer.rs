@@ -8,6 +8,7 @@ pub struct Buffer {
     pub(super) gpu: DkGpuAddr,
     pub(super) cpu: *mut u8,
     pub(super) size: u64,
+    _shared: alloc::sync::Arc<super::Shared>,
 }
 
 // SAFETY: the block is only freed by `Device::destroy_buffer`; wgpu-core orders access to it.
@@ -16,9 +17,10 @@ unsafe impl Sync for Buffer {}
 
 impl Buffer {
     pub(super) unsafe fn new(
-        device: DkDevice,
+        shared: &alloc::sync::Arc<super::Shared>,
         desc: &crate::BufferDescriptor,
     ) -> Result<Self, crate::DeviceError> {
+        let device = shared.device;
         let size = super::align_up(desc.size.max(1), DK_MEMBLOCK_ALIGNMENT as u64);
         let size = u32::try_from(size).map_err(|_| crate::DeviceError::OutOfMemory)?;
         let mem_block = unsafe {
@@ -30,6 +32,7 @@ impl Buffer {
             gpu: unsafe { dkMemBlockGetGpuAddr(mem_block) },
             cpu: unsafe { dkMemBlockGetCpuAddr(mem_block) }.cast(),
             size: desc.size,
+            _shared: shared.clone(),
         })
     }
 

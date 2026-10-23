@@ -61,6 +61,8 @@ unsafe extern "C" fn add_memory(user: *mut c_void, cmdbuf: DkCmdBuf, min_size: u
 #[derive(Debug)]
 pub struct CommandEncoder {
     cmdbuf: DkCmdBuf,
+    /// Dropped after the command memory is freed (`Drop`), so the device outlives it.
+    shared: alloc::sync::Arc<super::Shared>,
     memory: Box<CommandMemory>,
     addrs: DeviceAddrs,
     empty: bool,
@@ -76,7 +78,8 @@ pub struct CommandBuffer {
 }
 
 impl CommandEncoder {
-    pub(super) unsafe fn new(device: DkDevice, addrs: DeviceAddrs) -> DeviceResult<Self> {
+    pub(super) unsafe fn new(shared: alloc::sync::Arc<super::Shared>, addrs: DeviceAddrs) -> DeviceResult<Self> {
+        let device = shared.device;
         let mut memory = Box::new(CommandMemory {
             device,
             blocks: Vec::new(),
@@ -91,6 +94,7 @@ impl CommandEncoder {
         }
         Ok(Self {
             cmdbuf,
+            shared,
             memory,
             addrs,
             empty: true,

@@ -29,7 +29,8 @@
       "-mtune=cortex-a57",
       "-fPIE",
       "-L/opt/devkitpro/libnx/lib",
-      "-Wl,--allow-multiple-definition"
+      "-Wl,--allow-multiple-definition",
+      "-Wl,--wrap=pthread_create"
     ]
   },
   "late-link-args": {
