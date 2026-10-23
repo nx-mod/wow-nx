@@ -2,7 +2,36 @@ use alloc::{boxed::Box, vec::Vec};
 use core::{ffi::c_void, ops::Range};
 
 use super::ffi::*;
+use super::pipeline::{BindGroup, ComputePipeline, Muestreo, PipelineLayout, RenderPipeline, Tipo, SLOT_PRIMERA_INSTANCIA};
 use super::{Api, Buffer, DeviceResult, Resource, Texture, TextureView};
+
+/// The device's GPU addresses an encoder needs: zeros for clears, the descriptor sets, the driver's uniform buffer.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Fijos {
+    pub(super) ceros: (DkGpuAddr, u32),
+    pub(super) imagenes: (DkGpuAddr, u32),
+    pub(super) muestreadores: (DkGpuAddr, u32),
+    pub(super) ubo: (DkGpuAddr, u32),
+}
+
+/// What draws and dispatches read from earlier calls.
+#[derive(Debug, Default)]
+struct Estado {
+    texturas: [Option<u32>; DK_NUM_TEXTURE_BINDINGS as usize],
+    muestreadores: [Option<u32>; DK_NUM_TEXTURE_BINDINGS as usize],
+    imagenes: [Option<u32>; DK_NUM_IMAGE_BINDINGS as usize],
+    texturas_sucias: bool,
+    muestreo: Muestreo,
+    primitiva: Option<DkPrimitive>,
+    tira: bool,
+    primera_instancia: bool,
+    /// The first instance last written to the driver's uniform buffer.
+    primera_escrita: Option<u32>,
+    plantilla: (u8, u8),
+    referencia: u8,
+    indice: Option<DkIdxFormat>,
+    computo: bool,
+}
 
 /// Command memory of one encoder: deko3d asks for more through `anadir_memoria`.
 #[derive(Debug)]
@@ -28,9 +57,9 @@ unsafe extern "C" fn anadir_memoria(user: *mut c_void, cmdbuf: DkCmdBuf, minimo:
 pub struct CommandEncoder {
     cmdbuf: DkCmdBuf,
     memoria: Box<Memoria>,
-    /// GPU address and size of the device's zero-filled block.
-    ceros: (DkGpuAddr, u32),
+    fijos: Fijos,
     vacio: bool,
+    estado: Estado,
 }
 
 unsafe impl Send for CommandEncoder {}
@@ -42,7 +71,7 @@ pub struct CommandBuffer {
 }
 
 impl CommandEncoder {
-    pub(super) unsafe fn new(device: DkDevice, ceros: DkGpuAddr, tamano_ceros: u32) -> DeviceResult<Self> {
+    pub(super) unsafe fn new(device: DkDevice, fijos: Fijos) -> DeviceResult<Self> {
         let mut memoria = Box::new(Memoria {
             device,
             bloques: Vec::new(),
@@ -58,14 +87,66 @@ impl CommandEncoder {
         Ok(Self {
             cmdbuf,
             memoria,
-            ceros: (ceros, tamano_ceros),
+            fijos,
             vacio: true,
+            estado: Estado::default(),
         })
     }
 
+    /// The command buffer, after the descriptor sets on a list's first command.
     fn cmd(&mut self) -> DkCmdBuf {
-        self.vacio = false;
-        self.cmdbuf
+        let c = self.cmdbuf;
+        if self.vacio {
+            self.vacio = false;
+            let f = self.fijos;
+            unsafe {
+                dkCmdBufBindImageDescriptorSet(c, f.imagenes.0, f.imagenes.1);
+                dkCmdBufBindSamplerDescriptorSet(c, f.muestreadores.0, f.muestreadores.1);
+                // Descriptors written since the last list may reuse freed indices.
+                dkCmdBufBarrier(c, DkBarrier::DkBarrier_None, DkInvalidateFlags_Descriptors);
+            }
+        }
+        c
+    }
+
+    fn etapas(&self) -> &'static [DkStage] {
+        if self.estado.computo {
+            &[DkStage::DkStage_Compute]
+        } else {
+            &[DkStage::DkStage_Vertex, DkStage::DkStage_Fragment]
+        }
+    }
+
+    /// Binds the textures and storage images the current pipeline reads, once per change.
+    fn texturas(&mut self) {
+        if !self.estado.texturas_sucias {
+            return;
+        }
+        self.estado.texturas_sucias = false;
+        let c = self.cmd();
+        let e = &self.estado;
+        for &etapa in self.etapas() {
+            for &(t, m) in &e.muestreo.texturas {
+                let imagen = e.texturas.get(t as usize).copied().flatten().unwrap_or(0);
+                let muestreador = m.and_then(|m| e.muestreadores.get(m as usize).copied().flatten()).unwrap_or(0);
+                let h = unsafe { dkMakeTextureHandle(imagen, muestreador) };
+                unsafe { dkCmdBufBindTextures(c, etapa, t as u32, &h, 1) };
+            }
+            for &i in &e.muestreo.imagenes {
+                let h = unsafe { dkMakeImageHandle(e.imagenes.get(i as usize).copied().flatten().unwrap_or(0)) };
+                unsafe { dkCmdBufBindImages(c, etapa, i as u32, &h, 1) };
+            }
+        }
+    }
+
+    fn primera_instancia(&mut self, primera: u32) {
+        if !self.estado.primera_instancia || self.estado.primera_escrita == Some(primera) {
+            return;
+        }
+        self.estado.primera_escrita = Some(primera);
+        let (ubo, tamano) = self.fijos.ubo;
+        let c = self.cmd();
+        unsafe { dkCmdBufPushConstants(c, ubo, tamano, 0, 4, (&primera as *const u32).cast()) };
     }
 
     /// Waits for earlier work and drops cached texels and shader data, so later reads see earlier writes.
@@ -166,6 +247,7 @@ impl crate::CommandEncoder for CommandEncoder {
 
     unsafe fn begin_encoding(&mut self, label: crate::Label) -> DeviceResult<()> {
         self.vacio = true;
+        self.estado = Estado::default();
         Ok(())
     }
     unsafe fn discard_encoding(&mut self) {
@@ -208,7 +290,7 @@ impl crate::CommandEncoder for CommandEncoder {
     }
 
     unsafe fn clear_buffer(&mut self, buffer: &Buffer, range: crate::MemoryRange) {
-        let (ceros, tamano) = self.ceros;
+        let (ceros, tamano) = self.fijos.ceros;
         let c = self.cmd();
         let mut inicio = range.start;
         while inicio < range.end {
@@ -383,17 +465,110 @@ impl crate::CommandEncoder for CommandEncoder {
         unsafe { dkCmdBufBarrier(c, DkBarrier::DkBarrier_Fragments, DkInvalidateFlags_Image) };
     }
 
-    unsafe fn set_bind_group(&mut self, layout: &Resource, index: u32, group: &Resource, dynamic_offsets: &[wgt::DynamicOffset]) {}
-    unsafe fn set_push_constants(&mut self, layout: &Resource, stages: wgt::ShaderStages, offset_bytes: u32, data: &[u32]) {}
+    unsafe fn set_bind_group(
+        &mut self,
+        layout: &PipelineLayout,
+        index: u32,
+        group: &BindGroup,
+        dynamic_offsets: &[wgt::DynamicOffset],
+    ) {
+        let c = self.cmd();
+        let grupo = &layout.grupos[index as usize];
+        let mut dinamicos = dynamic_offsets.iter();
+        for r in group.recursos.iter() {
+            let ranura = (grupo.ranuras[r.binding as usize] + r.indice) as u32;
+            let desplazamiento = |dinamico: bool, d: &mut core::slice::Iter<'_, u32>| {
+                if dinamico { d.next().copied().unwrap_or(0) as u64 } else { 0 }
+            };
+            match r.tipo {
+                Tipo::Uniforme { gpu, tamano, dinamico } => {
+                    let gpu = gpu + desplazamiento(dinamico, &mut dinamicos);
+                    for &etapa in self.etapas() {
+                        unsafe { dkCmdBufBindUniformBuffer(c, etapa, ranura, gpu, tamano) };
+                    }
+                }
+                Tipo::Almacen { gpu, tamano, dinamico } => {
+                    let gpu = gpu + desplazamiento(dinamico, &mut dinamicos);
+                    for &etapa in self.etapas() {
+                        unsafe { dkCmdBufBindStorageBuffer(c, etapa, ranura, gpu, tamano) };
+                    }
+                }
+                Tipo::Textura { descriptor } => {
+                    if let Some(t) = self.estado.texturas.get_mut(ranura as usize) {
+                        *t = Some(descriptor);
+                    }
+                }
+                Tipo::Imagen { descriptor } => {
+                    if let Some(t) = self.estado.imagenes.get_mut(ranura as usize) {
+                        *t = Some(descriptor);
+                    }
+                }
+                Tipo::Muestreador { descriptor } => {
+                    if let Some(t) = self.estado.muestreadores.get_mut(ranura as usize) {
+                        *t = Some(descriptor);
+                    }
+                }
+            }
+        }
+        self.estado.texturas_sucias = true;
+    }
+    unsafe fn set_push_constants(&mut self, layout: &PipelineLayout, stages: wgt::ShaderStages, offset_bytes: u32, data: &[u32]) {}
 
     unsafe fn insert_debug_marker(&mut self, label: &str) {}
     unsafe fn begin_debug_marker(&mut self, group_label: &str) {}
     unsafe fn end_debug_marker(&mut self) {}
 
-    unsafe fn set_render_pipeline(&mut self, pipeline: &Resource) {}
+    unsafe fn set_render_pipeline(&mut self, p: &RenderPipeline) {
+        let c = self.cmd();
+        let mut shaders: arrayvec::ArrayVec<*const DkShader, 2> = arrayvec::ArrayVec::new();
+        shaders.push(&*p.vs.shader);
+        if let Some(fs) = &p.fs {
+            shaders.push(&*fs.shader);
+        }
+        unsafe {
+            dkCmdBufBindShaders(c, DkStageFlag_GraphicsMask, shaders.as_ptr(), shaders.len() as u32);
+            dkCmdBufBindRasterizerState(c, &p.rasterizador);
+            dkCmdBufBindMultisampleState(c, &p.multimuestra);
+            dkCmdBufSetSampleMask(c, p.mascara_muestras);
+            dkCmdBufBindColorState(c, &p.color);
+            dkCmdBufBindColorWriteState(c, &p.escritura);
+            if !p.mezclas.is_empty() {
+                dkCmdBufBindBlendStates(c, 0, p.mezclas.as_ptr(), p.mezclas.len() as u32);
+            }
+            dkCmdBufBindDepthStencilState(c, &p.profundidad);
+            dkCmdBufSetDepthBias(c, p.sesgo.0, p.sesgo.1, p.sesgo.2);
+            dkCmdBufSetStencil(c, DkFace::DkFace_FrontAndBack, p.plantilla.1, self.estado.referencia, p.plantilla.0);
+            dkCmdBufBindVtxAttribState(c, p.atributos.as_ptr(), p.atributos.len() as u32);
+            dkCmdBufBindVtxBufferState(c, p.buferes.as_ptr(), p.buferes.len() as u32);
+            if p.primera_instancia {
+                let (ubo, tamano) = self.fijos.ubo;
+                dkCmdBufBindUniformBuffer(c, DkStage::DkStage_Vertex, SLOT_PRIMERA_INSTANCIA, ubo, tamano);
+            }
+        }
+        let e = &mut self.estado;
+        e.muestreo = p.muestreo.clone();
+        e.primitiva = Some(p.primitiva);
+        e.tira = p.tira;
+        e.primera_instancia = p.primera_instancia;
+        e.primera_escrita = None;
+        e.plantilla = p.plantilla;
+        e.texturas_sucias = true;
+    }
 
-    unsafe fn set_index_buffer<'a>(&mut self, binding: crate::BufferBinding<'a, Buffer>, format: wgt::IndexFormat) {}
-    unsafe fn set_vertex_buffer<'a>(&mut self, index: u32, binding: crate::BufferBinding<'a, Buffer>) {}
+    unsafe fn set_index_buffer<'a>(&mut self, binding: crate::BufferBinding<'a, Buffer>, format: wgt::IndexFormat) {
+        let c = self.cmd();
+        let f = match format {
+            wgt::IndexFormat::Uint16 => DkIdxFormat::DkIdxFormat_Uint16,
+            wgt::IndexFormat::Uint32 => DkIdxFormat::DkIdxFormat_Uint32,
+        };
+        unsafe { dkCmdBufBindIdxBuffer(c, f, binding.buffer.gpu + binding.offset) };
+        self.estado.indice = Some(f);
+    }
+    unsafe fn set_vertex_buffer<'a>(&mut self, index: u32, binding: crate::BufferBinding<'a, Buffer>) {
+        let c = self.cmd();
+        let tamano = binding.size.map_or(binding.buffer.size - binding.offset, |s| s.get());
+        unsafe { dkCmdBufBindVtxBuffer(c, index, binding.buffer.gpu + binding.offset, tamano as u32) };
+    }
     unsafe fn set_viewport(&mut self, rect: &crate::Rect<f32>, depth_range: Range<f32>) {
         let c = self.cmd();
         let v = DkViewport {
@@ -416,17 +591,56 @@ impl crate::CommandEncoder for CommandEncoder {
         };
         unsafe { dkCmdBufSetScissors(c, 0, &s, 1) };
     }
-    unsafe fn set_stencil_reference(&mut self, value: u32) {}
+    unsafe fn set_stencil_reference(&mut self, value: u32) {
+        let c = self.cmd();
+        self.estado.referencia = value as u8;
+        let (lectura, escritura) = self.estado.plantilla;
+        unsafe { dkCmdBufSetStencil(c, DkFace::DkFace_FrontAndBack, escritura, value as u8, lectura) };
+    }
     unsafe fn set_blend_constants(&mut self, color: &[f32; 4]) {
         let c = self.cmd();
         unsafe { dkCmdBufSetBlendConst(c, color[0], color[1], color[2], color[3]) };
     }
 
-    unsafe fn draw(&mut self, first_vertex: u32, vertex_count: u32, first_instance: u32, instance_count: u32) {}
-    unsafe fn draw_indexed(&mut self, first_index: u32, index_count: u32, base_vertex: i32, first_instance: u32, instance_count: u32) {}
+    unsafe fn draw(&mut self, first_vertex: u32, vertex_count: u32, first_instance: u32, instance_count: u32) {
+        let Some(prim) = self.estado.primitiva else { return };
+        self.texturas();
+        self.primera_instancia(first_instance);
+        let c = self.cmd();
+        unsafe { dkCmdBufDraw(c, prim, vertex_count, instance_count, first_vertex, first_instance) };
+    }
+    unsafe fn draw_indexed(&mut self, first_index: u32, index_count: u32, base_vertex: i32, first_instance: u32, instance_count: u32) {
+        let Some(prim) = self.estado.primitiva else { return };
+        self.texturas();
+        self.primera_instancia(first_instance);
+        let c = self.cmd();
+        let reinicio = if self.estado.indice == Some(DkIdxFormat::DkIdxFormat_Uint16) { 0xffff } else { 0xffff_ffff };
+        unsafe {
+            dkCmdBufSetPrimitiveRestart(c, self.estado.tira, reinicio);
+            dkCmdBufDrawIndexed(c, prim, index_count, instance_count, first_index, base_vertex, first_instance);
+        }
+    }
     unsafe fn draw_mesh_tasks(&mut self, group_count_x: u32, group_count_y: u32, group_count_z: u32) {}
-    unsafe fn draw_indirect(&mut self, buffer: &Buffer, offset: wgt::BufferAddress, draw_count: u32) {}
-    unsafe fn draw_indexed_indirect(&mut self, buffer: &Buffer, offset: wgt::BufferAddress, draw_count: u32) {}
+    unsafe fn draw_indirect(&mut self, buffer: &Buffer, offset: wgt::BufferAddress, draw_count: u32) {
+        let Some(prim) = self.estado.primitiva else { return };
+        self.texturas();
+        self.primera_instancia(0);
+        let c = self.cmd();
+        for i in 0..draw_count as u64 {
+            unsafe { dkCmdBufDrawIndirect(c, prim, buffer.gpu + offset + i * 16) };
+        }
+    }
+    unsafe fn draw_indexed_indirect(&mut self, buffer: &Buffer, offset: wgt::BufferAddress, draw_count: u32) {
+        let Some(prim) = self.estado.primitiva else { return };
+        self.texturas();
+        self.primera_instancia(0);
+        let c = self.cmd();
+        let reinicio = if self.estado.indice == Some(DkIdxFormat::DkIdxFormat_Uint16) { 0xffff } else { 0xffff_ffff };
+        unsafe { dkCmdBufSetPrimitiveRestart(c, self.estado.tira, reinicio) };
+        for i in 0..draw_count as u64 {
+            unsafe { dkCmdBufDrawIndexedIndirect(c, prim, buffer.gpu + offset + i * 20) };
+        }
+    }
     unsafe fn draw_mesh_tasks_indirect(&mut self, buffer: &Buffer, offset: wgt::BufferAddress, draw_count: u32) {}
     unsafe fn draw_indirect_count(
         &mut self,
@@ -458,16 +672,35 @@ impl crate::CommandEncoder for CommandEncoder {
 
     // compute
 
-    unsafe fn begin_compute_pass(&mut self, desc: &crate::ComputePassDescriptor<Resource>) {}
+    unsafe fn begin_compute_pass(&mut self, desc: &crate::ComputePassDescriptor<Resource>) {
+        self.estado.computo = true;
+        self.estado.texturas_sucias = true;
+    }
     unsafe fn end_compute_pass(&mut self) {
+        self.estado.computo = false;
+        self.estado.texturas_sucias = true;
         let c = self.cmd();
-        unsafe { dkCmdBufBarrier(c, DkBarrier::DkBarrier_Primitives, 0) };
+        unsafe { dkCmdBufBarrier(c, DkBarrier::DkBarrier_Primitives, DkInvalidateFlags_Image | DkInvalidateFlags_Shader) };
     }
 
-    unsafe fn set_compute_pipeline(&mut self, pipeline: &Resource) {}
+    unsafe fn set_compute_pipeline(&mut self, p: &ComputePipeline) {
+        let c = self.cmd();
+        let cs: *const DkShader = &*p.cs.shader;
+        unsafe { dkCmdBufBindShaders(c, DkStageFlag_Compute, &cs, 1) };
+        self.estado.muestreo = p.muestreo.clone();
+        self.estado.texturas_sucias = true;
+    }
 
-    unsafe fn dispatch(&mut self, count: [u32; 3]) {}
-    unsafe fn dispatch_indirect(&mut self, buffer: &Buffer, offset: wgt::BufferAddress) {}
+    unsafe fn dispatch(&mut self, count: [u32; 3]) {
+        self.texturas();
+        let c = self.cmd();
+        unsafe { dkCmdBufDispatchCompute(c, count[0], count[1], count[2]) };
+    }
+    unsafe fn dispatch_indirect(&mut self, buffer: &Buffer, offset: wgt::BufferAddress) {
+        self.texturas();
+        let c = self.cmd();
+        unsafe { dkCmdBufDispatchComputeIndirect(c, buffer.gpu + offset) };
+    }
 
     unsafe fn build_acceleration_structures<'a, T>(&mut self, _descriptor_count: u32, descriptors: T)
     where

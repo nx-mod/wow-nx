@@ -333,6 +333,10 @@ optional = true
 version = "0.3.2"
 optional = true
 
+# wow-nx: uam, deko3d's shader compiler, for the deko3d backend.
+[target.'cfg(target_os = "horizon")'.dependencies.benilla-uam]
+path = "../../crates/benilla-uam"
+
 [target.'cfg(all(not(target_arch = "wasm32"), not(target_os = "horizon")))'.dependencies.khronos-egl]
 version = "6"
 features = ["dynamic"]

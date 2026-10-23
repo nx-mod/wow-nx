@@ -4,8 +4,9 @@
 //! backend and nothing above wgpu-hal changes. The map from WebGPU to deko3d follows nx-mod/dawn-nx's deko3d backend
 //! (branch `switch-deko3d`, `src/dawn/native/deko3d`).
 //!
-//! What works: device, queue, fences, buffers, textures and views, the swapchain, render passes that clear, and
-//! copies. Shaders, pipelines, bind groups and draws are still stubs.
+//! What works: device, queue, fences, buffers, textures and views, the swapchain, render passes, copies, and
+//! (untested on the console yet) shaders through naga and uam, pipelines, bind groups, samplers and draws.
+//! Queries and acceleration structures are stubs.
 #![allow(unused_variables)]
 
 use alloc::{boxed::Box, string::String, sync::Arc, vec, vec::Vec};
@@ -18,6 +19,7 @@ use crate::TlasInstance;
 mod buffer;
 mod command;
 mod conv;
+mod pipeline;
 #[allow(
     dead_code,
     non_camel_case_types,
@@ -31,6 +33,7 @@ mod ffi;
 
 pub use buffer::Buffer;
 pub use command::{CommandBuffer, CommandEncoder};
+pub use pipeline::{BindGroup, BindGroupLayout, ComputePipeline, PipelineLayout, RenderPipeline, Sampler, ShaderModule};
 use ffi::*;
 
 #[link(name = "nx")]
@@ -42,6 +45,13 @@ unsafe extern "C" {
 const CEROS: u32 = 64 * 1024;
 /// Command memory added to an encoder at a time.
 const MEMORIA_COMANDOS: u32 = 256 * 1024;
+/// Shader code memory.
+const MEMORIA_CODIGO: u32 = 32 << 20;
+/// Descriptor set sizes: one image descriptor per sampled or storage view, one sampler descriptor per sampler.
+const IMAGENES: u32 = 8192;
+const MUESTREADORES: u32 = 2048;
+/// The driver's own uniform buffer (the first instance).
+const UBO_DRIVER: u32 = 256;
 
 pub(super) fn alinear(valor: u64, alineacion: u64) -> u64 {
     (valor + alineacion - 1) & !(alineacion - 1)
@@ -80,12 +90,81 @@ pub struct Instance;
 #[derive(Debug)]
 pub struct Adapter;
 
-/// What the device and its queue share: deko3d's device, the one queue, and a block of zeros for clears.
+/// Shader code memory, filled from the start. Code is never freed.
+// TODO(wow-nx): recycle the code of destroyed pipelines.
+#[derive(Debug)]
+struct Codigo {
+    bloque: DkMemBlock,
+    usado: u32,
+}
+
+impl Codigo {
+    /// Loads a one-program DKSH file: the control section stays on the CPU, the code goes to code memory.
+    fn cargar(&mut self, dksh: &[u8]) -> Option<Box<DkShader>> {
+        let palabra = |i: usize| -> Option<u32> { Some(u32::from_le_bytes(dksh.get(i * 4..i * 4 + 4)?.try_into().ok()?)) };
+        let [magia, _, control, codigo, _, programas] = [palabra(0)?, palabra(1)?, palabra(2)?, palabra(3)?, palabra(4)?, palabra(5)?];
+        if magia != 0x4853_4B44 || programas != 1 || control as usize + codigo as usize > dksh.len() {
+            log::error!("deko3d: not a one-program DKSH ({} bytes)", dksh.len());
+            return None;
+        }
+        let en = alinear(self.usado as u64, DK_SHADER_CODE_ALIGNMENT as u64) as u32;
+        if en as u64 + codigo as u64 > (MEMORIA_CODIGO - DK_SHADER_CODE_UNUSABLE_SIZE) as u64 {
+            log::error!("deko3d: shader code memory full");
+            return None;
+        }
+        unsafe {
+            let destino = dkMemBlockGetCpuAddr(self.bloque).cast::<u8>().add(en as usize);
+            ptr::copy_nonoverlapping(dksh.as_ptr().add(control as usize), destino, codigo as usize);
+        }
+        self.usado = en + codigo;
+        let mut maker = unsafe { core::mem::zeroed::<DkShaderMaker>() };
+        unsafe { dkShaderMakerDefaults(&mut maker, self.bloque, en) };
+        maker.control = dksh.as_ptr().cast();
+        maker.programId = 0;
+        let mut shader = Box::new(unsafe { core::mem::zeroed::<DkShader>() });
+        unsafe { dkShaderInitialize(&mut *shader, &maker) };
+        Some(shader)
+    }
+}
+
+/// The image and sampler descriptor sets every command buffer binds, with free lists.
+#[derive(Debug)]
+struct Descriptores {
+    imagenes: DkMemBlock,
+    muestreadores: DkMemBlock,
+    libres_imagenes: Vec<u32>,
+    libres_muestreadores: Vec<u32>,
+}
+
+impl Descriptores {
+    fn nueva_imagen(&mut self, vista: &DkImageView, carga_almacen: bool) -> Option<u32> {
+        let i = self.libres_imagenes.pop()?;
+        unsafe {
+            let d = dkMemBlockGetCpuAddr(self.imagenes).cast::<DkImageDescriptor>().add(i as usize);
+            dkImageDescriptorInitialize(d, vista, carga_almacen, false);
+        }
+        Some(i)
+    }
+    fn nuevo_muestreador(&mut self, m: &DkSampler) -> Option<u32> {
+        let i = self.libres_muestreadores.pop()?;
+        unsafe {
+            let d = dkMemBlockGetCpuAddr(self.muestreadores).cast::<DkSamplerDescriptor>().add(i as usize);
+            dkSamplerDescriptorInitialize(d, m);
+        }
+        Some(i)
+    }
+}
+
+/// What the device and its queue share: deko3d's device, the one queue, a block of zeros for clears, shader code
+/// memory, the descriptor sets and the driver's uniform buffer.
 #[derive(Debug)]
 struct Compartido {
     device: DkDevice,
     cola: DkQueue,
     ceros: DkMemBlock,
+    codigo: Mutex<Codigo>,
+    descriptores: Mutex<Descriptores>,
+    ubo: DkMemBlock,
 }
 
 unsafe impl Send for Compartido {}
@@ -97,6 +176,11 @@ impl Drop for Compartido {
             dkQueueWaitIdle(self.cola);
             dkQueueDestroy(self.cola);
             dkMemBlockDestroy(self.ceros);
+            dkMemBlockDestroy(self.codigo.get_mut().bloque);
+            let d = self.descriptores.get_mut();
+            dkMemBlockDestroy(d.imagenes);
+            dkMemBlockDestroy(d.muestreadores);
+            dkMemBlockDestroy(self.ubo);
             dkDeviceDestroy(self.device);
         }
     }
@@ -158,6 +242,8 @@ unsafe impl Sync for Texture {}
 #[derive(Debug)]
 pub struct TextureView {
     vista: DkImageView,
+    /// Index in the image descriptor set, for views that are sampled or stored to.
+    descriptor: Option<u32>,
     formato: wgt::TextureFormat,
     /// Size of the viewed mip level, for render passes.
     tamano: (u32, u32),
@@ -218,22 +304,29 @@ impl crate::Api for Api {
     type Texture = Texture;
     type SurfaceTexture = Texture;
     type TextureView = TextureView;
-    type Sampler = Resource;
+    type Sampler = Sampler;
     type QuerySet = Resource;
     type Fence = Fence;
     type AccelerationStructure = Resource;
     type PipelineCache = Resource;
 
-    type BindGroupLayout = Resource;
-    type BindGroup = Resource;
-    type PipelineLayout = Resource;
-    type ShaderModule = Resource;
-    type RenderPipeline = Resource;
-    type ComputePipeline = Resource;
+    type BindGroupLayout = BindGroupLayout;
+    type BindGroup = BindGroup;
+    type PipelineLayout = PipelineLayout;
+    type ShaderModule = ShaderModule;
+    type RenderPipeline = RenderPipeline;
+    type ComputePipeline = ComputePipeline;
 }
 
 crate::impl_dyn_resource!(
     Adapter,
+    BindGroup,
+    BindGroupLayout,
+    ComputePipeline,
+    PipelineLayout,
+    RenderPipeline,
+    Sampler,
+    ShaderModule,
     Buffer,
     CommandBuffer,
     CommandEncoder,
@@ -248,18 +341,18 @@ crate::impl_dyn_resource!(
 );
 
 impl crate::DynAccelerationStructure for Resource {}
-impl crate::DynBindGroup for Resource {}
-impl crate::DynBindGroupLayout for Resource {}
+impl crate::DynBindGroup for BindGroup {}
+impl crate::DynBindGroupLayout for BindGroupLayout {}
 impl crate::DynBuffer for Buffer {}
 impl crate::DynCommandBuffer for CommandBuffer {}
-impl crate::DynComputePipeline for Resource {}
+impl crate::DynComputePipeline for ComputePipeline {}
 impl crate::DynFence for Fence {}
 impl crate::DynPipelineCache for Resource {}
-impl crate::DynPipelineLayout for Resource {}
+impl crate::DynPipelineLayout for PipelineLayout {}
 impl crate::DynQuerySet for Resource {}
-impl crate::DynRenderPipeline for Resource {}
-impl crate::DynSampler for Resource {}
-impl crate::DynShaderModule for Resource {}
+impl crate::DynRenderPipeline for RenderPipeline {}
+impl crate::DynSampler for Sampler {}
+impl crate::DynShaderModule for ShaderModule {}
 impl crate::DynSurfaceTexture for Texture {}
 impl crate::DynTexture for Texture {}
 impl crate::DynTextureView for TextureView {}
@@ -313,9 +406,9 @@ pub fn adapter_info() -> wgt::AdapterInfo {
     }
 }
 
-const FEATURES: wgt::Features = wgt::Features::TEXTURE_COMPRESSION_BC
-    .union(wgt::Features::DEPTH32FLOAT_STENCIL8)
-    .union(wgt::Features::INDIRECT_FIRST_INSTANCE);
+// No INDIRECT_FIRST_INSTANCE: the first instance reaches shaders through the driver's uniform buffer, which an
+// indirect draw does not update.
+const FEATURES: wgt::Features = wgt::Features::TEXTURE_COMPRESSION_BC.union(wgt::Features::DEPTH32FLOAT_STENCIL8);
 
 /// Maxwell's limits as deko3d exposes them, within WebGPU's defaults where those are lower.
 fn capabilities() -> crate::Capabilities {
@@ -473,11 +566,31 @@ impl crate::Adapter for Adapter {
         let ceros = unsafe {
             bloque(device, CEROS, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached | DkMemBlockFlags_ZeroFillInit)
         };
-        let (false, Some(ceros)) = (cola.is_null(), ceros) else {
+        let normal = DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached;
+        let codigo = unsafe { bloque(device, MEMORIA_CODIGO, normal | DkMemBlockFlags_Code) };
+        let tam = |n: u32, t: usize| alinear(n as u64 * t as u64, DK_MEMBLOCK_ALIGNMENT as u64) as u32;
+        let imagenes = unsafe { bloque(device, tam(IMAGENES, core::mem::size_of::<DkImageDescriptor>()), normal) };
+        let muestreadores = unsafe { bloque(device, tam(MUESTREADORES, core::mem::size_of::<DkSamplerDescriptor>()), normal) };
+        let ubo = unsafe { bloque(device, DK_MEMBLOCK_ALIGNMENT, normal) };
+        let (false, Some(ceros), Some(codigo), Some(imagenes), Some(muestreadores), Some(ubo)) =
+            (cola.is_null(), ceros, codigo, imagenes, muestreadores, ubo)
+        else {
             unsafe { dkDeviceDestroy(device) };
             return Err(crate::DeviceError::OutOfMemory);
         };
-        let compartido = Arc::new(Compartido { device, cola, ceros });
+        let compartido = Arc::new(Compartido {
+            device,
+            cola,
+            ceros,
+            codigo: Mutex::new(Codigo { bloque: codigo, usado: 0 }),
+            descriptores: Mutex::new(Descriptores {
+                imagenes,
+                muestreadores,
+                libres_imagenes: (0..IMAGENES).rev().collect(),
+                libres_muestreadores: (0..MUESTREADORES).rev().collect(),
+            }),
+            ubo,
+        });
         Ok(crate::OpenDevice {
             device: Device {
                 compartido: compartido.clone(),
@@ -654,61 +767,89 @@ impl crate::Device for Device {
         vista.layerOffset = desc.range.base_array_layer as u16;
         vista.layerCount = desc.range.array_layer_count.unwrap_or(0) as u16;
         let (ancho, alto) = texture.tamano;
+        let almacen = wgt::TextureUses::STORAGE_READ_ONLY | wgt::TextureUses::STORAGE_WRITE_ONLY | wgt::TextureUses::STORAGE_READ_WRITE;
+        let descriptor = if desc.usage.intersects(wgt::TextureUses::RESOURCE | almacen) {
+            let d = self.compartido.descriptores.lock().nueva_imagen(&vista, desc.usage.intersects(almacen));
+            Some(d.ok_or(crate::DeviceError::OutOfMemory)?)
+        } else {
+            None
+        };
         Ok(TextureView {
             vista,
+            descriptor,
             formato: desc.format,
             tamano: ((ancho >> mip).max(1), (alto >> mip).max(1)),
         })
     }
-    unsafe fn destroy_texture_view(&self, view: TextureView) {}
-    unsafe fn create_sampler(&self, desc: &crate::SamplerDescriptor) -> DeviceResult<Resource> {
-        Ok(Resource)
+    unsafe fn destroy_texture_view(&self, view: TextureView) {
+        if let Some(d) = view.descriptor {
+            self.compartido.descriptores.lock().libres_imagenes.push(d);
+        }
     }
-    unsafe fn destroy_sampler(&self, sampler: Resource) {}
+    unsafe fn create_sampler(&self, desc: &crate::SamplerDescriptor) -> DeviceResult<Sampler> {
+        self.nuevo_muestreador(desc)
+    }
+    unsafe fn destroy_sampler(&self, sampler: Sampler) {
+        self.compartido.descriptores.lock().libres_muestreadores.push(sampler.descriptor);
+    }
 
     unsafe fn create_command_encoder(&self, desc: &crate::CommandEncoderDescriptor<Queue>) -> DeviceResult<CommandEncoder> {
         let c = &self.compartido;
-        unsafe { CommandEncoder::new(c.device, dkMemBlockGetGpuAddr(c.ceros), CEROS) }
+        let d = c.descriptores.lock();
+        unsafe {
+            CommandEncoder::new(
+                c.device,
+                command::Fijos {
+                    ceros: (dkMemBlockGetGpuAddr(c.ceros), CEROS),
+                    imagenes: (dkMemBlockGetGpuAddr(d.imagenes), IMAGENES),
+                    muestreadores: (dkMemBlockGetGpuAddr(d.muestreadores), MUESTREADORES),
+                    ubo: (dkMemBlockGetGpuAddr(c.ubo), UBO_DRIVER),
+                },
+            )
+        }
     }
 
-    unsafe fn create_bind_group_layout(&self, desc: &crate::BindGroupLayoutDescriptor) -> DeviceResult<Resource> {
-        Ok(Resource)
+    unsafe fn create_bind_group_layout(&self, desc: &crate::BindGroupLayoutDescriptor) -> DeviceResult<BindGroupLayout> {
+        Ok(self.nuevo_layout_grupos(desc))
     }
-    unsafe fn destroy_bind_group_layout(&self, bg_layout: Resource) {}
-    unsafe fn create_pipeline_layout(&self, desc: &crate::PipelineLayoutDescriptor<Resource>) -> DeviceResult<Resource> {
-        Ok(Resource)
+    unsafe fn destroy_bind_group_layout(&self, bg_layout: BindGroupLayout) {}
+    unsafe fn create_pipeline_layout(&self, desc: &crate::PipelineLayoutDescriptor<BindGroupLayout>) -> DeviceResult<PipelineLayout> {
+        Ok(self.nuevo_layout(desc))
     }
-    unsafe fn destroy_pipeline_layout(&self, pipeline_layout: Resource) {}
+    unsafe fn destroy_pipeline_layout(&self, pipeline_layout: PipelineLayout) {}
     unsafe fn create_bind_group(
         &self,
-        desc: &crate::BindGroupDescriptor<Resource, Buffer, Resource, TextureView, Resource>,
-    ) -> DeviceResult<Resource> {
-        Ok(Resource)
+        desc: &crate::BindGroupDescriptor<BindGroupLayout, Buffer, Sampler, TextureView, Resource>,
+    ) -> DeviceResult<BindGroup> {
+        Ok(self.nuevo_grupo(desc))
     }
-    unsafe fn destroy_bind_group(&self, group: Resource) {}
+    unsafe fn destroy_bind_group(&self, group: BindGroup) {}
 
     unsafe fn create_shader_module(
         &self,
         desc: &crate::ShaderModuleDescriptor,
         shader: crate::ShaderInput,
-    ) -> Result<Resource, crate::ShaderError> {
-        Ok(Resource)
+    ) -> Result<ShaderModule, crate::ShaderError> {
+        match shader {
+            crate::ShaderInput::Naga(naga) => Ok(ShaderModule { naga }),
+            _ => Err(crate::ShaderError::Compilation(String::from("deko3d takes naga modules only"))),
+        }
     }
-    unsafe fn destroy_shader_module(&self, module: Resource) {}
+    unsafe fn destroy_shader_module(&self, module: ShaderModule) {}
     unsafe fn create_render_pipeline(
         &self,
-        desc: &crate::RenderPipelineDescriptor<Resource, Resource, Resource>,
-    ) -> Result<Resource, crate::PipelineError> {
-        Ok(Resource)
+        desc: &crate::RenderPipelineDescriptor<PipelineLayout, ShaderModule, Resource>,
+    ) -> Result<RenderPipeline, crate::PipelineError> {
+        self.nueva_tuberia(desc)
     }
-    unsafe fn destroy_render_pipeline(&self, pipeline: Resource) {}
+    unsafe fn destroy_render_pipeline(&self, pipeline: RenderPipeline) {}
     unsafe fn create_compute_pipeline(
         &self,
-        desc: &crate::ComputePipelineDescriptor<Resource, Resource, Resource>,
-    ) -> Result<Resource, crate::PipelineError> {
-        Ok(Resource)
+        desc: &crate::ComputePipelineDescriptor<PipelineLayout, ShaderModule, Resource>,
+    ) -> Result<ComputePipeline, crate::PipelineError> {
+        self.nueva_tuberia_computo(desc)
     }
-    unsafe fn destroy_compute_pipeline(&self, pipeline: Resource) {}
+    unsafe fn destroy_compute_pipeline(&self, pipeline: ComputePipeline) {}
     unsafe fn create_pipeline_cache(&self, desc: &crate::PipelineCacheDescriptor<'_>) -> Result<Resource, crate::PipelineCacheError> {
         Ok(Resource)
     }
