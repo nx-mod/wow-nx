@@ -724,14 +724,26 @@ impl crate::Queue for Queue {
         (fence, fence_value): (&mut Fence, crate::FenceValue),
     ) -> DeviceResult<()> {
         let queue = self.shared.queue;
+        // Each list flushed as it goes, so the channel's 2048 GPFIFO entries never fill (command.rs); and every
+        // LISTS_PER_WAIT kickoffs the GPU is let catch up, or the kernel's ring of submissions fills and a kickoff
+        // fails (a first frame's uploads are hundreds of lists).
+        const LISTS_PER_WAIT: usize = 8;
+        let mut kicked = 0;
         for cb in command_buffers {
-            // Each list flushed as it goes: the channel's 2048 GPFIFO entries never fill (command.rs).
             for &list in &cb.lists {
                 unsafe {
                     dkQueueSubmitCommands(queue, list);
                     dkQueueFlush(queue);
                 }
+                kicked += 1;
+                if kicked % LISTS_PER_WAIT == 0 {
+                    unsafe { dkQueueWaitIdle(queue) };
+                }
             }
+        }
+        #[cfg(deko3d_depurar)]
+        if kicked > LISTS_PER_WAIT {
+            log::warn!("deko3d: a submission of {} command buffers, {kicked} lists", command_buffers.len());
         }
         let mut dk = Box::new(unsafe { core::mem::zeroed::<DkFence>() });
         unsafe {
