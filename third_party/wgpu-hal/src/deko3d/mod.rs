@@ -725,8 +725,12 @@ impl crate::Queue for Queue {
     ) -> DeviceResult<()> {
         let queue = self.shared.queue;
         for cb in command_buffers {
-            if cb.list != 0 {
-                unsafe { dkQueueSubmitCommands(queue, cb.list) };
+            // Each list flushed as it goes: the channel's 2048 GPFIFO entries never fill (command.rs).
+            for &list in &cb.lists {
+                unsafe {
+                    dkQueueSubmitCommands(queue, list);
+                    dkQueueFlush(queue);
+                }
             }
         }
         let mut dk = Box::new(unsafe { core::mem::zeroed::<DkFence>() });

@@ -3,7 +3,9 @@
 //! - Paths: the install is `sdmc:/wow-nx/Data` and the state folder `sdmc:/wow-nx/benilla-config`, unless `WOW_DATA`
 //!   or `BENILLA_HOME` say otherwise (the Switch has no executable path to resolve them from).
 //! - The window: the primary window gets a raw handle to libnx's default `NWindow`, which wgpu's deko3d backend
-//!   presents to (`third_party/wgpu-hal`).
+//!   presents to (`third_party/wgpu-hal`), and is held at the window's own 1280x720, windowed, at scale 1
+//!   ([`pin_window`]): benilla's video settings (`gxResolution`, 1600x900 by default; borderless fullscreen) would
+//!   otherwise size the swapchain for a monitor the Switch does not have.
 //! - The main loop: the runner steps the app inside libnx's applet loop, which handles HOME, sleep and exit.
 //!
 //! - Settings: `sdmc:/wow-nx/benilla.env`, `KEY=VALUE` lines read into the environment at start (`WOW_HOST`,
@@ -48,6 +50,7 @@ pub(crate) struct SwitchPlugin;
 impl Plugin for SwitchPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(PreUpdate, give_window_handle)
+            .add_systems(PostUpdate, pin_window)
             .add_systems(PreUpdate, input::read.before(bevy::input::InputSystems))
             .init_non_send_resource::<input::Hid>()
             .set_runner(run);
@@ -81,6 +84,22 @@ fn give_window_handle(mut commands: Commands, new: Query<Entity, (With<Window>, 
                 commands.entity(e).insert(h);
             }
             Err(err) => error!("switch: window handle: {err}"),
+        }
+    }
+}
+
+/// The screen libnx's default window has (docked, the console scales it to the TV).
+const SCREEN: (u32, u32) = (1280, 720);
+
+/// Holds every window at the screen's size, windowed, at scale 1, whatever the video settings asked.
+fn pin_window(mut windows: Query<&mut Window>) {
+    for mut w in &mut windows {
+        let size_ok = w.resolution.physical_width() == SCREEN.0 && w.resolution.physical_height() == SCREEN.1;
+        let scale_ok = w.resolution.scale_factor() == 1.0;
+        if !size_ok || !scale_ok || w.mode != bevy::window::WindowMode::Windowed {
+            w.mode = bevy::window::WindowMode::Windowed;
+            w.resolution.set_scale_factor_override(Some(1.0));
+            w.resolution.set_physical_resolution(SCREEN.0, SCREEN.1);
         }
     }
 }

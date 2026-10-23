@@ -67,6 +67,11 @@ pub struct CommandEncoder {
     memory: Box<CommandMemory>,
     addrs: DeviceAddrs,
     empty: bool,
+    /// Lists finished so far in this encoding, and commands in the current one.
+    lists: Vec<DkCmdList>,
+    commands: u32,
+    /// A barrier asked for and not yet written: consecutive transitions make one, before the next command.
+    barrier_pending: bool,
     state: DrawState,
 }
 
@@ -75,8 +80,14 @@ unsafe impl Sync for CommandEncoder {}
 
 #[derive(Debug)]
 pub struct CommandBuffer {
-    pub(super) list: DkCmdList,
+    /// Short lists, each submitted and flushed on its own (`LIST_COMMANDS`).
+    pub(super) lists: Vec<DkCmdList>,
 }
+
+/// Commands per deko3d list. libnx's GPU channel holds 2048 GPFIFO entries between flushes, and a long list (a
+/// frame's texture uploads) overflows it ("gpfifo entry append failed"): lists are kept short and each one is flushed
+/// as it is submitted. GPU state carries from one list to the next on the queue.
+const LIST_COMMANDS: u32 = 256;
 
 impl CommandEncoder {
     pub(super) unsafe fn new(shared: alloc::sync::Arc<super::Shared>, addrs: DeviceAddrs) -> DeviceResult<Self> {
@@ -100,6 +111,9 @@ impl CommandEncoder {
             memory,
             addrs,
             empty: true,
+            lists: Vec::new(),
+            commands: 0,
+            barrier_pending: false,
             state: DrawState::default(),
         })
     }
@@ -107,6 +121,14 @@ impl CommandEncoder {
     /// The command buffer, after the descriptor sets on a list's first command.
     fn cmd(&mut self) -> DkCmdBuf {
         let c = self.cmdbuf;
+        if self.commands >= LIST_COMMANDS {
+            let list = unsafe { dkCmdBufFinishList(c) };
+            if list != 0 {
+                self.lists.push(list);
+            }
+            self.commands = 0;
+        }
+        self.commands += 1;
         if self.empty {
             self.empty = false;
             let f = self.addrs;
@@ -116,6 +138,10 @@ impl CommandEncoder {
                 // Descriptors written since the last list may reuse freed indices.
                 dkCmdBufBarrier(c, DkBarrier::DkBarrier_None, DkInvalidateFlags_Descriptors);
             }
+        }
+        if self.barrier_pending {
+            self.barrier_pending = false;
+            unsafe { dkCmdBufBarrier(c, DkBarrier::DkBarrier_Full, DkInvalidateFlags_Image | DkInvalidateFlags_Shader) };
         }
         c
     }
@@ -172,8 +198,7 @@ impl CommandEncoder {
     /// Waits for earlier work and drops cached texels and shader data, so later reads see earlier writes.
     // TODO(wow-nx): pick the barrier from the usages (fragments only, no invalidation) once draws exist.
     fn barrier(&mut self) {
-        let c = self.cmd();
-        unsafe { dkCmdBufBarrier(c, DkBarrier::DkBarrier_Full, DkInvalidateFlags_Image | DkInvalidateFlags_Shader) };
+        self.barrier_pending = true;
     }
 }
 
@@ -268,16 +293,32 @@ impl crate::CommandEncoder for CommandEncoder {
 
     unsafe fn begin_encoding(&mut self, label: crate::Label) -> DeviceResult<()> {
         self.empty = true;
+        self.lists.clear();
+        self.commands = 0;
+        self.barrier_pending = false;
         self.state = DrawState::default();
         Ok(())
     }
     unsafe fn discard_encoding(&mut self) {
-        // The commands stay in memory until `reset_all`; the list is simply never submitted.
+        // The commands stay in memory until `reset_all`; the lists are simply never submitted.
         unsafe { dkCmdBufFinishList(self.cmdbuf) };
+        self.lists.clear();
+        self.commands = 0;
+        self.barrier_pending = false;
     }
     unsafe fn end_encoding(&mut self) -> DeviceResult<CommandBuffer> {
-        let list = if self.empty { 0 } else { unsafe { dkCmdBufFinishList(self.cmdbuf) } };
-        Ok(CommandBuffer { list })
+        if self.barrier_pending {
+            // A transition at the very end still reaches the GPU before what follows.
+            self.cmd();
+        }
+        if !self.empty {
+            let list = unsafe { dkCmdBufFinishList(self.cmdbuf) };
+            if list != 0 {
+                self.lists.push(list);
+            }
+        }
+        self.commands = 0;
+        Ok(CommandBuffer { lists: core::mem::take(&mut self.lists) })
     }
     unsafe fn reset_all<I>(&mut self, command_buffers: I) {
         // Every list from this encoder has executed: start over in the first block, free the rest.
