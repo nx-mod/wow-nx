@@ -1,9 +1,11 @@
-//! Builds uam (third_party/uam) for the Switch, mirroring its CMakeLists.txt: the sources it names plus the plain
+//! Builds uam (third_party/uam) for the Switch (or, with the `host` feature, for Linux), mirroring its CMakeLists.txt: the sources it names plus the plain
 //! file lists of mesa-imported/*/meson.build. Elsewhere nothing is built.
 use std::path::PathBuf;
 
 fn main() {
-    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("horizon") {
+    // The Switch, and Linux for the shader checker (switch/shadercheck), which runs the same compiler on the host.
+    let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    if os != "horizon" && !(os == "linux" && std::env::var_os("CARGO_FEATURE_HOST").is_some()) {
         return;
     }
     let uam = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("../../third_party/uam");
@@ -59,4 +61,7 @@ fn main() {
     // c++11: the flex output uses 'register', gone in C++17
     bx.cpp(true).std("c++11").cpp_link_stdlib("stdc++").files(&cpp).compile("uam");
     println!("cargo:rerun-if-changed=uam_c.cpp");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
+        println!("cargo:rustc-link-lib=pthread");
+    }
 }

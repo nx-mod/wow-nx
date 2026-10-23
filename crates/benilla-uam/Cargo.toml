@@ -7,6 +7,13 @@ license.workspace = true
 publish = false
 links = "uam"
 
-# Only on the Switch target; elsewhere the crate is empty.
+# Only on the Switch target, or on Linux with `host`; elsewhere the crate is empty.
+[features]
+host = []
+
+[dependencies]
+# GLSL from naga with the options the deko3d backend uses (`escribir_glsl`).
+naga = { version = "27", features = ["glsl-out"] }
+
 [build-dependencies]
 cc = "1"

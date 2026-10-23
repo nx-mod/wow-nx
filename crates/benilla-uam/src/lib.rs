@@ -4,105 +4,77 @@
 //! [`compilar`] hands it the work and waits. [`compilar_con_cache`] keeps the results on the SD card
 //! (`sdmc:/wow-nx/shaders/<hash>.dksh`), so a shader compiles once per console, and leaves the GLSL of a shader that
 //! fails beside them (`<hash>.error.glsl`, with uam's log at the end).
-#![cfg(target_os = "horizon")]
 
-use std::sync::mpsc;
-use std::sync::{Mutex, OnceLock};
+#[cfg(any(target_os = "horizon", all(target_os = "linux", feature = "host")))]
+mod compilar;
+#[cfg(any(target_os = "horizon", all(target_os = "linux", feature = "host")))]
+pub use compilar::*;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(i32)]
-pub enum Etapa {
-    Vertices = 0,
-    Geometria = 3,
-    Fragmentos = 4,
-    Computo = 5,
+/// The uniform buffer slot of the first instance (`naga_vs_first_instance`), in the vertex stage.
+pub const SLOT_PRIMERA_INSTANCIA: u32 = 15;
+/// The uniform buffer slot of push constants, in every stage.
+pub const SLOT_CONSTANTES: u32 = 14;
+
+/// What naga's desktop GLSL needs before uam takes it: deko3d has no loose uniforms, so the first instance and push
+/// constants (`uniform T name;`) become uniform blocks in the driver's slots. Returns whether each one was used.
+pub fn adaptar_glsl(glsl: &mut String) -> (bool, bool) {
+    const PRIMERA: &str = "naga_vs_first_instance";
+    let suelto = format!("uniform uint {PRIMERA};");
+    let primera = glsl.contains(&suelto);
+    if primera {
+        *glsl = glsl.replace(
+            &suelto,
+            &format!("layout(std140, binding = {SLOT_PRIMERA_INSTANCIA}) uniform {PRIMERA}_block {{ uint {PRIMERA}; }};"),
+        );
+    }
+    let mut constantes = false;
+    let mut desde = 0;
+    while let Some(i) = glsl[desde..].find("\nuniform ").map(|i| i + desde) {
+        let fin = i + glsl[i..].find(';').unwrap_or(0);
+        let decl = &glsl[i + 9..fin];
+        desde = fin;
+        let Some((tipo, nombre)) = decl.split_once(' ') else { continue };
+        if !nombre.starts_with("_push_constant_binding_") {
+            continue;
+        }
+        let bloque = format!("\nlayout(std140, binding = {SLOT_CONSTANTES}) uniform {nombre}_block {{ {tipo} {nombre}; }}");
+        glsl.replace_range(i..fin, &bloque);
+        desde = i + bloque.len();
+        constantes = true;
+    }
+    (primera, constantes)
 }
 
-extern "C" {
-    fn benilla_uam_compilar(
-        etapa: i32,
-        glsl: *const core::ffi::c_char,
-        dksh: *mut *mut u8,
-        tamano: *mut usize,
-        registro: *mut *mut core::ffi::c_char,
-    ) -> i32;
-    fn benilla_uam_liberar(p: *mut core::ffi::c_void);
-}
-
-type Tarea = (Etapa, std::ffi::CString, mpsc::Sender<Result<Vec<u8>, String>>);
-
-fn hilo() -> &'static Mutex<mpsc::Sender<Tarea>> {
-    static HILO: OnceLock<Mutex<mpsc::Sender<Tarea>>> = OnceLock::new();
-    HILO.get_or_init(|| {
-        let (tx, rx) = mpsc::channel::<Tarea>();
-        std::thread::Builder::new()
-            .name("uam".into())
-            .stack_size(8 << 20)
-            .spawn(move || {
-                for (etapa, glsl, respuesta) in rx {
-                    let _ = respuesta.send(unsafe { compilar_aqui(etapa, &glsl) });
-                }
-            })
-            .expect("uam thread");
-        Mutex::new(tx)
-    })
-}
-
-unsafe fn compilar_aqui(etapa: Etapa, glsl: &std::ffi::CStr) -> Result<Vec<u8>, String> {
-    let (mut dksh, mut tamano, mut registro) = (core::ptr::null_mut(), 0usize, core::ptr::null_mut());
-    let ok = unsafe { benilla_uam_compilar(etapa as i32, glsl.as_ptr(), &mut dksh, &mut tamano, &mut registro) } != 0;
-    let texto = if registro.is_null() {
-        String::new()
-    } else {
-        let t = unsafe { std::ffi::CStr::from_ptr(registro) }.to_string_lossy().into_owned();
-        unsafe { benilla_uam_liberar(registro.cast()) };
-        t
+/// naga's desktop GLSL for one entry point, as uam takes it (`binding = N` from `mapa`), already through
+/// [`adaptar_glsl`]. Returns the GLSL, naga's reflection, and whether the first instance and push constants are used.
+pub fn escribir_glsl(
+    module: &naga::Module,
+    info: &naga::valid::ModuleInfo,
+    etapa: naga::ShaderStage,
+    entrada: &str,
+    mapa: naga::back::glsl::BindingMap,
+    ceros_en_grupo: bool,
+) -> Result<(String, naga::back::glsl::ReflectionInfo, bool, bool), String> {
+    use naga::back::glsl;
+    let opciones = glsl::Options {
+        version: glsl::Version::Desktop(450),
+        writer_flags: glsl::WriterFlags::FORCE_POINT_SIZE,
+        binding_map: mapa,
+        zero_initialize_workgroup_memory: ceros_en_grupo,
     };
-    if !ok || dksh.is_null() {
-        return Err(texto);
-    }
-    let bytes = unsafe { std::slice::from_raw_parts(dksh, tamano) }.to_vec();
-    unsafe { benilla_uam_liberar(dksh.cast()) };
-    Ok(bytes)
-}
-
-/// Compiles one stage to a whole DKSH file (what the uam tool writes), or returns uam's log.
-pub fn compilar(etapa: Etapa, glsl: &str) -> Result<Vec<u8>, String> {
-    let glsl = std::ffi::CString::new(glsl).map_err(|_| String::from("NUL in GLSL"))?;
-    let (tx, rx) = mpsc::channel();
-    hilo().lock().unwrap().send((etapa, glsl, tx)).map_err(|_| String::from("uam thread gone"))?;
-    rx.recv().map_err(|_| String::from("uam thread gone"))?
-}
-
-/// Where compiled shaders are kept.
-pub const CARPETA_CACHE: &str = "sdmc:/wow-nx/shaders";
-
-/// FNV-1a over the stage and the source: the cache key.
-fn clave(etapa: Etapa, glsl: &str) -> u64 {
-    let mut h = 0xcbf2_9ce4_8422_2325u64 ^ etapa as u64;
-    for b in glsl.bytes() {
-        h = (h ^ b as u64).wrapping_mul(0x0100_0000_01b3);
-    }
-    h
-}
-
-/// [`compilar`], through the SD card cache.
-pub fn compilar_con_cache(etapa: Etapa, glsl: &str) -> Result<Vec<u8>, String> {
-    let ruta = format!("{CARPETA_CACHE}/{:016x}", clave(etapa, glsl));
-    if let Ok(dksh) = std::fs::read(format!("{ruta}.dksh")) {
-        if dksh.len() >= 24 && dksh[..4] == *b"DKSH" {
-            return Ok(dksh);
-        }
-    }
-    let r = compilar(etapa, glsl);
-    let _ = std::fs::create_dir_all(CARPETA_CACHE);
-    match &r {
-        Ok(dksh) => {
-            let _ = std::fs::write(format!("{ruta}.dksh"), dksh);
-        }
-        Err(log) => {
-            let _ = std::fs::write(format!("{ruta}.error.glsl"), format!("{glsl}\n/* uam:\n{log}\n*/\n"));
-        }
-    }
-    r
+    let tuberia = glsl::PipelineOptions {
+        shader_stage: etapa,
+        entry_point: entrada.into(),
+        multiview: None,
+    };
+    let politicas = naga::proc::BoundsCheckPolicies {
+        image_load: naga::proc::BoundsCheckPolicy::ReadZeroSkipWrite,
+        ..Default::default()
+    };
+    let mut salida = String::new();
+    let reflejo = glsl::Writer::new(&mut salida, module, info, &opciones, &tuberia, politicas)
+        .and_then(|mut w| w.write())
+        .map_err(|e| e.to_string())?;
+    let (primera, constantes) = adaptar_glsl(&mut salida);
+    Ok((salida, reflejo, primera, constantes))
 }

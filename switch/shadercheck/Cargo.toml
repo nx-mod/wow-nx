@@ -1,0 +1,13 @@
+[package]
+name = "shadercheck"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Compiles WGSL the way the Switch's deko3d backend does (naga's GLSL, then uam), on the Linux host: shader errors show
+# up here instead of on the console. `cargo run --release -- <file.wgsl or folder>...`
+[dependencies]
+naga = { version = "27", features = ["wgsl-in", "glsl-out"] }
+benilla-uam = { path = "../../crates/benilla-uam", features = ["host"] }
+
+[workspace]

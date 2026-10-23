@@ -14,9 +14,9 @@ use super::ffi::*;
 
 /// The vertex stage's uniform buffer slot for the draw's first instance (`naga_vs_first_instance`): Maxwell's
 /// `gl_InstanceID` does not include it, and WebGPU's `instance_index` does.
-pub(super) const SLOT_PRIMERA_INSTANCIA: u32 = 15;
+pub(super) const SLOT_PRIMERA_INSTANCIA: u32 = benilla_uam::SLOT_PRIMERA_INSTANCIA;
 /// Every stage's uniform buffer slot for push constants, which naga writes as a loose uniform.
-pub(super) const SLOT_CONSTANTES: u32 = 14;
+pub(super) const SLOT_CONSTANTES: u32 = benilla_uam::SLOT_CONSTANTES;
 /// Where they live in the driver's uniform buffer (the first instance is at 0).
 pub(super) const DESPLAZAMIENTO_CONSTANTES: u64 = 256;
 pub(super) const TAMANO_CONSTANTES: u32 = 256;
@@ -264,25 +264,15 @@ impl super::Device {
             etapa.constants,
         )
         .map_err(|e| crate::PipelineError::PipelineConstants(wgt_etapa, format!("{e}")))?;
-        let opciones = glsl::Options {
-            version: glsl::Version::Desktop(450),
-            writer_flags: glsl::WriterFlags::FORCE_POINT_SIZE,
-            binding_map: layout.mapa.clone(),
-            zero_initialize_workgroup_memory: etapa.zero_initialize_workgroup_memory,
-        };
-        let tuberia = glsl::PipelineOptions {
-            shader_stage: naga_etapa,
-            entry_point: etapa.entry_point.into(),
-            multiview: None,
-        };
-        let politicas = naga::proc::BoundsCheckPolicies {
-            image_load: naga::proc::BoundsCheckPolicy::ReadZeroSkipWrite,
-            ..Default::default()
-        };
-        let mut salida = String::new();
-        let reflejo = glsl::Writer::new(&mut salida, &module, &info, &opciones, &tuberia, politicas)
-            .and_then(|mut w| w.write())
-            .map_err(|e| crate::PipelineError::Linkage(wgt_etapa, format!("{e}")))?;
+        let (salida, reflejo, _, _) = benilla_uam::escribir_glsl(
+            &module,
+            &info,
+            naga_etapa,
+            etapa.entry_point,
+            layout.mapa.clone(),
+            etapa.zero_initialize_workgroup_memory,
+        )
+        .map_err(|e| crate::PipelineError::Linkage(wgt_etapa, e))?;
         for (_, m) in reflejo.texture_mapping {
             let var = &module.global_variables[m.texture];
             let ranura = layout.ranura(var.binding.as_ref().unwrap());
@@ -297,29 +287,6 @@ impl super::Device {
             if !muestreo.texturas.iter().any(|(t, _)| *t == ranura) {
                 muestreo.texturas.push((ranura, muestreador));
             }
-        }
-        // A loose uniform has nowhere to live in deko3d: the first instance goes in a uniform block of its own.
-        let suelto = format!("uniform uint {};", glsl::FIRST_INSTANCE_BINDING);
-        if salida.contains(&suelto) {
-            salida = salida.replace(
-                &suelto,
-                &format!(
-                    "layout(std140, binding = {SLOT_PRIMERA_INSTANCIA}) uniform naga_vs_first_instance_block {{ uint {}; }};",
-                    glsl::FIRST_INSTANCE_BINDING
-                ),
-            );
-        }
-        // Push constants are a loose uniform too: a block in the driver's uniform buffer, filled by
-        // `set_push_constants`.
-        while let Some(i) = salida.find("\nuniform ") {
-            let fin = i + salida[i..].find(';').unwrap_or(0);
-            let decl = &salida[i + 9..fin];
-            let Some((tipo, nombre)) = decl.split_once(' ') else { break };
-            if !nombre.starts_with("_push_constant_binding_") {
-                break;
-            }
-            let bloque = format!("\nlayout(std140, binding = {SLOT_CONSTANTES}) uniform {nombre}_block {{ {tipo} {nombre}; }}");
-            salida.replace_range(i..fin, &bloque);
         }
         Ok(salida)
     }
