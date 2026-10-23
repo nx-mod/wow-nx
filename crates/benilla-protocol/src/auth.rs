@@ -43,7 +43,15 @@ fn os_time_zone_bias() -> i32 {
     zone::standard_offset_east().map_or(0, |secs| (secs / 60) as i32)
 }
 
-#[cfg(unix)]
+// wow-nx: the Switch's newlib has no zone database and its `tm` no `tm_gmtoff`: the bias is 0 (UTC).
+#[cfg(target_os = "horizon")]
+mod zone {
+    pub(super) fn standard_offset_east() -> Option<i64> {
+        None
+    }
+}
+
+#[cfg(all(unix, not(target_os = "horizon")))]
 mod zone {
     extern "C" {
         fn tzset();

@@ -17,9 +17,11 @@ pub const PUSH_CONSTANT_SLOT: u32 = 14;
 
 /// What naga's desktop GLSL needs before uam takes it: deko3d has no loose uniforms, so the first instance and push
 /// constants (`uniform T name;`) become uniform blocks in the driver's slots; and uam has no
-/// `GL_EXT_texture_shadow_lod` ([`drop_shadow_lod`]). Returns whether the first instance and push constants are used.
+/// `GL_EXT_texture_shadow_lod` ([`drop_shadow_lod`]); and a depth texture that is never compared is not a shadow
+/// sampler ([`unshadow_uncompared`]). Returns whether the first instance and push constants are used.
 pub fn adapt_glsl(glsl: &mut String) -> (bool, bool) {
     drop_shadow_lod(glsl);
+    unshadow_uncompared(glsl);
     const FIRST: &str = "naga_vs_first_instance";
     let loose = format!("uniform uint {FIRST};");
     let first = glsl.contains(&loose);
@@ -137,6 +139,66 @@ fn drop_shadow_lod(glsl: &mut String) {
             glsl.replace_range(start..stop, "");
             glsl.replace_range(i..args, plain);
             from = i + plain.len();
+        }
+    }
+}
+
+/// naga declares every depth texture as a shadow sampler, even one only gathered or fetched without a comparison
+/// (Bevy's depth downsampling: `textureGatherOffset(sampler2DShadow, uv, offset, 0)`), which GLSL has no overload for.
+/// A shadow sampler whose every use is a gather with a component (an integer literal last), a fetch or a size query
+/// is declared as the plain sampler of its shape instead; one that is compared anywhere stays as it is.
+fn unshadow_uncompared(glsl: &mut String) {
+    const KINDS: [(&str, &str); 3] =
+        [("sampler2DArrayShadow ", "sampler2DArray "), ("samplerCubeShadow ", "samplerCube "), ("sampler2DShadow ", "sampler2D ")];
+    const PLAIN_USES: [&str; 6] = ["textureGather", "textureGatherOffset", "texelFetch", "texelFetchOffset", "textureSize", "textureQueryLevels"];
+    for (shadow, plain) in KINDS {
+        let mut from = 0;
+        while let Some(i) = glsl[from..].find(shadow).map(|i| i + from) {
+            let start = i + shadow.len();
+            let name: String = glsl[start..].chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+            from = start;
+            if name.is_empty() {
+                continue;
+            }
+            let call_arg = format!("({name},");
+            let mut uses = 0;
+            let mut all_plain = true;
+            let mut at = 0;
+            while let Some(k) = glsl[at..].find(&call_arg).map(|k| k + at) {
+                at = k + call_arg.len();
+                uses += 1;
+                let func: String = glsl[..k].chars().rev().take_while(|c| c.is_alphanumeric() || *c == '_').collect::<Vec<_>>().into_iter().rev().collect();
+                if !PLAIN_USES.contains(&func.as_str()) {
+                    all_plain = false;
+                    break;
+                }
+                if func.starts_with("textureGather") {
+                    // The last argument: a component (an integer literal) for a plain gather, a depth reference for a
+                    // comparing one.
+                    let (mut depth, mut last, mut end) = (0i32, at, None);
+                    for (n, c) in glsl[at..].char_indices() {
+                        match c {
+                            '(' | '[' => depth += 1,
+                            ')' | ']' if depth > 0 => depth -= 1,
+                            ')' => {
+                                end = Some(at + n);
+                                break;
+                            }
+                            ',' if depth == 0 => last = at + n + 1,
+                            _ => {}
+                        }
+                    }
+                    let arg = end.map(|e| glsl[last..e].trim().to_string()).unwrap_or_default();
+                    if arg.is_empty() || !arg.chars().all(|c| c.is_ascii_digit()) {
+                        all_plain = false;
+                        break;
+                    }
+                }
+            }
+            if uses > 0 && all_plain {
+                glsl.replace_range(i..start, plain);
+                from = i + plain.len();
+            }
         }
     }
 }

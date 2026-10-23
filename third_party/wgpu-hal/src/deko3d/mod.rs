@@ -275,6 +275,8 @@ pub struct Texture {
     /// Width and height of mip 0.
     size: (u32, u32),
     is_3d: bool,
+    /// Array layers (1 for a 3D texture or one without layers).
+    layers: u32,
     /// The swapchain slot of an acquired surface texture.
     slot: Option<i32>,
 }
@@ -599,6 +601,7 @@ impl crate::Surface for Surface {
                 samples: 1,
                 size: (c.size.width, c.size.height),
                 is_3d: false,
+                layers: 1,
                 slot: Some(slot),
             },
             suboptimal: false,
@@ -799,6 +802,15 @@ impl crate::Device for Device {
         if desc.usage.intersects(wgt::TextureUses::STORAGE_READ_ONLY | wgt::TextureUses::STORAGE_WRITE_ONLY | wgt::TextureUses::STORAGE_READ_WRITE) {
             maker.flags |= DkImageFlags_UsageLoadStore;
         }
+        // A multisample resolve (dkCmdBufResolveImage) runs on the 2D engine, which wants the flag on both images; it
+        // takes no depth, compressed or 3D image (dk_image.cpp).
+        if desc.usage.contains(wgt::TextureUses::COLOR_TARGET)
+            && !desc.format.is_depth_stencil_format()
+            && !desc.format.is_compressed()
+            && desc.dimension != wgt::TextureDimension::D3
+        {
+            maker.flags |= DkImageFlags_Usage2DEngine;
+        }
         maker.flags |= DkImageFlags_HwCompression;
 
         let mut layout = unsafe { core::mem::zeroed::<DkImageLayout>() };
@@ -819,6 +831,7 @@ impl crate::Device for Device {
             samples: desc.sample_count,
             size: (desc.size.width, desc.size.height),
             is_3d: desc.dimension == wgt::TextureDimension::D3,
+            layers: if desc.dimension == wgt::TextureDimension::D3 { 1 } else { desc.size.depth_or_array_layers },
             slot: None,
         })
     }
@@ -842,8 +855,11 @@ impl crate::Device for Device {
         let mip = desc.range.base_mip_level;
         view.mipLevelOffset = mip as u8;
         view.mipLevelCount = desc.range.mip_level_count.unwrap_or(0) as u8;
-        view.layerOffset = desc.range.base_array_layer as u16;
-        view.layerCount = desc.range.array_layer_count.unwrap_or(0) as u16;
+        // A layer range only on an array image (deko3d reads one on a single-layer image as an overridden type).
+        if texture.layers > 1 {
+            view.layerOffset = desc.range.base_array_layer as u16;
+            view.layerCount = desc.range.array_layer_count.unwrap_or(0) as u16;
+        }
         let (width, height) = texture.size;
         let storage = wgt::TextureUses::STORAGE_READ_ONLY | wgt::TextureUses::STORAGE_WRITE_ONLY | wgt::TextureUses::STORAGE_READ_WRITE;
         let descriptor = if desc.usage.intersects(wgt::TextureUses::RESOURCE | storage) {

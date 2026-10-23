@@ -35,7 +35,7 @@ mod device;
 #[cfg(not(any(target_os = "macos", target_os = "horizon")))]
 #[path = "cpal.rs"]
 mod device;
-// wow-nx: the Switch's, silent for now.
+// wow-nx: the Switch's, on libnx's audout.
 #[cfg(target_os = "horizon")]
 #[path = "switch.rs"]
 mod device;

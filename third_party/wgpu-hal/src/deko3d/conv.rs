@@ -78,8 +78,10 @@ pub(super) fn image_type(desc: &crate::TextureDescriptor) -> DkImageType {
     use DkImageType as I;
     let layers = desc.size.depth_or_array_layers;
     match desc.dimension {
-        wgt::TextureDimension::D1 if layers > 1 => I::DkImageType_1DArray,
-        wgt::TextureDimension::D1 => I::DkImageType_1D,
+        // 1D textures are 2D images one texel tall: deko3d's copies and render targets take no 1D image
+        // (dk_image.cpp, ImageInfo::fromImageView), and a view cannot change an image's base type.
+        wgt::TextureDimension::D1 if layers > 1 => I::DkImageType_2DArray,
+        wgt::TextureDimension::D1 => I::DkImageType_2D,
         wgt::TextureDimension::D3 => I::DkImageType_3D,
         wgt::TextureDimension::D2 => match (desc.sample_count > 1, layers > 1) {
             (true, true) => I::DkImageType_2DMSArray,
@@ -94,7 +96,8 @@ pub(super) fn view_type(dim: wgt::TextureViewDimension, multisample: bool) -> Dk
     use wgt::TextureViewDimension as V;
     use DkImageType as I;
     match dim {
-        V::D1 => I::DkImageType_1D,
+        // (1D textures are stored as 2D: image_type)
+        V::D1 => I::DkImageType_2D,
         V::D2 if multisample => I::DkImageType_2DMS,
         V::D2 => I::DkImageType_2D,
         V::D2Array if multisample => I::DkImageType_2DMSArray,

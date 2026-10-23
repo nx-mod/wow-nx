@@ -194,7 +194,8 @@ fn subresource_view(tex: &Texture, base: &crate::TextureCopyBase, is_3d: bool) -
     unsafe { dkImageViewDefaults(&mut view, &*tex.image) };
     view.mipLevelOffset = base.mip_level as u8;
     view.mipLevelCount = 1;
-    if !is_3d {
+    // Only an array image takes a layer: on a single-layer one deko3d reads a layer range as an overridden type.
+    if !is_3d && tex.layers > 1 {
         view.layerOffset = base.array_layer as u16;
         view.layerCount = 1;
     }

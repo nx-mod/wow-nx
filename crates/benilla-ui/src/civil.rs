@@ -153,12 +153,26 @@ mod zone {
     }
 
     /// Seconds east of UTC; `long` is 32 bits on some unix targets.
+    #[cfg(not(target_os = "horizon"))]
     fn gmtoff(tm: &libc::tm) -> i64 {
         #[allow(clippy::useless_conversion)]
         let off = i64::from(tm.tm_gmtoff);
         off
     }
 
+    /// wow-nx: the Switch's newlib `tm` has no `tm_gmtoff` and no zone database: UTC.
+    #[cfg(target_os = "horizon")]
+    fn gmtoff(_tm: &libc::tm) -> i64 {
+        0
+    }
+
+    /// wow-nx: the Switch has no zone names (newlib has no `tzname` there): UTC, unnamed.
+    #[cfg(target_os = "horizon")]
+    pub(super) fn name(_isdst: bool) -> Vec<u8> {
+        Vec::new()
+    }
+
+    #[cfg(not(target_os = "horizon"))]
     pub(super) fn name(isdst: bool) -> Vec<u8> {
         reread();
         // SAFETY: `tzset` filled both names; each is a NUL-terminated string the runtime owns.
