@@ -7,6 +7,8 @@ use benilla_protocol::messages::{GroupLootInfo, GroupMemberEntry, PartyMemberSta
 use benilla_ui::script::UiScript;
 use bevy::prelude::*;
 
+use std::collections::HashMap;
+
 use benilla_protocol::{SessionEvent, SessionEventKind};
 
 use super::{GroupState, RosterRelease, GROUPTYPE_RAID};
@@ -62,8 +64,9 @@ fn on_uninvited(
     mut teardown: RosterTeardown,
 ) {
     if let SessionEvent::GroupUninvited = ev {
+        let before = teardown.before(&group);
         uninvited(&mut group, &errors);
-        teardown.run(&mut group);
+        teardown.run(&mut group, before);
     }
 }
 
@@ -86,8 +89,9 @@ fn on_destroyed(
     mut teardown: RosterTeardown,
 ) {
     if let SessionEvent::GroupDestroyed = ev {
+        let before = teardown.before(&group);
         destroyed(&mut group, &errors);
-        teardown.run(&mut group);
+        teardown.run(&mut group, before);
     }
 }
 
@@ -120,11 +124,12 @@ fn on_list(
                 ));
             }
         }
+        let before = teardown.before(&group);
         list(
             &mut group, &sounds, &mut quest, group_type, own_flags, members, leader, loot,
             &self_guid, &names, &index, &commands,
         );
-        teardown.run(&mut group);
+        teardown.run(&mut group, before);
     }
 }
 
@@ -140,8 +145,9 @@ fn on_command_result(
         result,
     } = ev
     {
+        let before = teardown.before(&group);
         command_result(&mut group, &errors, operation, &member, result);
-        teardown.run(&mut group);
+        teardown.run(&mut group, before);
     }
 }
 
@@ -154,10 +160,26 @@ struct RosterTeardown<'w, 's> {
     index: Option<Res<'w, GuidIndex>>,
     stores: Query<'w, 's, &'static ObjectStore>,
     deselect: Option<MessageWriter<'w, DeselectGuid>>,
+    /// What each packet changed, for the views a listener reads ([`crate::ui_unit::views`]).
+    log: Option<ResMut<'w, crate::ui_unit::views::ViewLog>>,
 }
 
 impl RosterTeardown<'_, '_> {
-    fn run(&mut self, group: &mut GroupState) {
+    /// The records as the packet found them, for [`Self::run`] to log what it changed, with the
+    /// packet's entry opened ahead of its signals: a list writes each member's record
+    /// (`AddPartyMember`, `0x5e6c4a`) before it signals (`0x5e6c61`, `0x5e6c66`).
+    fn before(&mut self, group: &GroupState) -> Option<HashMap<u64, PartyMemberStatsInfo>> {
+        let log = self.log.as_deref_mut()?;
+        log.open();
+        Some(group.stats.clone())
+    }
+
+    /// The packet's end: the records it changed against `before` logged, then its teardowns.
+    fn run(&mut self, group: &mut GroupState, before: Option<HashMap<u64, PartyMemberStatsInfo>>) {
+        if let (Some(log), Some(before)) = (self.log.as_deref_mut(), before) {
+            log.records(&before, &group.stats);
+            log.close();
+        }
         let released = group.take_released();
         let guids: Vec<u64> = released
             .into_iter()
@@ -196,10 +218,20 @@ fn on_member_stats(
     In(ev): In<SessionEvent>,
     mut group: ResMut<GroupState>,
     mut notices: ResMut<crate::field_watch::NoticeLane>,
+    log: Option<ResMut<crate::ui_unit::views::ViewLog>>,
 ) {
     if let SessionEvent::PartyMemberStats { guid, full, info } = ev {
-        let old = group.stats.get(&guid).cloned().unwrap_or_default();
+        let before = group.stats.get(&guid).cloned();
+        let old = before.clone().unwrap_or_default();
         group.apply_stats(guid, full, *info);
+        // Logged ahead of the signals, as the record copies precede them (`0x5e54c4`,
+        // `0x5e54d8`, then `0x5e54fa`).
+        if let Some(mut log) = log {
+            if group.stats.get(&guid) != before.as_ref() {
+                log.record(guid, before);
+            }
+            log.close();
+        }
         if let Some(new) = group.stats.get(&guid) {
             notices.write_batch(super::records::record_notices(guid, &old, new));
         }
@@ -252,8 +284,17 @@ fn on_player_name(In(ev): In<SessionEvent>, mut group: ResMut<GroupState>, names
 }
 
 /// The group state dies with the socket, after the bridge's own teardown.
-fn on_session_end(In(_): In<SessionEvent>, mut group: ResMut<GroupState>) {
+fn on_session_end(
+    In(_): In<SessionEvent>,
+    mut group: ResMut<GroupState>,
+    log: Option<ResMut<crate::ui_unit::views::ViewLog>>,
+) {
+    let before = log.is_some().then(|| group.stats.clone());
     group.clear_session();
+    if let (Some(mut log), Some(before)) = (log, before) {
+        log.records(&before, &group.stats);
+        log.close();
+    }
 }
 
 /// Queue the messages an `apply_*` named; `ui_action::feed_actions` resolves and shows them.
@@ -428,7 +469,10 @@ pub(crate) fn member_deactivated<'a>(
 }
 
 /// [`member_deactivated`] for every streamed roster member: a cross-map transfer's teardown, where
-/// the reference destroys each object and runs the hook on each.
+/// the reference frees each object without its release (`0x467700` → `0x467800`), and the player's
+/// destructor runs the same roster search in mode 0 (`0x5dd600`, at `0x5dd6a0` → `0x4e85d0`): the
+/// record built (`0x4e8630`) and the stats asked, with no `PARTY_MEMBER_DISABLE`, which only the
+/// release signals (`0x5e9b78`).
 pub(crate) fn roster_deactivated(
     group: &mut GroupState,
     index: &GuidIndex,
@@ -1370,67 +1414,74 @@ mod tests {
         use benilla_ui::script::{UiScript, UnitState};
         use bevy::ecs::system::RunSystemOnce;
 
-        let run =
-            |leader: u64, members: Vec<GroupMemberEntry>| -> (Vec<ChatKind>, Vec<&'static str>) {
-                let mut script = UiScript::new().unwrap();
-                script.set_unit(
-                    "player",
-                    Some(UnitState {
-                        exists: true,
-                        name: Some("Me".into()),
-                        ..Default::default()
-                    }),
-                );
-                let mut app = app_with(script);
-                let (tx, rx) = crossbeam_channel::unbounded();
-                app.insert_resource(NetCommands(tx));
-                app.init_resource::<UiErrorKeys>()
-                    .init_resource::<MessageSounds>()
-                    .init_resource::<QuestGiver>()
-                    .init_resource::<crate::ui_chat::AfkMirror>()
-                    .init_resource::<crate::target::Selection>()
-                    .insert_resource(SelfGuid(Some(ME)));
-                let me = app
-                    .world_mut()
-                    .spawn((SelfPlayer, Guid(ME), ObjectStore::default()))
-                    .id();
-                app.world_mut().resource_mut::<GuidIndex>().0.insert(ME, me);
-                let group_type = if members.is_empty() {
-                    0
-                } else {
-                    GROUPTYPE_RAID
-                };
-                app.world_mut()
-                    .run_system_once_with(
-                        on_list,
-                        SessionEvent::GroupList {
-                            group_type,
-                            own_flags: 0,
-                            members,
-                            leader,
-                            loot: None,
-                        },
-                    )
-                    .expect("the group-list handler");
-                app.update();
-                crate::ui_chat::run_chat(app.world_mut(), r#"SendChatMessage("go", "RAID")"#)
-                    .expect("lua");
-                let sent = rx
-                    .try_iter()
-                    .filter_map(|c| match c {
-                        ClientCommand::Chat { kind, .. } => Some(kind),
-                        _ => None,
-                    })
-                    .collect();
-                let refused = app
-                    .world()
-                    .resource::<UiErrorKeys>()
-                    .snapshot()
-                    .iter()
-                    .map(|e| e.key)
-                    .collect();
-                (sent, refused)
+        let run = |leader: u64, members: Vec<GroupMemberEntry>| -> (Vec<ChatKind>, Vec<String>) {
+            let mut script = UiScript::new().unwrap();
+            script.set_unit(
+                "player",
+                Some(UnitState {
+                    exists: true,
+                    name: Some("Me".into()),
+                    ..Default::default()
+                }),
+            );
+            let mut app = app_with(script);
+            let (tx, rx) = crossbeam_channel::unbounded();
+            app.insert_resource(NetCommands(tx));
+            app.init_resource::<UiErrorKeys>()
+                .init_resource::<MessageSounds>()
+                .init_resource::<QuestGiver>()
+                .init_resource::<crate::ui_chat::AfkMirror>()
+                .init_resource::<crate::target::Selection>()
+                .insert_resource(SelfGuid(Some(ME)));
+            let me = app
+                .world_mut()
+                .spawn((SelfPlayer, Guid(ME), ObjectStore::default()))
+                .id();
+            app.world_mut().resource_mut::<GuidIndex>().0.insert(ME, me);
+            let group_type = if members.is_empty() {
+                0
+            } else {
+                GROUPTYPE_RAID
             };
+            app.world_mut()
+                .run_system_once_with(
+                    on_list,
+                    SessionEvent::GroupList {
+                        group_type,
+                        own_flags: 0,
+                        members,
+                        leader,
+                        loot: None,
+                    },
+                )
+                .expect("the group-list handler");
+            app.update();
+            // The refusal's chat line, `CHAT_MSG_SYSTEM` inside the call (`0x496720`).
+            crate::ui_chat::run_chat(
+                app.world_mut(),
+                r#"ERR_NOT_IN_RAID = "ERR_NOT_IN_RAID"
+                    REFUSED = {}
+                    local tap = CreateFrame("Frame")
+                    tap:RegisterEvent("CHAT_MSG_SYSTEM")
+                    tap:SetScript("OnEvent", function() table.insert(REFUSED, arg1) end)"#,
+            )
+            .expect("the tap is in");
+            crate::ui_chat::run_chat(app.world_mut(), r#"SendChatMessage("go", "RAID")"#)
+                .expect("lua");
+            let sent = rx
+                .try_iter()
+                .filter_map(|c| match c {
+                    ClientCommand::Chat { kind, .. } => Some(kind),
+                    _ => None,
+                })
+                .collect();
+            let refused = app
+                .world()
+                .non_send_resource::<UiScript>()
+                .eval::<Vec<String>>("return REFUSED")
+                .expect("the tap reads");
+            (sent, refused)
+        };
         let listed = |guid: u64, name: &str| GroupMemberEntry {
             name: name.into(),
             guid,

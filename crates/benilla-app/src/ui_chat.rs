@@ -230,9 +230,12 @@ impl Plugin for UiChatPlugin {
                     .after(benilla_world::terrain_stream::AreaAuthoritySet)
                     .after(crate::player::WorldFocusSet),
             )
+            // After the shutdown's `PLAYER_LOGOUT`, whose handlers read the windows and the
+            // channels as they stood, and before the glue VM goes in.
             .add_systems(
                 OnExit(crate::client_state::ClientState::InWorld),
-                (channels::end_session_channels, end_session_chat),
+                (channels::end_session_channels, end_session_chat)
+                    .in_set(crate::ui_script::SessionEnd::Clears),
             );
         settings::plugin(app);
         logging::plugin(app);
@@ -247,6 +250,7 @@ impl Plugin for UiChatPlugin {
 /// welcome. Ahead of each drain the held lines' age pass is queued ([`ChatLog::begin_frame`]).
 pub(crate) fn add_chat_lane(app: &mut App) {
     use crate::lanes::LaneApp;
+    app.init_resource::<combat::watch::DeathLineAt>();
     app.init_resource::<ChatLog>().add_lane(
         "chat",
         |world| world.get_resource::<ChatLog>()?.peek(),

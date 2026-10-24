@@ -99,7 +99,8 @@ pub(crate) struct Lifecycle<'w> {
 pub(crate) struct Scene<'w, 's> {
     commands: Commands<'w, 's>,
     casting: Query<'w, 's, &'static Casting>,
-    engaged_self: Query<'w, 's, (), (With<crate::creature_anim::Engaged>, With<SelfPlayer>)>,
+    /// Our own entity, whose attack target the queued edits answer.
+    self_player: Query<'w, 's, Entity, With<SelfPlayer>>,
     stores: Query<'w, 's, &'static mut ObjectStore>,
     items: ResMut<'w, crate::items::Items>,
     loot_latch: ResMut<'w, crate::ui_loot::LootLatch>,
@@ -294,11 +295,18 @@ fn on_spell_start(
 }
 
 /// The GO, then its deferred auto-attack start (`0x6e8402` → `0x6131a0` → `0x5ecb70`): StartAttack
-/// with its own select (`0x5eccaa`), which selects the hit unit whatever is selected.
+/// with its own select (`0x5eccaa`), which selects the hit unit whatever is selected and signals
+/// in place, behind the GO's reports, before the swing
+/// ([`crate::script_calls::ScriptCallHost::engine_start_attack`]).
+#[allow(clippy::type_complexity)] // a Bevy system's full input set
 fn on_spell_go(
     In(ev): In<SessionEvent>,
-    mut set: ParamSet<((Lifecycle, Scene), crate::target::SelectCommit)>,
+    mut set: ParamSet<(
+        (Lifecycle, Scene),
+        crate::script_calls::VmWith<crate::target::SelectCommit<'static, 'static>>,
+    )>,
 ) {
+    let mark = crate::lanes::mark();
     if let SessionEvent::SpellGo {
         caster,
         spell_id,
@@ -307,15 +315,25 @@ fn on_spell_go(
         misses,
         target,
         go_target,
+        target_mask,
+        source,
         dest,
         ammo_display_id,
         item_caster,
         unit_caster,
     } = ev
     {
+        let points = GoPoints {
+            mask: target_mask,
+            source,
+            dest,
+        };
         let deferred = {
             let (mut l, mut sc) = set.p0();
-            let engaged = !sc.engaged_self.is_empty();
+            let engaged = sc
+                .self_player
+                .single()
+                .is_ok_and(|me| sc.edits.attacking(me));
             spell_go(
                 caster,
                 spell_id,
@@ -324,7 +342,7 @@ fn on_spell_go(
                 misses,
                 target,
                 go_target,
-                dest,
+                points,
                 ammo_display_id,
                 item_caster,
                 unit_caster,
@@ -359,7 +377,8 @@ fn on_spell_go(
             )
         };
         if let Some(guid) = deferred {
-            set.p1().start_attack(guid);
+            set.p1()
+                .engine_start_attack(guid, mark, |mut commit| commit.start_attack(guid));
         }
     }
 }
@@ -629,7 +648,13 @@ fn spell_book(
     for &spell_id in &spell_ids {
         list_opener(spell_id, spells, actions);
     }
-    actions.spells = spell_ids.into_iter().collect();
+    actions.spells.clear();
+    actions.profession_order.clear();
+    actions.craft_order.clear();
+    for spell_id in spell_ids {
+        actions.spells.insert(spell_id);
+        list_learn(spell_id, actions);
+    }
     actions.dirty = true;
     let now = Instant::now();
     for cd in &initial_cooldowns {
@@ -665,9 +690,34 @@ fn learned_spell(
     if actions.spells.insert(spell_id) {
         actions.dirty = true;
     }
+    list_learn(spell_id, actions);
     list_opener(spell_id, spells, actions);
     announce_learn(spell_id, spells, errors);
     tab_flash.0.push(spell_id);
+}
+
+/// `LearnSpell 0x5e9c20`'s list legs: the profession lists append with no duplicate check
+/// (`0x5e9d72`), the craft lists only a spell they lack (`0x5e9db3`, `0x5e9e0f`).
+fn list_learn(spell_id: u32, actions: &mut PlayerActions) {
+    actions.profession_order.push(spell_id);
+    if !actions.craft_order.contains(&spell_id) {
+        actions.craft_order.push(spell_id);
+    }
+}
+
+/// `UnlearnSpell 0x5e9fe0`'s list legs: the profession lists' backward scan takes out the last
+/// copy (`0x5ea0fe`, `0x5ea123`), the craft lists' forward scan the first (`0x5ea1b8`).
+fn list_unlearn(spell_id: u32, actions: &mut PlayerActions) {
+    if let Some(at) = actions
+        .profession_order
+        .iter()
+        .rposition(|&id| id == spell_id)
+    {
+        actions.profession_order.remove(at);
+    }
+    if let Some(at) = actions.craft_order.iter().position(|&id| id == spell_id) {
+        actions.craft_order.remove(at);
+    }
 }
 
 /// `SPELL_EFFECT_OPEN_LOCK` in `Effect[0]`, the registrar's test for the opener list (`0x4b265e`).
@@ -734,6 +784,7 @@ fn removed_spell(
     if actions.spells.remove(&spell_id) {
         actions.dirty = true;
     }
+    list_unlearn(spell_id, actions);
     // `UnlearnSpell 0x5e9fe0` does nothing for a spell with no record (`0x5ea02a`); otherwise it
     // clears the bar slots that stand for the spell (`0x5ea253`), which the bar's queue makes.
     if spells.is_some_and(|s| s.catalog.get(spell_id).is_some()) {
@@ -769,8 +820,12 @@ fn superceded_spell(
     tab_flash: &mut LearnedInTab,
 ) {
     debug!("net: superceded spell {old_spell_id} -> {new_spell_id}");
+    // The player's unlearn of the old rank, then its learn of the new one at the tail
+    // (`0x5e6392`, `0x5e63a4`).
     actions.spells.remove(&old_spell_id);
+    list_unlearn(old_spell_id, actions);
     actions.spells.insert(new_spell_id);
+    list_learn(new_spell_id, actions);
     actions.superseded.push((old_spell_id, new_spell_id));
     actions.dirty = true;
     // `0x4b2f50` unlists the old rank and registers the new one at the tail; the player's own
@@ -1091,7 +1146,7 @@ fn spell_go(
     misses: Vec<benilla_protocol::messages::SpellGoMiss>,
     target: Option<u64>,
     go_target: Option<u64>,
-    dest: Option<[f32; 3]>,
+    points: GoPoints,
     ammo_display_id: Option<u32>,
     item_caster: Option<u64>,
     // The packet's second guid as written, the caster slot `0x6e7f8b` looks up as a unit.
@@ -1120,10 +1175,11 @@ fn spell_go(
     attack_ctx: (&crate::creature_anim::UnitEdits, bool, &mut super::CastCore),
     seq: u64,
 ) -> Option<u64> {
+    let GoPoints { mask, source, dest } = points;
     debug!(
         "net: spell go {spell_id} by {caster:#x} ({} hit(s), {} miss(es), flags \
-         {cast_flags:#x}, target {target:?}, go_target {go_target:?}, dest {dest:?}, \
-         ammo {ammo_display_id:?})",
+         {cast_flags:#x}, target {target:?}, go_target {go_target:?}, mask {mask:#x}, \
+         source {source:?}, dest {dest:?}, ammo {ammo_display_id:?})",
         hits.len(),
         misses.len()
     );
@@ -1272,10 +1328,16 @@ fn spell_go(
         .iter()
         .filter_map(|&g| index.0.get(&g).map(|&e| (g, e)))
         .collect();
-    let misses: Vec<(Entity, u8)> = misses
+    let misses: Vec<(Entity, u8, u8)> = misses
         .iter()
-        .filter_map(|m| index.0.get(&m.target).map(|&e| (e, m.info)))
+        .filter_map(|m| {
+            index
+                .0
+                .get(&m.target)
+                .map(|&e| (e, m.info, m.reflect_result))
+        })
         .collect();
+
     // The caster slot is the second guid looked up as a unit (`0x6e7f8b`, mask 8): a game object's
     // cast writes it 0, so it finds none and skips every leg that needs one.
     let unit = index
@@ -1293,7 +1355,9 @@ fn spell_go(
                 spell_id,
                 hits: hits.into_iter().map(|(_, e)| e).collect(),
                 misses,
+                source: None,
                 dest: None,
+                target_mask: mask,
                 ammo_display_id,
                 seq,
             });
@@ -1326,20 +1390,32 @@ fn spell_go(
         item_cast: item_caster.is_some(),
         seq,
     });
-    // A pure dest cast (ground AoE, empty lists) rides the same message: the point is a target.
+    // A pure point cast (ground AoE, empty lists) rides the same message: the point is a target.
+    let source = source.map(benilla_assets::coords::wow_to_bevy);
     let dest = dest.map(benilla_assets::coords::wow_to_bevy);
-    if !hits.is_empty() || !misses.is_empty() || dest.is_some() {
+    if !hits.is_empty() || !misses.is_empty() || source.is_some() || dest.is_some() {
         go_targets.write(SpellGoTargets {
             caster: Some(e),
             spell_id,
             hits: hits.into_iter().map(|(_, e)| e).collect(),
             misses,
+            source,
             dest,
+            target_mask: mask,
             ammo_display_id,
             seq,
         });
     }
     deferred
+}
+
+/// The GO target block's mask and its two points, raw WoW (`0x7e4ed0`): SOURCE_LOCATION (0x20)
+/// and DEST_LOCATION (0x40).
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct GoPoints {
+    pub(super) mask: u16,
+    pub(super) source: Option<[f32; 3]>,
+    pub(super) dest: Option<[f32; 3]>,
 }
 
 /// `SMSG_SPELL_FAILED_OTHER`: a cast was interrupted; ends the caster's `Casting` as [`spell_go`]
@@ -1647,6 +1723,7 @@ mod tests {
 
     mod cooldown_sites;
     mod dispatch;
+    mod learned;
     mod openers;
 
     /// `SMSG_COOLDOWN_EVENT` (`0x6e9670`): the event moves the held record's one start, which the
@@ -2268,7 +2345,7 @@ mod tests {
                             vec![],
                             None,
                             None,
-                            None,
+                            GoPoints::default(),
                             None,
                             None,
                             Self::SELF,
@@ -3195,7 +3272,7 @@ mod tests {
                         vec![],
                         None,
                         None,
-                        None,
+                        GoPoints::default(),
                         None,
                         item_caster,
                         caster,
@@ -3393,7 +3470,7 @@ mod tests {
                         vec![],
                         None,
                         None,
-                        None,
+                        GoPoints::default(),
                         None,
                         None,
                         10,
@@ -3773,7 +3850,7 @@ mod tests {
                             // A different guid from `hits[0]`, which the arm must take.
                             Some(99),
                             None,
-                            None,
+                            GoPoints::default(),
                             None,
                             None,
                             caster,

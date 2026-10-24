@@ -414,6 +414,7 @@ fn buy_calls_with_an_available_services_spell_id_and_refuses_every_other_row() {
 #[test]
 fn selection_and_close_intents() {
     let mut s = UiScript::new().unwrap();
+    s.keep_calls();
     s.set_trainer(Some(trainer()));
     assert_eq!(
         s.eval::<i64>("return GetTrainerSelectionIndex()").unwrap(),
@@ -430,10 +431,8 @@ fn selection_and_close_intents() {
         0
     );
 
-    assert!(!s.take_trainer_close());
     s.run("CloseTrainer()").unwrap();
-    assert!(s.take_trainer_close());
-    assert!(!s.take_trainer_close(), "drained");
+    assert_eq!(s.take_trainer_calls(), [TrainerCall::Close]);
 }
 
 /// `IsTradeskillTrainer` tests type 2 (`0x4d8ea0`); `IsTalentTrainer` answers 1 with no trainer
@@ -867,10 +866,6 @@ fn open_trainer_calls_for_the_own_list() {
     s.keep_calls();
     s.run("OpenTrainer()").unwrap();
     assert_eq!(s.take_trainer_calls(), vec![TrainerCall::OpenOwn]);
-    assert!(
-        !s.take_trainer_close(),
-        "the close waits on the player, which the host sees"
-    );
 }
 
 /// `IsTrainerServiceSkillStep` (`0x4d9dd0`) and `GetTrainerServiceStepIncrease` (`0x4da030`).
@@ -1402,7 +1397,8 @@ fn a_mount_trainer_always_builds_the_known_group_first() {
         .unwrap()
         .is_none());
 
-    // A class trainer builds no such group.
+    // A class trainer's list builds no such group.
+    s.reset_trainer_list_state(0);
     s.set_trainer(Some(trainer()));
     assert_eq!(
         s.eval::<i64>("local n = function(...) return arg.n end return n(GetTrainerSkillLines())")
@@ -1435,4 +1431,63 @@ fn the_type_filter_getter_reads_any_case_and_raises_the_exes_errors() {
     raises(&mut s, "GetTrainerServiceTypeFilter({})", usage);
     raises(&mut s, "GetTrainerServiceTypeFilter('all')", bad);
     raises(&mut s, "GetTrainerServiceTypeFilter(1)", bad);
+}
+
+/// The header array is built per list (`0x4d7560`, its count `0xb73a14`) and a state pass only
+/// re-keys a row now known to -1 at type 1 (`0x4d82b2`-`0x4d82c1`): the last row of a skill line
+/// moving to the known group leaves the line's header in the array, so the line count and the
+/// filter's group indices hold until the next list.
+#[test]
+fn a_pass_keeps_the_lists_header_array() {
+    let services = |known: bool| {
+        let mut horse = svc(
+            824,
+            "Horse Riding",
+            TrainerServiceCategory::Available,
+            148,
+            "Horse Riding",
+        );
+        if known {
+            horse.category = TrainerServiceCategory::Used;
+            (horse.group_key, horse.group_name, horse.line_name) =
+                (TRAINER_GROUP_KNOWN, "My Talents".into(), None);
+        }
+        let ram = svc(
+            8394,
+            "Ram Riding",
+            TrainerServiceCategory::Available,
+            152,
+            "Ram Riding",
+        );
+        TrainerState {
+            guid: 0x42,
+            greeting: String::new(),
+            trainer_type: 1,
+            groups: Vec::new(),
+            services: vec![horse, ram],
+        }
+    };
+    let lines = |s: &mut UiScript| {
+        s.eval::<i64>("local function n(...) return arg.n end return n(GetTrainerSkillLines())")
+            .unwrap()
+    };
+    let mut s = UiScript::new().unwrap();
+    s.run("KNOWN_TALENTS_HEADER = 'My Talents'").unwrap();
+    s.reset_trainer_list_state(1);
+    s.set_trainer(Some(services(false)));
+    assert_eq!(lines(&mut s), 3, "My Talents, Horse Riding, Ram Riding");
+    s.set_trainer(Some(services(true)));
+    assert_eq!(lines(&mut s), 3, "Horse Riding's header stays");
+    s.run("SetTrainerSkillLineFilter(3, 0)").unwrap();
+    assert_eq!(
+        s.eval::<Option<i64>>("return GetTrainerSkillLineFilter(3)")
+            .unwrap(),
+        None,
+        "index 3 is still Ram Riding's"
+    );
+    let shown: Vec<String> = visible(&mut s).into_iter().map(|(n, _)| n).collect();
+    assert_eq!(shown, ["My Talents", "Horse Riding"]);
+    s.reset_trainer_list_state(1);
+    s.set_trainer(Some(services(true)));
+    assert_eq!(lines(&mut s), 2, "the next list builds its own");
 }

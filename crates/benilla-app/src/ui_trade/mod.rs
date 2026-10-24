@@ -507,7 +507,7 @@ impl TradeSession {
 }
 
 /// The partner's cell `[0xb71728]`, set only while the window is open; `CloseTrade` (`0x4bfdc0`)
-/// enters the core.
+/// enters the core inside its call ([`crate::script_calls::ScriptCallHost`]).
 impl LatchedWindow for TradeSession {
     const WINDOW: NpcWindow = NpcWindow::Trade;
 
@@ -517,10 +517,6 @@ impl LatchedWindow for TradeSession {
 
     fn dispatched(world: &mut World) {
         close_core(world);
-    }
-
-    fn take_close_verb(script: &mut UiScript) -> bool {
-        script.take_trade_close()
     }
 }
 
@@ -1277,15 +1273,18 @@ fn feed_trade(
             // something on the partner moves what the cursor holds into the offer (`0x5d3f80`).
             if trade.opens_with_held() {
                 if let Some(offer) = script.trade_open_money() {
-                    // Coins (`0x4bf5fe`-`0x4bf644`): `0x5d4500` sends the new offer, the cache of
-                    // our money `[0xb71740]` takes it (`0x4bf62b`), and `PLAYER_TRADE_MONEY`,
-                    // `PLAYER_MONEY` and `TRADE_SHOW` fire once each, then the leg returns.
-                    trade.fold_held_coins(offer);
+                    // Coins (`0x4bf5fe`-`0x4bf644`): `0x5d4500` sends the new offer, then the
+                    // cursor clears (`0x4bf61c`), the cache of our money `[0xb71740]` takes it
+                    // (`0x4bf62b`), and `PLAYER_TRADE_MONEY`, `PLAYER_MONEY` and `TRADE_SHOW` fire
+                    // once each, then the leg returns.
                     trade.send_edit(&commands, ClientCommand::SetTradeGold { copper: offer });
+                    script.trade_open_money_clear();
+                    trade.fold_held_coins(offer);
                     script.fire_event("PLAYER_TRADE_MONEY", vec![]);
                     script.fire_event("PLAYER_MONEY", vec![]);
                 } else if let Some(held) = script.trade_open_item() {
-                    // An item (`0x4bf652`-`0x4bf6fa`): its send's answer is not read (`0x4bf6be`).
+                    // An item (`0x4bf652`-`0x4bf6fa`): its send's answer is not read (`0x4bf6be`),
+                    // then the cursor clears and the slot is stored (`0x4bf6ca`-`0x4bf6fa`).
                     let _ = trade.send_placement(
                         &commands,
                         &objects,
@@ -1295,6 +1294,7 @@ fn feed_trade(
                         held.bag,
                         held.bag_slot,
                     );
+                    script.trade_open_item_store(&held);
                 }
             }
             script.fire_event("TRADE_SHOW", vec![]);
@@ -1322,23 +1322,16 @@ fn register_record_callbacks(script: &mut UiScript, items: &Items, commands: &Ne
     }
 }
 
-/// After the tick: `CloseTrade`'s close core, which the interaction latch runs (`0x4bfdd9` →
-/// `0x4bf4e0(0, 0)`), and the item getters' record callbacks ([`register_record_callbacks`]).
-/// Every other trade verb acts inside its call ([`TradeSteps`]).
+/// After the tick: the item getters' record callbacks ([`register_record_callbacks`]). Every
+/// trade verb acts inside its call ([`TradeSteps`]), `CloseTrade`'s close core among them.
 fn drain_trade(
     mut hosted: crate::script_calls::HostedVm,
-    mut world_commands: Commands,
     commands: Res<NetCommands>,
     items: Res<Items>,
 ) {
     hosted.run(|script| {
-        let Some(script) = script else {
-            return;
-        };
-        register_record_callbacks(script, &items, &commands);
-        // The core's cancel goes out open or not (`0x4bf527`).
-        if script.take_trade_close() {
-            crate::ui_session::queue(&mut world_commands, close_core);
+        if let Some(script) = script {
+            register_record_callbacks(script, &items, &commands);
         }
     })
 }

@@ -116,6 +116,9 @@ pub enum ScriptCall {
     /// host runs the rest of the verb inside the call, from the group gates to the packet, and
     /// raises its escape error there ([`UiScript::raise_in_call`]).
     SendChat(super::ChatSend),
+    /// `DisplayError` (`0x496720`) on a catalog row a verb refuses with itself: the host shows the
+    /// line, its event and its sound, before the verb returns.
+    DisplayError(&'static str),
     /// `RandomRoll(min, max)` (`0x48c7b0`) past its range check (`0x48c807`-`0x48c830`):
     /// `MSG_RANDOM_ROLL` (`0x48c832`).
     RandomRoll { min: u32, max: u32 },
@@ -199,6 +202,42 @@ pub enum ScriptCall {
     /// A stable request past its binding's checks ([`super::StableCall`]): its packet inside the
     /// call.
     Stable(super::StableCall),
+    /// A session verb ([`super::SessionRequest`]): the logout's request, its cancel, the quit,
+    /// the reload's flag and the cinematic's stop, inside the call (`0x489390` → `0x5ab000`).
+    Session(super::SessionRequest),
+    /// A tutorial verb ([`super::TutorialCall`]): the bank's write and its packet inside the call
+    /// (`0x4b59dc` → `0x4b54c0`).
+    Tutorial(super::TutorialCall),
+    /// A bank verb ([`super::BankCall`]): `PurchaseSlot`'s refusal or packet, `CloseBankFrame`'s
+    /// close core, inside the call.
+    Bank(super::BankCall),
+    /// A profession window verb ([`super::TradeSkillCall`]): `DoTradeSkill`'s cast, the close's
+    /// marker, inside the call.
+    TradeSkill(super::TradeSkillCall),
+    /// The craft window's close ([`super::CraftCall`]): its marker, inside the call.
+    Craft(super::CraftCall),
+    /// A battleground verb ([`super::BattlefieldCall`]): its refusal, its packet and its throttle
+    /// inside the call.
+    Battlefield(super::BattlefieldCall),
+    /// A death verb ([`super::DeathAction`]): its gates and its packet, or the soulstone's item
+    /// use, inside the call.
+    Death(super::DeathAction),
+    /// A duel verb ([`super::DuelRequest`]): its packet or the duel spell's cast inside the call.
+    Duel(super::DuelRequest),
+    /// A group loot vote ([`super::LootRollCall`]): its packet and the engine's close inside the
+    /// call, ahead of `CANCEL_LOOT_ROLL`.
+    LootRoll(super::LootRollCall),
+    /// The innkeeper's Accept ([`super::BinderCall`]): its packet inside the call.
+    Binder(super::BinderCall),
+    /// The summon's Accept ([`super::SummonCall`]): its packet inside the call.
+    Summon(super::SummonCall),
+    /// The meeting stone's leave ([`super::MeetingStoneCall`]): its refusal or packet inside the
+    /// call.
+    MeetingStone(super::MeetingStoneCall),
+    /// The lockouts' reset ([`super::InstanceCall`]): its packet inside the call.
+    Instance(super::InstanceCall),
+    /// The PvP flag's toggle ([`super::PvpCall`]): its packet inside the call.
+    Pvp(super::PvpCall),
 }
 
 /// The mode the four `TargetNearest*` shims hand the TAB cycler `0x493f60`, the only byte that
@@ -228,6 +267,7 @@ impl ScriptCall {
             ScriptCall::PickItem(pick) => pick.may_cast,
             ScriptCall::EnchantConfirm(answer) => answer.may_cast,
             ScriptCall::Item(super::ItemCall::BindOnUse { may_cast }) => *may_cast,
+            ScriptCall::Death(super::DeathAction::UseSoulstone { may_cast }) => *may_cast,
             ScriptCall::CastSpell { may_cast, .. } => *may_cast,
             ScriptCall::CastShapeshiftForm { may_cast, .. } => *may_cast,
             ScriptCall::Select { may_cast, .. }
@@ -341,6 +381,15 @@ pub(crate) fn hold(lua: &Lua, held: Held) {
     super::census::held();
 }
 
+/// Whether a handler an engine step held waits for the host ([`Waiting::Lua`]).
+pub(crate) fn signal_waiting(lua: &Lua) -> bool {
+    lua.app_data_ref::<Model>()
+        .expect("model app_data")
+        .script_calls
+        .iter()
+        .any(|item| matches!(item, Waiting::Lua { .. }))
+}
+
 /// Take what waits, with the lock bits and the cursor its writes changed put back, last first:
 /// each item then runs against the locks and the cursor as they stood when it was made, and each
 /// write is made again in its place ([`Waiting::Lock`], [`Waiting::Cursor`], a held segment's
@@ -349,6 +398,12 @@ fn take_waiting(lua: &Lua) -> VecDeque<Waiting> {
     let mut model = lua.app_data_mut::<Model>().expect("model app_data");
     let model = &mut *model;
     let batch = std::mem::take(&mut model.script_calls);
+    rewind_waiting(model, &batch);
+    batch.into()
+}
+
+/// Put back, last first, the lock bits and the cursor `batch`'s writes changed.
+fn rewind_waiting(model: &mut Model, batch: &[Waiting]) {
     for item in batch.iter().rev() {
         match item {
             Waiting::Lock { guid, was, .. } => {
@@ -362,7 +417,6 @@ fn take_waiting(lua: &Lua) -> VecDeque<Waiting> {
             Waiting::Lua { .. } | Waiting::Call(_) => {}
         }
     }
-    batch.into()
 }
 
 /// Make a lock write that waited, in its place.
@@ -440,6 +494,12 @@ pub(crate) const TOO_DEEP: &str = "script calls nested too deep";
 pub(crate) fn submit(lua: &Lua, call: ScriptCall) -> mlua::Result<()> {
     let mut model = lua.app_data_mut::<Model>().expect("model app_data");
     if !super::host::open(lua) {
+        // A VM with no host open queues a refusal's line for the app instead
+        // ([`super::Model::push_ui_error`]).
+        if let ScriptCall::DisplayError(key) = call {
+            model.push_ui_error(key);
+            return Ok(());
+        }
         return match model.kept_calls.as_mut() {
             Some(kept) => {
                 kept.push(call);
@@ -472,6 +532,13 @@ pub(crate) fn submit(lua: &Lua, call: ScriptCall) -> mlua::Result<()> {
         Some(at) => Err(mlua::Error::runtime(raised.remove(at).1)),
         None => Ok(()),
     }
+}
+
+/// `DisplayError` (`0x496720`) on the catalog row `key`, from inside a verb or an engine step that
+/// refuses: the host shows the line and signals `UI_ERROR_MESSAGE` before the verb returns, as
+/// `0x496720` signals before it returns ([`submit`]). The caller holds no borrow of the model.
+pub(crate) fn display_error(lua: &Lua, key: &'static str) -> mlua::Result<()> {
+    submit(lua, ScriptCall::DisplayError(key))
 }
 
 /// File what the call `seq` raised: for its verb, while that waits inside [`submit`]; else, its
@@ -627,6 +694,40 @@ pub(crate) fn refuse_waiting(lua: &Lua) -> usize {
 }
 
 impl UiScript {
+    /// How much waits for the host now: the mark a deferred stretch parks from
+    /// ([`Self::park_since`]).
+    pub fn waiting_mark(&self) -> usize {
+        self.model_ref().script_calls.len()
+    }
+
+    /// Park what has waited since `mark`, a deferred stretch's held handlers and writes
+    /// ([`Self::defer`]), with the lock bits and the cursor its writes changed put back, so what
+    /// runs before it reads them as they stood; the key [`Self::run_parked`] runs it by, `None`
+    /// when nothing waited.
+    pub fn park_since(&mut self, mark: usize) -> Option<u64> {
+        let mut model = self.model_mut();
+        let model = &mut *model;
+        if model.script_calls.len() <= mark {
+            return None;
+        }
+        let parked = model.script_calls.split_off(mark);
+        rewind_waiting(model, &parked);
+        let key = model.next_parked;
+        model.next_parked += 1;
+        model.parked.insert(key, parked);
+        Some(key)
+    }
+
+    /// Run what [`Self::park_since`] parked under `key`, behind what waits now, each write made
+    /// again in its place, with the host lent; a key this VM never parked runs nothing.
+    pub fn run_parked(&mut self, key: u64) {
+        let Some(parked) = self.model_mut().parked.remove(&key) else {
+            return;
+        };
+        self.model_mut().script_calls.extend(parked);
+        drain(self.lua());
+    }
+
     /// Raise `message` in the verb of the call the host is applying, as that verb returns: the
     /// reference's verb raises in its own body (`lua_error`, through `0x6f4940`), after what it did
     /// before, which stands. A verb that returned while its call waited for the host reports it as
@@ -651,6 +752,12 @@ impl UiScript {
             .as_mut()
             .map(std::mem::take)
             .unwrap_or_default()
+    }
+
+    /// Take the kept calls equal to `call`, leaving the rest kept: how many there were.
+    pub fn take_calls_like(&mut self, call: &ScriptCall) -> usize {
+        self.take_calls_where(|kept| (kept == call).then_some(()))
+            .len()
     }
 
     /// Take the kept calls `pick` answers for, in call order, leaving the rest kept.
@@ -1071,33 +1178,47 @@ mod tests {
         );
     }
 
-    /// What an engine turn left runs in the order it was made: a handler fired before a waiting
-    /// call reads the state before it, one fired after it the state after.
+    /// What an engine turn left runs in the order it was made: a call made ahead of its handlers
+    /// applies first, and each handler reads the state the ones before it left.
     #[test]
     fn a_turns_handlers_and_waiting_calls_run_in_the_order_made() {
         let mut s = UiScript::new().unwrap();
         listen(&s, "First", "LOOT_OPENED", "1");
         listen(&s, "Second", "LOOT_CLOSED", "2");
         s.host_out(|s| {
-            s.fire_event("LOOT_OPENED", vec![]);
             s.run(r#"TargetUnit("player")"#).unwrap();
+            s.fire_event("LOOT_OPENED", vec![]);
             s.fire_event("LOOT_CLOSED", vec![]);
         });
         let mut host = Stamping::default();
         s.hosted(&mut host, |_| ());
-        // The first handler's call applies inside it, then the waiting one, then the second's.
+        // The waiting call applies, then the first handler's inside it, then the second's.
         assert_eq!(
             global::<Option<String>>(&s, "ORDER").as_deref(),
-            Some("1:1 2:3 ")
+            Some("1:2 2:3 ")
         );
         assert_eq!(
             host.applied,
             vec![
-                ScriptCall::ClearTarget,
                 select("player"),
+                ScriptCall::ClearTarget,
                 ScriptCall::ClearTarget
             ]
         );
+    }
+
+    /// Lua run in place behind a handler a turn held would run ahead of it, where `SignalEvent`
+    /// (`0x703e50`) ran the handler first: the in-place runner refuses it.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "no held signal waiting")]
+    fn a_chunk_run_in_place_behind_a_held_signal_is_refused() {
+        let mut s = UiScript::new().unwrap();
+        listen(&s, "First", "LOOT_OPENED", "1");
+        s.host_out(|s| {
+            s.fire_event("LOOT_OPENED", vec![]);
+            let _ = s.run(r#"TargetUnit("player")"#);
+        });
     }
 
     /// With no host to lend after the turn, its handlers still run, as it ends: the calls they
@@ -1341,26 +1462,6 @@ mod tests {
         assert_eq!(s.item_locks(), vec![2]);
     }
 
-    /// Lua the turn runs in place reads the locks as they are then, and its own unlock waits in
-    /// order behind the held signal before it: `ClearCursor` (`0x495190`) on a held item unlocks
-    /// it (`0x4951d9`) after the turn's first unlock signalled, so that signal's handler, run once
-    /// the host is back, still reads the cursor's item locked.
-    #[test]
-    fn a_chunks_unlock_waits_behind_the_held_signal_before_it() {
-        let mut s = UiScript::new().unwrap();
-        watch_locks(&s);
-        s.seed_item_locks([1, 2]);
-        s.set_cursor_for_test(super::super::cursor::CursorPayload::Item(held_item(2)));
-        s.host_out(|s| {
-            s.unlock_item(1);
-            s.run("ClearCursor()").unwrap();
-        });
-        s.hosted(&mut Stamping::default(), |_| ());
-        // The chunk's own handler ran in place, then the held one.
-        assert_eq!(global::<String>(&s, "SEEN"), "00 01 ");
-        assert_eq!(s.item_locks(), Vec::<u64>::new());
-    }
-
     /// The tag a test host notes a call by.
     fn tag(call: &ScriptCall) -> &'static str {
         match call {
@@ -1433,7 +1534,7 @@ mod tests {
         assert_eq!(s.refuse_waiting(), 0, "nothing waits");
     }
 
-    /// A host whose first apply signals `LOOT_OPENED` and runs `TargetLastEnemy()` in place, both
+    /// A host whose first apply runs `TargetLastEnemy()` in place and signals `LOOT_OPENED`, both
     /// of which wait for the host, then stops at a signal point, notes its next step and signals
     /// `LOOT_CLOSED`.
     struct Ahead {
@@ -1444,8 +1545,8 @@ mod tests {
         fn apply(&mut self, script: &mut UiScript, call: ScriptCall) -> Option<CallTail> {
             note(script, tag(&call));
             if std::mem::take(&mut self.first) {
-                script.fire_event("LOOT_OPENED", vec![]);
                 script.run("TargetLastEnemy()").unwrap();
+                script.fire_event("LOOT_OPENED", vec![]);
                 script.signal_point(self);
                 note(script, "next");
                 script.fire_event("LOOT_CLOSED", vec![]);
@@ -1454,8 +1555,8 @@ mod tests {
         }
     }
 
-    /// What the apply held before a signal point (a signal's handlers, a call Lua run in place
-    /// made) runs at the point, in the order made; what it signals after the point waits for the
+    /// What the apply held before a signal point (a call Lua run in place made, a signal's
+    /// handlers) runs at the point, in the order made; what it signals after the point waits for the
     /// apply to return.
     #[test]
     fn what_the_apply_held_before_a_point_runs_at_it() {
@@ -1467,7 +1568,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             global::<String>(&s, "ORDER"),
-            "select opened last next closed "
+            "select last opened next closed "
         );
     }
 
@@ -1502,6 +1603,102 @@ mod tests {
         };
         s.hosted(&mut next, |s| s.run("ClearTarget()")).unwrap();
         assert_eq!(next.applied, 1);
+    }
+
+    /// While a stretch is deferred, a handler fired is held even with a host lent, and a lend's
+    /// drain runs nothing; each leg's handlers park apart, and each parked run fires once, in
+    /// order, with the host lent.
+    #[test]
+    fn a_deferred_stretch_parks_each_legs_handlers_for_one_run() {
+        let mut s = UiScript::new().unwrap();
+        on(&s, "LOOT_OPENED", r#"ORDER = (ORDER or "") .. "opened ""#);
+        on(&s, "LOOT_CLOSED", r#"ORDER = (ORDER or "") .. "closed ""#);
+        let mut host = Nesting {
+            applied: Vec::new(),
+            inner: None,
+        };
+        let mark = s.waiting_mark();
+        let deferring = s.defer();
+        s.hosted(&mut host, |s| s.fire_event("LOOT_OPENED", vec![]));
+        assert_eq!(global::<Option<String>>(&s, "ORDER"), None, "held");
+        let first = s.park_since(mark).expect("the first leg's");
+        s.fire_event("LOOT_CLOSED", vec![]);
+        s.hosted(&mut host, |_| ());
+        assert_eq!(
+            global::<Option<String>>(&s, "ORDER"),
+            None,
+            "the drain refused"
+        );
+        let second = s.park_since(mark).expect("the second leg's");
+        assert_eq!(s.park_since(mark), None, "nothing since");
+        drop(deferring);
+        let lua = s.lua().clone();
+        assert!(!super::super::host::holding(&lua));
+        s.hosted(&mut host, |s| {
+            s.run_parked(first);
+            s.run_parked(first);
+        });
+        assert_eq!(global::<String>(&s, "ORDER"), "opened ", "once");
+        s.hosted(&mut host, |s| s.run_parked(second));
+        assert_eq!(global::<String>(&s, "ORDER"), "opened closed ");
+    }
+
+    /// A parked stretch puts back the lock bits and the cursor its writes changed, so what runs
+    /// before it reads them as they stood, and makes each write again in its place when it runs:
+    /// the clear's `CURSOR_UPDATE` reads the emptied cursor then.
+    #[test]
+    fn a_parked_stretch_rewinds_its_cursor_and_lock_writes_and_makes_them_again() {
+        use super::super::cursor::{CursorItem, CursorPayload};
+        const LOCKED: u64 = 0x200;
+        let mut s = UiScript::new().unwrap();
+        on(&s, "CURSOR_UPDATE", r#"SEEN = tostring(CursorHasItem())"#);
+        // A handler held ahead of the writes, so they wait behind it.
+        on(&s, "LOOT_OPENED", "OPENED = 1");
+        s.set_cursor_for_test(CursorPayload::Item(CursorItem {
+            item_class: None,
+            guid: 0x106,
+            bar_placeable: true,
+            consumable: false,
+            bag: 0,
+            slot: 1,
+            item_id: 117,
+            texture: None,
+            link: None,
+            count: None,
+            quality: None,
+            equip_slots: Vec::new(),
+        }));
+        let mark = s.waiting_mark();
+        let deferring = s.defer();
+        s.fire_event("LOOT_OPENED", vec![]);
+        s.lock_item(LOCKED);
+        s.clear_cursor_payload();
+        let key = s.park_since(mark).expect("parked");
+        drop(deferring);
+        assert!(!s.item_locked(LOCKED), "the lock put back");
+        assert!(s.cursor_payload().is_some(), "the cursor put back");
+        let mut host = Nesting {
+            applied: Vec::new(),
+            inner: None,
+        };
+        s.hosted(&mut host, |s| s.run_parked(key));
+        assert!(s.item_locked(LOCKED), "the lock made again");
+        assert!(s.cursor_payload().is_none(), "the clear made again");
+        assert_eq!(global::<String>(&s, "SEEN"), "nil");
+    }
+
+    /// The deferral's guard ends with a panic that unwinds through it: nothing is held after.
+    #[test]
+    fn a_panic_ends_the_deferral() {
+        let s = UiScript::new().unwrap();
+        let lua = s.lua().clone();
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _deferring = s.defer();
+            panic!("inside a deferred stretch");
+        }));
+        assert!(unwound.is_err());
+        assert!(!super::super::host::holding(&lua));
+        assert!(!super::super::host::open(&lua));
     }
 
     /// A host whose `ClearTarget` panics; its other calls signal `PLAYER_TARGET_CHANGED`, stop at a

@@ -88,6 +88,8 @@ pub(crate) struct BindingsState {
     fired: Vec<Input>,
     /// Amount per one-shot this frame: a zoom's yards, else 1.0.
     amounts: Vec<(Input, f32)>,
+    /// This frame's `MoveView*` calls in call order, `(axis, start)`, for the camera's axes.
+    view_calls: Vec<(script_input::ViewAxis, bool)>,
     /// The keys we believe are down: a press of one is a repeat. The reference classifies
     /// auto-repeat off its own list (`0x4248b3`), never the Win32 `lParam` repeat bit.
     /// Normalized like [`latched`](Self::latched) and reconciled against `ButtonInput` every
@@ -157,6 +159,16 @@ impl BindingsState {
     pub(crate) fn fired(&self, i: Input) -> bool {
         self.fired.contains(&i)
     }
+    /// Fire the one-shot `i` this frame, as a body's Lua call would.
+    #[cfg(test)]
+    pub(crate) fn fire_for_test(&mut self, i: Input) {
+        self.fired.push(i);
+    }
+    /// End the frame's one-shots.
+    #[cfg(test)]
+    pub(crate) fn clear_for_test(&mut self) {
+        self.fired.clear();
+    }
     /// Total amount for a one-shot this frame (0.0 when idle): the camera zoom's yards.
     pub(crate) fn amount(&self, i: Input) -> f32 {
         self.amounts
@@ -164,6 +176,10 @@ impl BindingsState {
             .filter(|&&(a, _)| a == i)
             .map(|&(_, v)| v)
             .sum()
+    }
+    /// This frame's `MoveView*` calls in call order, `(axis, start)`.
+    pub(crate) fn view_calls(&self) -> &[(script_input::ViewAxis, bool)] {
+        &self.view_calls
     }
     /// Both mouse bits held by their Lua Starts, the both-button run: MOVEANDSTEER's body
     /// (`Bindings.xml:3-11`) runs `CameraOrSelectOrMoveStart` and `TurnOrActionStart`.
@@ -452,6 +468,7 @@ fn latch_and_dispatch(
     state.just.clear();
     state.fired.clear();
     state.amounts.clear();
+    state.view_calls.clear();
 
     // Deviation: latches die with the VM that made them, because a latch names a command of that
     // VM's table and releasing it against a new one would run another load's up-half. The

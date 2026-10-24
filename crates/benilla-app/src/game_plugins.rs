@@ -1260,11 +1260,18 @@ pub(crate) mod schedule_tests {
     /// Why a VM holder in `Update` ordered before the tick may stay out of
     /// [`crate::ui_script::UiFeed`], keyed by a suffix of the system's full name, with the
     /// reason.
-    const OUTSIDE_THE_FEED_PHASE: &[(&str, &str)] = &[(
-        "::ui_chat::frames::tee_shown_lines",
-        "in the lanes' set after their drain (`lanes::UiLanes`, after `UiFeed` and before the \
-         tick), so the log files take the lines the verbs showed after the drain's own",
-    )];
+    const OUTSIDE_THE_FEED_PHASE: &[(&str, &str)] = &[
+        (
+            "::ui_chat::frames::tee_shown_lines",
+            "in the lanes' set after their drain (`lanes::UiLanes`, after `UiFeed` and before the \
+             tick), so the log files take the lines the verbs showed after the drain's own",
+        ),
+        (
+            "::ui_unit::views::mark_frame_start",
+            "a debug snapshot of what the frame starts from, ahead of the net stage by design: it \
+             reads the units the resolver's last inputs name and pushes nothing",
+        ),
+    ];
 
     /// The create's control restore (`player::regain_control_on_arrival`) is registered in the
     /// built client and ordered: after the self create it answers, before the controller and the
@@ -1341,7 +1348,7 @@ pub(crate) mod schedule_tests {
         ("::ui_script::sweep::arm_leaving_world_on_self_create",
          "`Added<SelfPlayer>` is relative to this system's own last run, so a tag that lands after a run is still seen at the next"),
         ("::ui_session::release::release_on_field_edges",
-         "it is in Net after `apply_net_updates`, unordered against the tag; its self-only branches need `old > 0` (the death edge) or a form change on a latch that is not open, which a create burst never raises"),
+         "it is in Net after `apply_net_updates`, unordered against the tag; its self-only branch needs a form change on a latch that is not open, which a create burst never raises"),
         ("::death::drive_death_look",
          "level-driven: it writes the fade from the ghost flag every frame and re-reads self each time, so a frame with no self is overwritten by the next"),
         ("::tutorial::run_world_enter_cascade",
@@ -1350,6 +1357,8 @@ pub(crate) mod schedule_tests {
          "no self returns before anything changes, and a question open on an NPC needs a self that interacted; the leash is re-tested every frame"),
         ("::ui_session::latch::watch_interaction_range",
          "no self returns before anything changes, and a latch needs a self that interacted; the leash is re-tested every frame"),
+        ("::ui_unit::views::mark_frame_start",
+         "a debug snapshot of what the frame starts from, ahead of the net stage by design and with no change detection: a self the frame tags is in no snapshot, and the views' check skips it"),
     ];
 
     /// Every `Update` system that names `SelfPlayer` (reads it, or filters on it) is ordered after
@@ -1877,12 +1886,16 @@ pub(crate) mod schedule_tests {
           raised by the gesture it just made"),
         ("death/mod.rs", "feed_death", Because::MemoLatched,
          "`feed.vm: VmMemo<DeathAnnounced>`: a fresh memo makes the first snapshot an edge and re-announces a held offer, confirm and corpse range"),
+        ("death/mod.rs", "signal_death", Because::MemoLatched,
+         "our death's leg, run in its packet with the VM deferred: its `PLAYER_DEAD` is parked for the deaths lane, whose drain runs only with the interface up (`ingame_ui_up`), and its memo is `feed.vm`, a `VmMemo<DeathAnnounced>`, which a fresh VM reads as `None`, so `feed_death` signals `PLAYER_DEAD` at its first sight of the body dead"),
         ("net/objects/update.rs", "on_update_end", Because::Deliberate,
          "a net handler whose take is the packet's own pass, the blocks its write pass recorded, documented at the line: it publishes nothing to the VM, whose `UNKNOWNOBJECT` text it reads only to name a party member's pet; its notices go to the gated field-notice firing"),
         ("screenshot.rs", "ask_for_captures", Because::FilledByVm,
          "`pending` holds only the VM's own `Screenshot()` asks, and the take spawns a capture, publishing nothing"),
         ("screenshot.rs", "report_captures", Because::FilledByVm,
          "the outcome chain starts with the VM's own `Screenshot()` call"),
+        ("target/click.rs", "select_on_plate_click", Because::FilledByVm,
+         "filled only by a nameplate frame's click, which a frameless VM has no plate to make"),
         ("ui_action/drain.rs", "drain_click_casts", Because::FilledByVm,
          "filled only by a world right-click on a GameObject or a body; the drain sends casts to the wire"),
         ("ui_bank/mod.rs", "feed_bank", Because::PlayerRoundTrip,
@@ -1926,6 +1939,8 @@ pub(crate) mod schedule_tests {
          "every line answers a charter action of ours; the window edges ride the `fed` memo"),
         ("ui_quest_share.rs", "feed_quest_share", Because::PlayerRoundTrip,
          "a verdict answers our own push and a confirm follows a party member's escort accept, both held until the name resolves (the confirm is another player's act: coincidence-only residual)"),
+        ("ui_reputation.rs", "feed_reputation", Because::SelfHealing,
+         "its take is the messages' list ops: a new VM's first push is the rebuild (`set_reputation` on an empty list), which lists every met slot the lost ops would have added, and the folds a lost sort leaves stand from the rebuild"),
         ("ui_script/glue_mgr.rs", "drive_glue_mgr", Because::Deliberate,
          "it acts only on a glue-kind VM (`script.filter(vm_kind() == Glue)`, documented at the fire sites), never the entry VM the window leaves frameless; news that arrives with no glue VM is held in `AddonInfoReply` for the next one"),
         ("ui_script/extract/mod.rs", "paint_script", Because::Deliberate,
@@ -1944,6 +1959,8 @@ pub(crate) mod schedule_tests {
          "both packets follow talking to a flight master"),
         ("ui_trade/mod.rs", "feed_trade", Because::Deliberate,
          "its take is `named_lines_asked`, how many held lines have been asked: taken before the interface is up the lines' names are still asked, to the server and not the VM, and the lines stay held until they show"),
+        ("ui_tradeskill.rs", "fire_list_rebuilds", Because::Deliberate,
+         "a lane's firing, run only by the drain: `drop_list_rebuilds`, gated on the interface being down, empties the lane the frame its items land, so none fires into a later VM"),
         ("ui_trainer/mod.rs", "feed_trainer", Because::PlayerRoundTrip,
          "a refusal answers a Train click and a list answers a trainer gossip click; the edges ride `VmMemo`s"),
     ];

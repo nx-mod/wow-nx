@@ -247,6 +247,8 @@ fn a_bag_items_price_scales_by_its_charges_and_loses_its_repair_cost() {
 #[test]
 fn the_merchant_prices_an_object_held_past_the_worn_slots() {
     let mut s = script();
+    // The bank bands read through `GetItemInSlot`, open only at a banker.
+    s.set_bank(Some(crate::script::BankState::default()));
     s.set_screen_size(800.0, 600.0);
     for (id, name, sell_price) in [(4380, "Ring", 50), (4381, "Gem", 7), (4382, "Shard", 9)] {
         s.set_item_template(
@@ -876,6 +878,7 @@ fn a_looted_roll_shows_its_lines_and_never_the_placeholder() {
             quantity: 1,
             quality: Some(2),
             is_coin: false,
+            money: 0,
             item_id: 8888,
             link: Some("|cff1eff00|Hitem:8888:0:584:0|h[Bloodrazor of the Monkey]|h|r".into()),
             // The row carries the roll id; the engine resolves it, as the reference reads `+0x424`.

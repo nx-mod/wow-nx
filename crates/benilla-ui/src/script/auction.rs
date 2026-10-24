@@ -220,12 +220,16 @@ pub struct AuctionQuery {
     pub inv_type: Option<u32>,
     pub class: Option<u32>,
     pub sub_class: Option<u32>,
-    /// A minimum quality, not an equality; `None` = no filter (the dropdown's All, -1).
-    pub quality: Option<u32>,
+    /// A minimum quality, not an equality, as the wire takes it: the argument's `_ftol`, a
+    /// negative's 32-bit pattern, `u32::MAX` (-1, the dropdown's All) for a non-number
+    /// (`0x4ceb72`-`0x4ceb96`).
+    pub quality: u32,
     /// The wire's item offset: the page argument's `_ftol` times 50 in 32 bits, 0 for a
     /// non-number (`0x4ceb28`-`0x4ceb44`).
     pub list_from: u32,
-    pub usable_only: bool,
+    /// The usable-only byte: the argument's `_ftol` low byte, 0 for a non-number
+    /// (`0x4ceb47`-`0x4ceb6f`, sent at `0x4cec32`).
+    pub usable: u8,
 }
 
 /// `StartAuction`'s send (`0x4ce8c5`-`0x4ce925`): the sell slot's item as the attach stored it.
@@ -354,6 +358,11 @@ pub enum AuctionCall {
     /// `StartAuction` past its slot: with an auctioneer (`0x4ce7da`), the damaged item's refusal
     /// or the send and the sell slot's clear (`0x4ce925`, `0x4ce92a`).
     Start(Result<AuctionStartRequest, &'static str>),
+    /// `SortAuctionItems` past its names (`0x4cfc00`): list `list`'s driver promotes `column` in
+    /// the engine's stack, with a session or without (`0x4cd850`).
+    Sort { list: usize, column: u8 },
+    /// `CloseAuctionHouse()` (`0x4ce160`): the close core `0x4cd5f0`.
+    Close,
 }
 
 impl super::UiScript {
@@ -493,17 +502,6 @@ impl super::UiScript {
         });
     }
 
-    /// Drain the header clicks: `(list index, sort key)`, in click order, which the app replays
-    /// onto its own copy of the stacks, the one that outlives the session and the VM.
-    pub fn take_auction_sorts(&mut self) -> Vec<(usize, String)> {
-        std::mem::take(&mut self.model_mut().auction_sorts)
-    }
-
-    /// Whether `CloseAuctionHouse` was called since the last drain (and clear the flag).
-    pub fn take_auction_close(&mut self) -> bool {
-        std::mem::take(&mut self.model_mut().auction_close)
-    }
-
     /// The sell slot's `(bag, slot)`, resolved by the app to the item guid on `StartAuction`.
     pub fn auction_sell_item(&mut self) -> Option<(i64, u32)> {
         self.model_mut()
@@ -543,7 +541,7 @@ pub(crate) fn clear_sell_slot(model: &mut Model) {
 fn sell_refusal(model: &Model, item: &cursor::CursorItem) -> Option<&'static str> {
     let (bound, flags, duration, seats) = if item.bag == cursor::EQUIPMENT_BAG {
         let s = model
-            .inv_slot("player", item.slot as usize)
+            .player_slot_object(item.slot as usize)
             .filter(|s| s.guid == item.guid)?;
         (s.already_bound, s.flags, s.field_duration, s.occupied_seats)
     } else {
@@ -1013,8 +1011,8 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
 
     // SortAuctionItems(type, sort) (`0x4cfc00`): the sort name is matched first, then the type;
     // either unknown sorts nothing (`0x4cfd90`). Otherwise the list's driver promotes the column
-    // and runs the sort tail, which sorts and signals before the call returns (`0x4cd850`,
-    // `0x4cdc70`, `0x4cdd60`); the click is queued for the app's copy of the stack.
+    // in the engine's stack, the one that outlives the session and the VM, then runs the sort
+    // tail, which sorts and signals before the call returns (`0x4cd850`, `0x4cdc70`, `0x4cdd60`).
     g.set(
         "SortAuctionItems",
         lua.create_function(|lua, (kind, sort): (Value, Value)| {
@@ -1030,10 +1028,8 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             let Some(list) = list_index(&kind) else {
                 return Ok(());
             };
+            submit(lua, AuctionCall::Sort { list, column })?;
             super::tick::verb(lua, |model| {
-                model
-                    .auction_sorts
-                    .push((list, SORT_KEYS[usize::from(column)].to_string()));
                 if let Some(a) = model.auction.as_mut() {
                     a.lists[list].sort.promote(column);
                 }
@@ -1174,21 +1170,18 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         "QueryAuctionItems",
         lua.create_function(|lua, args: MultiValue| {
             let a: Vec<Value> = args.into_iter().collect();
-            let name = match a.first() {
-                Some(Value::String(s)) => s.to_str().map(|s| s.to_string()).unwrap_or_default(),
-                _ => String::new(),
-            };
-            let truthy = |i: usize| {
-                !matches!(
-                    a.get(i),
-                    None | Some(Value::Nil) | Some(Value::Boolean(false))
-                )
-            };
-            // qualityIndex arrives as the dropdown's value: -1 for All, else the quality itself.
-            let quality = match a.get(8) {
-                Some(Value::Integer(n)) if *n >= 0 => u32::try_from(*n).ok(),
-                Some(Value::Number(n)) if *n >= 0.0 => Some(*n as u32),
-                _ => None,
+            // `is-number-or-string` then `tostring`, a number as its text, else ""
+            // (`0x4ce9cd`-`0x4ce9e7`).
+            let name = a
+                .first()
+                .and_then(|v| binding_abi::optional_string(lua, v))
+                .unwrap_or_default();
+            // A number's `_ftol`, numeric strings included, for `usable` and `quality`.
+            let number = |i: usize| {
+                a.get(i)
+                    .cloned()
+                    .and_then(|v| binding_abi::is_number(lua, v))
+                    .map(binding_abi::ftol)
             };
             // A menu position: a number's `_ftol` less one, compared unsigned, so 0 and a
             // negative fall out of range (`0x4cea62`-`0x4cea6b`).
@@ -1217,9 +1210,12 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                     inv_type,
                     class,
                     sub_class,
-                    quality,
+                    // Any number's `_ftol`, a negative too, else -1, the wire's "any"
+                    // (`0x4ceb72`-`0x4ceb96`).
+                    quality: number(8).map_or(u32::MAX, |n| n as u32),
                     list_from: list_offset(lua, a.get(6).cloned()),
-                    usable_only: truthy(7),
+                    // A number's `_ftol` low byte, else 0, so `true` is 0 (`0x4ceb47`-`0x4ceb6f`).
+                    usable: number(7).map_or(0, |n| n as u8),
                 }
             };
             submit(lua, AuctionCall::Query(query))
@@ -1459,8 +1455,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                 }
             };
             if let Some(key) = refusal {
-                super::tick::verb(lua, |model| model.push_ui_error(key));
-                return Ok(());
+                return super::calls::display_error(lua, key);
             }
             if cursor::click_attach_slot(lua, |model| &mut model.auction_sell_item) {
                 super::tick::verb(lua, |model| {
@@ -1471,14 +1466,11 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         })?,
     )?;
 
-    // CloseAuctionHouse(): the client-side close; nothing goes on the wire.
+    // CloseAuctionHouse() (`0x4ce160`): the close core `0x4cd5f0` inside the call; nothing goes
+    // on the wire.
     g.set(
         "CloseAuctionHouse",
-        lua.create_function(|lua, ()| {
-            let mut model = lua.app_data_mut::<Model>().expect("model app_data");
-            model.auction_close = true;
-            Ok(())
-        })?,
+        lua.create_function(|lua, ()| submit(lua, AuctionCall::Close))?,
     )?;
 
     Ok(())
@@ -1571,6 +1563,7 @@ mod tests {
     #[test]
     fn list_types_and_sort_names_match_without_case() {
         let mut s = UiScript::new().unwrap();
+        s.keep_calls();
         s.set_auction(page(&[7]));
         assert_eq!(
             s.eval::<i64>(r#"return (GetNumAuctionItems("LIST"))"#)
@@ -1583,12 +1576,19 @@ mod tests {
             "Item 7"
         );
         s.run(r#"SortAuctionItems("LIST", "Name")"#).unwrap();
-        assert_eq!(s.take_auction_sorts(), [(LIST, "name".to_string())]);
+        let name = crate::auction_sort::sort_column("name").unwrap();
+        assert_eq!(
+            s.take_auction_calls(),
+            [AuctionCall::Sort {
+                list: LIST,
+                column: name
+            }]
+        );
         s.run(r#"SortAuctionItems("list", "nonsense") SortAuctionItems("nowhere", "name")"#)
             .unwrap();
         s.run("SortAuctionItems(1, 2)").unwrap();
         assert!(
-            s.take_auction_sorts().is_empty(),
+            s.take_auction_calls().is_empty(),
             "an unknown one sorts nothing"
         );
         let err = s
@@ -1637,6 +1637,7 @@ mod tests {
     #[test]
     fn a_sort_signals_its_list_inside_the_call_with_the_rows_in_order() {
         let mut s = UiScript::new().unwrap();
+        s.keep_calls();
         let mut state = page(&[1, 2]);
         state.lists[LIST].rows[0].name = Some("Cheap".into());
         state.lists[LIST].rows[0].buyout_price = 100;
@@ -1791,6 +1792,7 @@ mod tests {
     #[test]
     fn the_selection_follows_its_auction_through_a_resort() {
         let mut s = UiScript::new().unwrap();
+        s.keep_calls();
         s.set_auction(page(&[11, 22]));
 
         s.eval::<()>(r#"SetSelectedAuctionItem("list", 2)"#)
@@ -2703,5 +2705,22 @@ mod tests {
             "every read asks"
         );
         assert!(s.take_auction_name_asks().is_empty());
+    }
+
+    /// `ClickAuctionSellItemButton`'s refusal shows inside the verb (`0x496720`): the chunk's next
+    /// line reads it.
+    #[test]
+    fn the_sell_slots_refusal_shows_inside_its_call() {
+        use crate::script::ui_errors::shown::seen_in_call;
+        let mut s = UiScript::new().unwrap();
+        let mut bag = crate::script::cursor::two_item_bag();
+        bag.slots.get_mut(&1).unwrap().already_bound = true;
+        s.set_container(0, Some(bag));
+        let (seen, _) = seen_in_call(
+            &mut s,
+            "PickupContainerItem(0, 1) ClickAuctionSellItemButton()",
+        );
+        assert_eq!(seen, "ERR_AUCTION_BOUND_ITEM");
+        assert!(s.take_ui_errors().is_empty(), "nothing waits for the feed");
     }
 }

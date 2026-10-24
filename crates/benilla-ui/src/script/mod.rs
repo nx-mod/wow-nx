@@ -226,11 +226,14 @@ pub use auction::{
 };
 pub use aura::{AuraState, TrackingState, UnitAuraList};
 pub use backdrop::{Backdrop, Insets};
-pub use bank::BankState;
+pub use bank::{BankCall, BankState};
 pub use battlefield_positions::{BattlefieldFlagView, BattlefieldPositionView};
-pub use battlefield_queue::{BattlefieldListView, BattlefieldMapInfo, BattlefieldQueueSlot};
+pub use battlefield_queue::{
+    BattlefieldCall, BattlefieldListView, BattlefieldMapInfo, BattlefieldQueueSlot,
+};
 pub use battlefield_score::{BattlefieldScoreRow, BattlefieldScores, BattlefieldStatColumn};
 pub use bind_confirm::PendingEquipAnswer;
+pub use binder::BinderCall;
 pub use binding_abi::{ftol, s_str_to_float, s_str_to_int};
 pub use calls::{NearestMode, QueuedCall, ScriptCall};
 pub use camera_view::{CameraViewRequest, CAMERA_VIEW_COUNT};
@@ -252,9 +255,10 @@ pub use container::{
     BagAutoStore, ContainerMove, ContainerSlot, ContainerState, ContainerUse, EnchantView,
     PendingWrap, PetitionSlotView, RandomPropertyView, UiCursorMode, UseArm, UseFork,
 };
-pub use craft::{CraftReagent, CraftRecipe, CraftState, CraftTooltip};
+pub use craft::{CraftCall, CraftDifficulty, CraftReagent, CraftRecipe, CraftState, CraftTooltip};
 pub use cursor::equip::{AutoEquip, BIND_WHEN_EQUIPPED};
 pub use cursor::money::coin_icon;
+pub use cursor::swap::Swap;
 pub use cursor::{
     CursorAction, CursorItem, CursorMacro, CursorMerchantItem, CursorMoney, CursorPayload,
     CursorPetAction, CursorSpell, CursorStablePet, EnchantAnswer, EnchantConfirm, HeldCursor,
@@ -279,6 +283,7 @@ pub use cvars::{
     VIDEO_DEFAULT_CVARS, WORLD_DETAIL_STOPS,
 };
 pub use death::{DeathAction, DeathUiState};
+pub use dialog_verbs::MeetingStoneCall;
 pub use dressup::DressUpIntent;
 pub use duel::DuelRequest;
 pub use follow::FollowRequest;
@@ -289,8 +294,8 @@ pub use guild::{
     GuildCall, GuildCells, GuildMemberInfo, GuildRankEdit, GuildRankInfo, GuildState, LastOnline,
     UnitGuild, MAX_RANKS, MIN_RANKS, RANK_RIGHT_BITS,
 };
-pub use host::{CallHost, CallTail};
-pub use input_verbs::{BindingInput, FiredInput, HeldInput};
+pub use host::{CallHost, CallTail, Deferring};
+pub use input_verbs::{BindingInput, FiredInput, HeldInput, LookCall, ViewAxis};
 pub use item_calls::ItemCall;
 pub use lfg::LfgDungeon;
 pub use lottery::UnservedSend;
@@ -310,6 +315,7 @@ pub use worldmap_arrow::ARROW_MODEL;
 pub(crate) use button::{refresh_label_lua, state_font_lua, LabelFont};
 pub(crate) use font_block::{face_loads, own_font_lua, SAME_FONT_HEIGHT};
 pub use inspect::UnitReach;
+pub use instance::InstanceCall;
 pub use item_stats::{
     item_usable, ItemRecipe, ItemSetView, ItemSpellLine, ItemTemplateView, PlayerReqState,
     TaughtSpell,
@@ -318,7 +324,7 @@ pub use item_text::ItemTextState;
 pub use layout_cache::{AnchorLayout, FrameLayout, LayoutPoint};
 pub use lock_check::{check_lock, LockCheck, LockOpener, LockOpeners, LockSlotView};
 pub use loot::{LootCall, LootRow, LootState, LOOT_PORTRAIT_UNIT};
-pub use loot_roll::{LootRollEntry, LootRollsState};
+pub use loot_roll::{LootRollCall, LootRollEntry, LootRollsState};
 pub use macros::{
     macro_lines, MacroBinding, MacroDerives, MacroState, MacroView, CHARACTER_ID_BASE, MAX_MACROS,
     MAX_MACRO_BODY, MAX_MACRO_NAME,
@@ -343,7 +349,9 @@ pub use party::{
     PartyMemberInfo, PartyRequest, PartyState, RaidMemberInfo, ReadyCheckState, SavedInstanceInfo,
 };
 pub use pet::{PetActionView, PetCall, PetStats, PET_DISMISS_WORD};
-pub use pvp::{decorated_name, pvp_name_global_keys, HonorState, InspectHonorData, RankTitle};
+pub use pvp::{
+    decorated_name, pvp_name_global_keys, HonorState, InspectHonorData, PvpCall, RankTitle,
+};
 pub use quest::{QuestCall, QuestItemView, QuestPanel, QuestRewardSpell, QuestSelect, QuestState};
 pub use quest_log::{
     QuestLogCarry, QuestObjectiveView, QuestRecordView, QuestSlotView, QUEST_LOG_SLOTS,
@@ -353,7 +361,7 @@ pub(crate) use region::{
     load_blend_mode, load_texture_file, load_texture_name, load_xml_font_file,
     texture_name_verdict, FileLoad,
 };
-pub use reputation::{FactionEntry, ReputationCall, ReputationState};
+pub use reputation::{FactionEntry, ReputationCall, ReputationListOp, ReputationState};
 pub use session::SessionRequest;
 pub use shapeshift::ShapeshiftFormView;
 pub(crate) use simplehtml::{
@@ -368,18 +376,23 @@ pub use spellbook::{
     SpellTabView,
 };
 pub use stable::{StableCall, StableIntent, StablePetSlot, StableState, NUM_STABLE_SLOTS};
-pub use summon::SummonConfirmUiState;
-pub use talent::{TalentCall, TalentPrereqView, TalentTabView, TalentUiState, TalentView};
+pub use summon::{SummonCall, SummonConfirmUiState};
+pub use talent::{
+    TalentCall, TalentPrereqView, TalentReq, TalentTabView, TalentUiState, TalentView,
+};
 pub use taxi::{TaxiCall, TaxiNodeType, TaxiUiNode, TaxiUiState};
 pub use tooltip_aura::{AuraKey, AuraTooltipView};
 pub use tooltip_spell::{ReputationRequirement, SpellTooltipView};
 pub use tooltip_text::{KeyedArg, TextPart, TooltipText};
 pub use trade::{TradeCall, TradeOpenItem, TradeSideState, TradeSlotItem, TradeState, TRADE_SLOTS};
-pub use tradeskill::{TradeSkillDifficulty, TradeSkillReagent, TradeSkillRecipe, TradeSkillState};
+pub use tradeskill::{
+    TradeSkillCall, TradeSkillDifficulty, TradeSkillReagent, TradeSkillRecipe, TradeSkillState,
+};
 pub use trainer::{
     TrainerAbilityReq, TrainerCall, TrainerGroup, TrainerService, TrainerServiceCategory,
     TrainerSkillReq, TrainerState, TrainerTooltip, TRAINER_GROUP_KNOWN,
 };
+pub use tutorial::TutorialCall;
 pub(crate) use types::{monochrome_flag, FontMask, MeasuredText, RegionData};
 pub use types::{
     BlendMode, EditAction, EditBoxAdvanceRequest, EditBoxTextUi, EditOutcome, EditUnit,
@@ -399,7 +412,7 @@ pub use worldmap::{
 };
 pub use worldstate::WorldStateUiView;
 pub use worn_display::WornDisplay;
-pub use zone_text::ZoneTexts;
+pub use zone_text::{ZonePvp, ZoneTexts};
 
 use mlua::Lua;
 

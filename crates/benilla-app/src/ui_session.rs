@@ -16,14 +16,15 @@ use benilla_world::schedule::WorldStage;
 
 mod latch;
 #[cfg(test)]
-mod latch_tests;
+pub(crate) mod latch_tests;
 mod release;
 #[cfg(test)]
 mod release_tests;
 
 pub(crate) use latch::{
-    dispatch, fire, note_closed, queue, register, release, with_script, CoreCloses, InteractLatch,
-    LatchApp, LatchVocal, LatchedWindow, NpcWindow,
+    dispatch, fire, note_closed, queue, register, release, release_cell, release_latch,
+    with_script, CoreCloses, InteractLatch, LatchApp, LatchCloses, LatchSteps, LatchVocal,
+    LatchedWindow, NpcWindow,
 };
 pub(crate) use release::form_bars_interaction;
 
@@ -35,6 +36,7 @@ impl Plugin for UiSessionPlugin {
     fn build(&self, app: &mut App) {
         app.configure_sets(Update, NpcWindowFeed.after(crate::ui_unit::UnitFeed));
         app.init_resource::<InteractLatch>()
+            .init_resource::<LatchCloses>()
             .add_message::<LatchVocal>()
             .init_resource::<InteractNpc>()
             .net_handler(
@@ -49,7 +51,8 @@ impl Plugin for UiSessionPlugin {
                 (
                     // Before the feeds, so a walk-away's `*_CLOSED` lands the frame it happens.
                     latch::watch_interaction_range.before(crate::ui_script::UiFeed),
-                    // The unit events that release the latch, off the apply pass's field edges.
+                    // The form change and the service flags that release the latch, off the
+                    // apply pass's field edges; a death's are its handler's (`crate::target`).
                     release::release_on_field_edges
                         .in_set(WorldStage::Net)
                         .after(crate::net::apply_net_updates)

@@ -3,10 +3,10 @@
 //! handler whole (`0x537aa0`, `0x537ae5`), and a handler's events fire inside it, every listener
 //! before the signal returns (`0x703e50`, `0x703f50`). Here a handler queues what it raises on a
 //! lane, a producer's queue that stamps each item from one clock as it is pushed ([`stamp`]).
-//! Once every feed has pushed what the events' listeners read, as the reference writes a whole
-//! update block before its notify pass (`0x465277`), [`fire_in_order`] fires the lowest stamp
-//! across the lanes, so the events come out in the order their handlers raised them, whichever
-//! lane holds them.
+//! Once every feed has pushed what the events' listeners read, as the update handler writes every
+//! block of its packet before its notify pass (`0x465277`), [`fire_in_order`] fires the lowest
+//! stamp across the lanes, so the events come out in the order their handlers raised them,
+//! whichever lane holds them.
 //!
 //! An item pushed while another fires is stamped under it ([`firing`]) and fires straight after
 //! it, ahead of everything stamped before it, as a signal raised inside a listener runs to its
@@ -125,11 +125,14 @@ pub(crate) fn firing<R>(at: Stamp, f: impl FnOnce() -> R) -> (R, bool) {
     (r, CLOCK.load(Ordering::Relaxed) != before)
 }
 
-/// What a lane's firing may fire: the stamps below `bound`, the lowest of the other lanes' heads,
-/// among those whose outermost push came before the drain began.
+/// What a lane's firing may fire, among the stamps whose outermost push came before the drain
+/// began: those below `before`, the lowest head of the lanes registered ahead of it, and up to
+/// `through`, the lowest head of the lanes after it. Equal heads fire in lane order, so a tie
+/// never stalls the drain.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Until {
-    bound: Option<Stamp>,
+    before: Option<Stamp>,
+    through: Option<Stamp>,
     fence: u64,
 }
 
@@ -138,13 +141,16 @@ impl Until {
     #[cfg(test)]
     pub(crate) fn all() -> Self {
         Self {
-            bound: None,
+            before: None,
+            through: None,
             fence: CLOCK.load(Ordering::Relaxed),
         }
     }
 
     pub(crate) fn admits(&self, stamp: Stamp) -> bool {
-        stamp.first() < self.fence && self.bound.is_none_or(|b| stamp < b)
+        stamp.first() < self.fence
+            && self.before.is_none_or(|b| stamp < b)
+            && self.through.is_none_or(|b| stamp <= b)
     }
 }
 
@@ -174,6 +180,11 @@ impl Lanes {
     }
 }
 
+/// What runs once after each drain, however it ended: a lane's firing that stopped early leaves
+/// state no read outside the drain may see.
+#[derive(Resource, Default)]
+struct DrainEnds(Vec<fn(&mut World)>);
+
 /// The drain's place: after every feed in [`crate::ui_script::UiFeed`] has pushed, and before
 /// the tick ([`crate::ui_script::UiInput`]).
 #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -190,6 +201,9 @@ pub(crate) trait LaneApp {
         fire: impl IntoSystem<In<Until>, (), M> + 'static,
         begin: Option<fn(&World)>,
     ) -> &mut Self;
+
+    /// Run `end` once after each drain, whether it fired every item or stopped.
+    fn add_drain_end(&mut self, end: fn(&mut World)) -> &mut Self;
 }
 
 impl LaneApp for App {
@@ -242,6 +256,12 @@ impl LaneApp for App {
         });
         self
     }
+
+    fn add_drain_end(&mut self, end: fn(&mut World)) -> &mut Self {
+        self.init_resource::<DrainEnds>();
+        self.world_mut().resource_mut::<DrainEnds>().0.push(end);
+        self
+    }
 }
 
 /// Fire every lane's items in stamp order: each lane's `begin`, then, while any lane's head was
@@ -270,14 +290,23 @@ pub(crate) fn fire_in_order(world: &mut World) {
         else {
             break;
         };
-        let bound = heads
-            .iter()
-            .enumerate()
-            .filter(|(j, _)| *j != i)
-            .filter_map(|(_, h)| *h)
-            .min();
+        // A head at the origin is a view's frame-start push, which raises nothing and commutes
+        // with another view's: it bounds no other lane. The pick is the first lane holding the
+        // lowest head, so a later lane's equal head bounds it inclusively.
+        let lowest = |lanes: &[Option<Stamp>]| {
+            lanes
+                .iter()
+                .filter_map(|h| *h)
+                .filter(|h| *h != Stamp::origin())
+                .min()
+        };
+        let until = Until {
+            before: lowest(&heads[..i]),
+            through: lowest(&heads[i + 1..]),
+            fence,
+        };
         let lane = &lanes.0[i];
-        if let Err(e) = world.run_system_with(lane.fire, Until { bound, fence }) {
+        if let Err(e) = world.run_system_with(lane.fire, until) {
             error!("lanes: `{}` did not fire: {e}", lane.name);
             break;
         }
@@ -287,16 +316,29 @@ pub(crate) fn fire_in_order(world: &mut World) {
         }
     }
     world.insert_resource(lanes);
+    let ends = world
+        .get_resource::<DrainEnds>()
+        .map(|e| e.0.clone())
+        .unwrap_or_default();
+    for end in ends {
+        end(world);
+    }
 }
 
 #[cfg(test)]
+mod aura_view_tests;
+#[cfg(test)]
 mod bag_tests;
+#[cfg(test)]
+mod group_view_tests;
 #[cfg(test)]
 mod guard_tests;
 #[cfg(test)]
 mod item_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod unit_view_tests;
 
 #[cfg(test)]
 mod unit_tests {
@@ -383,6 +425,21 @@ mod unit_tests {
         push::<0>(w, "d");
         push::<1>(w, "e");
         assert_eq!(drain(&mut app), ["a", "b", "c", "d", "e"]);
+    }
+
+    /// Two lanes holding one stamp fire in lane order, the first lane's item then the second's,
+    /// and the drain goes on to the next stamp: a tie never stalls it.
+    #[test]
+    fn equal_heads_fire_in_lane_order_and_the_drain_goes_on() {
+        let mut app = app(&[]);
+        let w = app.world_mut();
+        let tie = stamp();
+        w.resource_mut::<Toy<0>>().0.push((tie, "a"));
+        w.resource_mut::<Toy<1>>().0.push((tie, "b"));
+        push::<1>(w, "c");
+        push::<0>(w, "d");
+        assert_eq!(drain(&mut app), ["a", "b", "c", "d"]);
+        assert_eq!(drain(&mut app), Vec::<&str>::new(), "nothing left behind");
     }
 
     /// A signal raised inside a listener runs to its end before the outer signal returns

@@ -251,6 +251,15 @@ pub(crate) fn current_speed(s: &MoveSpeeds, flags: u32) -> f32 {
 pub(crate) struct ObjectStore(pub(crate) ObjectFields);
 
 impl ObjectStore {
+    /// `UNIT_FIELD_BYTES_0`'s race and class bytes (`+0x78`, `+0x79`), 0 while unstreamed: what
+    /// `FindSkillLineAbility` (`0x6de040`) indexes a unit's spells by.
+    pub(crate) fn race_class(&self) -> (u8, u8) {
+        (
+            self.0.unit_race().unwrap_or(0),
+            self.0.unit_class().unwrap_or(0),
+        )
+    }
+
     /// The object manager's unit lookup (`0x468460`, `ecx = 8`): a unit or a player, which share
     /// the unit block; a game object, corpse or item is not one.
     pub(crate) fn is_unit(&self) -> bool {
@@ -436,6 +445,14 @@ pub(crate) struct ActiveMover;
 /// The inbound event channel, drained each frame by [`apply_net_updates`].
 #[derive(Resource)]
 pub(crate) struct NetEvents(Receiver<SessionEvent>);
+
+impl NetEvents {
+    /// The inbound channel as `rx` brings it, for a test that feeds the drain.
+    #[cfg(test)]
+    pub(crate) fn for_test(rx: Receiver<SessionEvent>) -> Self {
+        Self(rx)
+    }
+}
 
 /// The outbound command channel.
 #[derive(Resource, Debug)]
@@ -791,11 +808,17 @@ pub(crate) enum MoveKind {
     FallLand,
     StartSwim,
     StopSwim,
+    /// The pitch keys' sends, the drain's tags 0xb, 0xc and 0xd (`0x61a240`, `0x61a2e0`).
+    StartPitchUp,
+    StartPitchDown,
+    StopPitch,
     /// The walk/run toggle: sent from the toggle handler (`ToggleRun 0x513d50` to `0x617de0`),
     /// not the move broadcaster, so it goes out standing still (`0x61a99d` gates the latter).
     SetWalkMode,
     SetRunMode,
     SetFacing,
+    /// The mouse-look pitch set, tag 0x11 drained through `0x615bc0`.
+    SetPitch,
     Heartbeat,
 }
 
@@ -816,9 +839,13 @@ impl MoveKind {
             MoveKind::FallLand => op::MSG_MOVE_FALL_LAND,
             MoveKind::StartSwim => op::MSG_MOVE_START_SWIM,
             MoveKind::StopSwim => op::MSG_MOVE_STOP_SWIM,
+            MoveKind::StartPitchUp => op::MSG_MOVE_START_PITCH_UP,
+            MoveKind::StartPitchDown => op::MSG_MOVE_START_PITCH_DOWN,
+            MoveKind::StopPitch => op::MSG_MOVE_STOP_PITCH,
             MoveKind::SetWalkMode => op::MSG_MOVE_SET_WALK_MODE,
             MoveKind::SetRunMode => op::MSG_MOVE_SET_RUN_MODE,
             MoveKind::SetFacing => op::MSG_MOVE_SET_FACING,
+            MoveKind::SetPitch => op::MSG_MOVE_SET_PITCH,
             MoveKind::Heartbeat => op::MSG_MOVE_HEARTBEAT,
         }
     }
@@ -1165,6 +1192,8 @@ pub(crate) enum ClientCommand {
         spell_id: u32,
         enabled: bool,
     },
+    /// `CMSG_REQUEST_PET_INFO`: the world entry's ask for the pet bar it cleared (`0x4bc738`).
+    RequestPetInfo,
     /// `CMSG_PET_ABANDON`: the menu's Abandon only. Dismiss (`PetDismiss 0x4be4d0`) is a
     /// [`Self::PetAction`] with word `0x07000003`. Answered by a zero-guid `SMSG_PET_SPELLS`.
     PetAbandon {

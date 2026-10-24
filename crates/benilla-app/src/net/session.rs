@@ -11,6 +11,7 @@ use crate::names::NameCache;
 use crate::ui_quest::QuestGiver;
 
 use benilla_protocol::{SessionEvent, SessionEventKind};
+use benilla_ui::script::ReputationListOp;
 use bevy::ecs::system::SystemParam;
 
 use super::{clock_tick, ServerTime};
@@ -205,8 +206,14 @@ fn on_connected(In(ev): In<SessionEvent>, mut e: Edges, mut b: Bridge) {
     }
 }
 
-fn on_logged_out(In(ev): In<SessionEvent>, mut e: Edges, mut b: Bridge) {
+fn on_logged_out(
+    In(ev): In<SessionEvent>,
+    mut e: Edges,
+    mut b: Bridge,
+    view_log: Option<ResMut<crate::ui_unit::views::ViewLog>>,
+) {
     if let SessionEvent::LoggedOut = ev {
+        log_teardown(view_log, &b);
         logged_out(
             &mut b.commands,
             &mut b.index,
@@ -229,8 +236,10 @@ fn on_disconnected(
     mut e: Edges,
     mut b: Bridge,
     mut released: ResMut<super::objects::Released>,
+    view_log: Option<ResMut<crate::ui_unit::views::ViewLog>>,
 ) {
     if let SessionEvent::Disconnected { reason, end } = ev {
+        log_teardown(view_log, &b);
         // The same teardown as `on_logged_out`'s.
         b.reputations.tear_down();
         // Leaving the world frees the released objects with the live ones (`0x467700`).
@@ -248,6 +257,14 @@ fn on_disconnected(
             &mut e.transfer,
             &mut e.disconnects,
         );
+    }
+}
+
+/// The world left at once: the stores the teardown takes, logged for the views a listener reads
+/// ([`crate::ui_unit::views::ViewLog::torn_down`]).
+fn log_teardown(view_log: Option<ResMut<crate::ui_unit::views::ViewLog>>, b: &Bridge) {
+    if let Some(mut log) = view_log {
+        log.torn_down(&b.index, |e| b.stores.get(e).ok());
     }
 }
 
@@ -288,6 +305,7 @@ fn on_worldport(
     mut group: ResMut<crate::ui_party::GroupState>,
     script: Option<NonSend<benilla_ui::script::UiScript>>,
     mut released: ResMut<super::objects::Released>,
+    view_log: Option<ResMut<crate::ui_unit::views::ViewLog>>,
 ) {
     if let SessionEvent::Worldport {
         map_id,
@@ -296,7 +314,9 @@ fn on_worldport(
         needs_ack,
     } = ev
     {
-        // Every streamed roster member is about to be purged; the reference deactivates each.
+        // Every streamed roster member is about to be freed, and each one's destructor runs the
+        // roster hook (`0x5dd6a0` → `0x4e85d0` mode 0).
+        let before = view_log.as_ref().map(|_| group.stats.clone());
         crate::ui_party::net::roster_deactivated(
             &mut group,
             &b.index,
@@ -305,6 +325,11 @@ fn on_worldport(
             script.as_deref(),
             &b.net,
         );
+        let mut view_log = view_log;
+        if let (Some(log), Some(before)) = (view_log.as_deref_mut(), before) {
+            log.records(&before, &group.stats);
+        }
+        log_teardown(view_log, &b);
         worldport(
             map_id,
             position,
@@ -399,9 +424,13 @@ fn on_reputations(
     match ev {
         SessionEvent::Reputations { standings } => {
             reputations(standings, &mut b.reputations);
-            // The rebuild's sort signals with the player held (`0x4d5694` → `0x4d55de`), then the
-            // message's own (`0x4d5699`).
-            signal(1 + usize::from(self_facts(&b).is_some()), &mut lane);
+            // With the player held, the rebuild (`0x4d5694`), whose two sorts signal
+            // (`0x4d55d9` → `0x4d6457`, and `0x4d55de`), then the message's own (`0x4d5699`).
+            let held = self_facts(&b).is_some();
+            if held {
+                b.reputations.list_ops.push(ReputationListOp::Rebuild);
+            }
+            signal(1 + 2 * usize::from(held), &mut lane);
         }
         SessionEvent::ForcedReactions { reactions } => {
             forced_reactions(reactions, &mut b.reputations);
@@ -421,8 +450,14 @@ fn on_reputations(
                 );
                 crate::ui_reputation::queue_standing_lines(line, f.catalog(), me.female, &chat);
             }
-            // A slot newly visible is sorted, which signals (`0x4d574a` → `0x4d5dab`).
+            // A slot newly visible is added and sorted, which signals (`0x4d5738`, `0x4d574a` →
+            // `0x4d5dab`).
             let listed = reputation_visible(list_id, &mut b.reputations);
+            if listed {
+                b.reputations
+                    .list_ops
+                    .push(ReputationListOp::Visible(list_id));
+            }
             signal(usize::from(listed), &mut lane);
         }
         SessionEvent::ReputationAtWar { list_id, flags } => {
@@ -490,6 +525,10 @@ fn on_reputation_delta(
             .zip(self_facts(&b))
             .map(|(f, me)| (f.catalog(), me.race, me.class));
         let latches = reputation_delta(standings, &mut b.reputations, ranks, &mut quest);
+        b.reputations.list_ops.push(ReputationListOp::Standing {
+            listed: latches.listed.clone(),
+            flags_moved: latches.flags_moved,
+        });
         // A flag byte that moved re-sorts, which signals (`0x4d58c8` → `0x4d5dab`).
         if latches.flags_moved {
             if let Some(lane) = lane.as_deref_mut() {
@@ -868,6 +907,8 @@ fn reputation_delta(
         let mut flags = reputations.flags(i);
         if flags & (flag::VISIBLE | flag::HIDDEN) == 0 {
             flags |= flag::VISIBLE;
+            // The adder, which lists the slot (`0x4d5826`).
+            latches.listed.push(list_id);
         }
         if let (Some(old), Some(new)) = (old, rank(reputations, i)) {
             latches.rank_moved |= new != old;
@@ -890,6 +931,8 @@ fn reputation_delta(
 struct DeltaLatches {
     /// A slot's flag byte moved (`0x4d585d`-`0x4d5876`): the list re-sorts.
     flags_moved: bool,
+    /// The slots the entries made visible, in their order, each handed to the adder (`0x4d5826`).
+    listed: Vec<u32>,
     /// A slot's rank moved, `HIDDEN` or not (`0x4d5880`, `0x4d58a9`, `0x4d58ac`): the quest log and
     /// the reaction refresh read it.
     rank_moved: bool,

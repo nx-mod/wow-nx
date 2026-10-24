@@ -129,7 +129,6 @@ impl Plugin for CombatLogPlugin {
             .net_handler(K::EnvironmentalDamageLog, on_environmental_damage_log)
             .net_handler(K::XpGain, on_xp_gain)
             .net_handler(K::ExplorationXp, on_exploration_xp)
-            .net_handler(K::LevelUp, on_level_up)
             .net_handler(K::PvpCredit, on_pvp_credit)
             // Written by the missile flight; declared here too, as registering is idempotent.
             .add_message::<MissileMiss>()
@@ -446,12 +445,6 @@ fn on_exploration_xp(
     }
 }
 
-fn on_level_up(In(ev): In<SessionEvent>, l: Sinks) {
-    if let SessionEvent::LevelUp(lv) = ev {
-        text::level_up(lv, &l.log);
-    }
-}
-
 /// An honor credit (`0x625270`): the combat-log line, which raises the `HONOR_GAINED` word once
 /// written. The packet's handler writes nothing unless the client holds the active player
 /// (`0x48f703`, type mask `0x10`; `0x48f708`). A kill needs its victim held as a unit (`0x62529f`,
@@ -663,6 +656,8 @@ mod tests {
             }],
             target: Some(ME),
             go_target: None,
+            target_mask: 0x2,
+            source: None,
             dest: None,
             ammo_display_id: None,
             item_caster: None,
@@ -704,6 +699,8 @@ mod tests {
             }],
             target: Some(ME),
             go_target: None,
+            target_mask: 0x2,
+            source: None,
             dest: None,
             ammo_display_id: None,
             item_caster: (item || (second != 0 && first != second)).then_some(first),

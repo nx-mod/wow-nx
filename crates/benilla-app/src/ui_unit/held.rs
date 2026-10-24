@@ -79,6 +79,16 @@ impl HeldUnits<'_> {
         self.state_named(store, guid, name)
     }
 
+    /// The snapshot of the unit a `target` chain ends on, by guid, whose descriptor is `store`:
+    /// a held unit's, a no-object entry for a guid the object manager does not hold, nothing for
+    /// one held as anything but a unit.
+    pub(super) fn chain_end(&self, guid: u64, store: Option<&ObjectStore>) -> Option<UnitState> {
+        match store {
+            Some(store) => store.is_unit().then(|| self.state(store, guid)),
+            None => Some(unheld_state(self.names, self.group, guid, self.unit_names)),
+        }
+    }
+
     /// [`Self::state`] under a name the caller looked up, which sends no name query.
     fn state_named(&self, store: &ObjectStore, guid: u64, name: Option<String>) -> UnitState {
         let unit = RelUnit::of(guid, store).with_record(store, self.names);
@@ -198,12 +208,11 @@ pub(super) fn feed_chain_units(
         let built: HashMap<u64, UnitState> = ends
             .iter()
             .filter_map(|&guid| {
-                let Some(&entity) = index.as_ref().and_then(|i| i.0.get(&guid)) else {
-                    let tables = tables.unit_names();
-                    return Some((guid, unheld_state(&names, &group, guid, tables)));
+                let store = match index.as_ref().and_then(|i| i.0.get(&guid)) {
+                    Some(&entity) => Some(stores.get(entity).ok()?),
+                    None => None,
                 };
-                let store = stores.get(entity).ok().filter(|s| s.is_unit())?;
-                Some((guid, held.state(store, guid)))
+                Some((guid, held.chain_end(guid, store)?))
             })
             .collect();
 
@@ -542,7 +551,13 @@ mod tests {
                 );
             }
         }
-        let me = spawn(&mut app, ME, player(MOB, 900));
+        let mut mine = player(MOB, 900);
+        // `UNIT_FIELD_SUMMON`, the pet `"pet"` names (`0x515a6e`).
+        mine.0.merge(ObjectFields::from_pairs(&[
+            (8, MY_PET as u32),
+            (9, (MY_PET >> 32) as u32),
+        ]));
+        let me = spawn(&mut app, ME, mine);
         app.world_mut().entity_mut(me).insert(SelfPlayer);
         spawn(&mut app, A, player(BOSS, 800));
         spawn(&mut app, B, player(ADD, 700));
@@ -567,9 +582,7 @@ mod tests {
             guid: Some(MOB),
             ..Default::default()
         });
-        let mut bar = crate::ui_pet::PetBar::default();
-        bar.spells.pet_guid = MY_PET;
-        app.insert_resource(bar);
+        app.init_resource::<crate::ui_pet::PetBar>();
         app
     }
 

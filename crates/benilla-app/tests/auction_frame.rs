@@ -432,7 +432,9 @@ fn the_show_cascade_notifies_the_bids_pane_once_and_keeps_its_page() {
 
     // Reopen: the tab click left the pane's shown flag clear, so it is skipped and keeps its page.
     s.run("HideUIPanel(AuctionFrame)").unwrap();
-    let _ = s.take_auction_close();
+    let _ = s.take_calls_like(&benilla_ui::script::ScriptCall::Auction(
+        benilla_ui::script::AuctionCall::Close,
+    ));
     s.fire_event("AUCTION_HOUSE_SHOW", vec![]);
     assert_eq!(
         order(&s),
@@ -716,7 +718,7 @@ fn search_reads_the_filters_and_nothing_queries_before_it() {
         Some(4),
         "Armor is item class 4, not menu row 1"
     );
-    assert!(query.usable_only);
+    assert_eq!(query.usable, 1, "the check button's 1");
     assert_eq!(query.list_from, 0);
     assert!(s.errors().is_empty(), "clean search: {:?}", s.errors());
 }
@@ -887,12 +889,16 @@ fn hiding_the_window_closes_the_session() {
     seat_player(&mut s, 0);
     s.set_auction(state(vec![]));
     s.fire_event("AUCTION_HOUSE_SHOW", vec![]);
-    let _ = s.take_auction_close();
+    let _ = s.take_calls_like(&benilla_ui::script::ScriptCall::Auction(
+        benilla_ui::script::AuctionCall::Close,
+    ));
 
     s.run("HideUIPanel(AuctionFrame)").unwrap();
     assert!(!s.eval::<bool>("return AuctionFrame:IsShown()").unwrap());
     assert!(
-        s.take_auction_close(),
+        s.take_calls_like(&benilla_ui::script::ScriptCall::Auction(
+            benilla_ui::script::AuctionCall::Close
+        )) > 0,
         "OnHide queues CloseAuctionHouse (the session is client-side only)"
     );
     assert!(s.errors().is_empty());

@@ -106,7 +106,6 @@ impl ScriptSelect<'_, '_> {
         mode: benilla_ui::script::NearestMode,
         reverse: bool,
     ) -> SelectDebt {
-        let engaged = self.commit.engaged();
         let now = self.time.elapsed_secs_f64();
         let (scan, history) = (&self.scan, &mut self.history);
         self.commit.owing(|commit| {
@@ -119,7 +118,6 @@ impl ScriptSelect<'_, '_> {
                 &mut commit.selection,
                 &mut commit.seam,
                 &mut commit.front,
-                engaged,
             );
             commit.owe_all(owed);
         })
@@ -146,9 +144,22 @@ impl ScriptSelect<'_, '_> {
         self.commit.pay_send(send);
     }
 
-    /// Pay what a selecting call still owes, now that its signals' listeners have run.
-    pub(crate) fn pay(&mut self, debt: SelectDebt) {
-        self.commit.pay(debt);
+    /// Pay what a selecting call still owes, now that its signals' listeners have run, up to a
+    /// payment that selected again ([`SelectCommit::pay`]): what that one owes.
+    pub(crate) fn pay(&mut self, debt: SelectDebt) -> SelectDebt {
+        self.commit.pay(debt)
+    }
+
+    /// Pay all of `debt` now ([`SelectCommit::pay_now`]).
+    #[cfg(test)]
+    pub(crate) fn pay_now(&mut self, debt: SelectDebt) {
+        self.commit.pay_now(debt);
+    }
+
+    /// StartAttack (`0x5ecb70`) at `guid` from an engine writer, its own select (`0x5eccaa`)
+    /// owing the swing past its signals ([`SelectCommit::start_attack`]).
+    pub(crate) fn start_attack(&mut self, guid: u64) -> SelectDebt {
+        self.commit.owing(|commit| commit.start_attack(guid))
     }
 
     /// `ClearTarget()` (`0x489ff0`): deselect whatever the calls before it left selected.
@@ -247,7 +258,7 @@ mod tests {
                     |mut script: NonSendMut<UiScript>, mut select: ScriptSelect| {
                         for request in script.take_selection_requests() {
                             let debt = select.select(request);
-                            select.pay(debt);
+                            select.pay_now(debt);
                         }
                     },
                 )
@@ -366,7 +377,7 @@ mod tests {
                     |mut script: NonSendMut<UiScript>, mut select: ScriptSelect| {
                         for request in script.take_selection_requests() {
                             let debt = select.select(request);
-                            select.pay(debt);
+                            select.pay_now(debt);
                         }
                     },
                 )
@@ -454,9 +465,6 @@ mod tests {
                 None,
                 Some(ME),
             );
-        let mut bar = crate::ui_pet::PetBar::default();
-        bar.spells.pet_guid = PET;
-        world.insert_resource(bar);
 
         let run = |world: &mut World, lua: &str| {
             world
@@ -468,7 +476,7 @@ mod tests {
                     |mut script: NonSendMut<UiScript>, mut select: ScriptSelect| {
                         for request in script.take_selection_requests() {
                             let debt = select.select(request);
-                            select.pay(debt);
+                            select.pay_now(debt);
                         }
                     },
                 )
@@ -581,7 +589,7 @@ mod tests {
                     |mut script: NonSendMut<UiScript>, mut select: ScriptSelect| {
                         for request in script.take_selection_requests() {
                             let debt = select.select(request);
-                            select.pay(debt);
+                            select.pay_now(debt);
                         }
                     },
                 )
@@ -652,7 +660,7 @@ mod tests {
                 |mut script: NonSendMut<UiScript>, mut select: ScriptSelect| {
                     for request in script.take_selection_requests() {
                         let debt = select.select(request);
-                        select.pay(debt);
+                        select.pay_now(debt);
                     }
                 },
             )

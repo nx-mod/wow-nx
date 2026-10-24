@@ -90,6 +90,7 @@ pub struct MailInboxRow {
 pub struct MailInvoice {
     /// `"seller"` (your auction sold) or `"buyer"` (you won), literal tokens, not global strings.
     pub seller: bool,
+    /// The item's name with its suffix, "" while the item cache lacks it (`0x5d8b25`).
     pub item_name: String,
     /// The counterparty: who bought it (seller invoice) or who sold it (buyer invoice).
     pub player_name: String,
@@ -185,6 +186,8 @@ pub enum MailCall {
     },
     /// `SendMail` past its guards: `CMSG_SEND_MAIL` (`0x4aea6c`).
     Send(MailSendRequest),
+    /// `CloseMail()` (`0x4aded0`): the close core's ordinary arm, `0x4acd50` with `cl = 0`.
+    Close,
 }
 
 /// `0x4acdc0`'s clears: the attachment, whose lock it lifts (`0x495420`, firing an argless
@@ -277,11 +280,6 @@ impl super::UiScript {
     /// there is no change for the scripts.
     pub fn holds_mail(&self, state: &Option<MailState>) -> bool {
         self.model_ref().mail == *state
-    }
-
-    /// Take the `CloseMail` flag; 1.12 has no close opcode, so the app only ends its mail session.
-    pub fn take_mail_close(&mut self) -> bool {
-        std::mem::take(&mut self.model_mut().mail_close)
     }
 
     /// The reference's compose-tab reset (`0x4acdc0(1)`), run on mailbox open and a sent mail:
@@ -754,10 +752,11 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                         return Ok(());
                     };
                     if let Err(refusal) = verb.sends(&model, &row) {
-                        if let Some(key) = refusal {
-                            model.push_ui_error(key);
-                        }
-                        return Ok(());
+                        drop(model);
+                        return match refusal {
+                            Some(key) => super::calls::display_error(lua, key),
+                            None => Ok(()),
+                        };
                     }
                     model.mail_busy = true;
                     MailCall::Row {
@@ -771,18 +770,11 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         )?;
     }
 
+    // CloseMail() (`0x4aded0`): the close core's ordinary arm, `0x4acd50` with `cl = 0`, inside
+    // the call; 1.12 has no close opcode.
     g.set(
         "CloseMail",
-        lua.create_function(|lua, ()| {
-            let mut model = lua.app_data_mut::<Model>().expect("model app_data");
-            model.mail_close = true;
-            // The close core zeroes the mailbox inside the verb (`0x4aded0` → `0x4acd8f`), so a
-            // mail verb later in the same chunk finds none.
-            if let Some(mail) = model.mail.as_mut() {
-                mail.open = false;
-            }
-            Ok(())
-        })?,
+        lua.create_function(|lua, ()| submit(lua, MailCall::Close))?,
     )?;
 
     g.set(
@@ -810,17 +802,12 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                 {
                     return None;
                 }
-                // An attached item whose object is gone (`0x4ae92e` resolves its guid):
-                // `ERR_ITEM_NOT_FOUND` (equip error 0x17, `0x4ae957`), the attachment dropped and
-                // `MAIL_SEND_INFO_UPDATE` (`0x4ae98d`), no packet. Checked before the money
-                // (`0x4ae917` ahead of `0x4ae99e`). The attachment is locked, so it cannot have
-                // moved.
+                // An attached item whose object is gone (`0x4ae92e` resolves its guid) ends the
+                // send below. Checked before the money (`0x4ae917` ahead of `0x4ae99e`). The
+                // attachment is locked, so it cannot have moved.
                 if let Some(item) = model.mail_send_item.as_ref() {
                     if !holds(model, item) {
-                        model.push_ui_error("ERR_ITEM_NOT_FOUND");
-                        model.mail_send_item = None;
-                        model.raise("MAIL_SEND_INFO_UPDATE", Vec::new());
-                        return None;
+                        return Some(Err(()));
                     }
                 }
                 // Money with COD, or COD with no item (`0x4ae99e`-`0x4ae9b8`).
@@ -834,7 +821,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                 // `0x4aea7b`).
                 model.mail_send_pending = true;
                 model.mail_busy = true;
-                Some(MailSendRequest {
+                Some(Ok(MailSendRequest {
                     target,
                     subject,
                     body,
@@ -843,10 +830,21 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                     cod: model.mail_send_cod,
                     item_guid: model.mail_send_item.as_ref().map_or(0, |it| it.guid),
                     package: model.mail_package,
-                })
+                }))
             });
             match send {
-                Some(req) => submit(lua, MailCall::Send(req)),
+                Some(Ok(req)) => submit(lua, MailCall::Send(req)),
+                // The attachment gone: `ERR_ITEM_NOT_FOUND` (equip error 0x17) shown inside the
+                // verb (`0x4ae957` → `0x496720`), then the attachment dropped and
+                // `MAIL_SEND_INFO_UPDATE` (`0x4ae96f`-`0x4ae98d`), no packet.
+                Some(Err(())) => {
+                    super::calls::display_error(lua, "ERR_ITEM_NOT_FOUND")?;
+                    super::tick::verb(lua, |model| {
+                        model.mail_send_item = None;
+                        model.raise("MAIL_SEND_INFO_UPDATE", Vec::new());
+                    });
+                    Ok(())
+                }
                 None => Ok(()),
             }
         })?,
@@ -863,11 +861,12 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                 copper,
                 "Usage: SetSendMailMoney(amount)",
             )? as u32;
+            let money = lua.app_data_ref::<Model>().expect("model app_data").money;
+            if u64::from(n) > money {
+                super::calls::display_error(lua, "ERR_NOT_ENOUGH_MONEY")?;
+                return Ok(Value::Nil);
+            }
             Ok(super::tick::verb(lua, |model| {
-                if u64::from(n) > model.money {
-                    model.push_ui_error("ERR_NOT_ENOUGH_MONEY");
-                    return Value::Nil;
-                }
                 // The write (`0x4adc39`), then the signal (`0x4adc44`).
                 model.mail_send_money = n;
                 model.raise("SEND_MAIL_MONEY_CHANGED", Vec::new());
@@ -980,10 +979,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
 
     g.set(
         "ClickSendMailItemButton",
-        lua.create_function(|lua, ()| {
-            click_send_mail_item(lua);
-            Ok(())
-        })?,
+        lua.create_function(|lua, ()| click_send_mail_item(lua))?,
     )?;
 
     // ── The stationery family ──
@@ -1148,7 +1144,7 @@ fn submit(lua: &Lua, call: MailCall) -> mlua::Result<()> {
 fn attach_refusal(model: &Model, item: &cursor::CursorItem) -> Option<&'static str> {
     let (bound, seats) = if item.bag == cursor::EQUIPMENT_BAG {
         let s = model
-            .inv_slot("player", item.slot as usize)
+            .player_slot_object(item.slot as usize)
             .filter(|s| s.guid == item.guid)?;
         (s.already_bound, s.occupied_seats)
     } else {
@@ -1183,7 +1179,7 @@ fn attach_refusal(model: &Model, item: &cursor::CursorItem) -> Option<&'static s
 fn holds(model: &Model, item: &cursor::CursorItem) -> bool {
     if item.bag == cursor::EQUIPMENT_BAG {
         model
-            .inv_slot("player", item.slot as usize)
+            .player_slot_object(item.slot as usize)
             .is_some_and(|s| s.guid == item.guid)
     } else {
         model
@@ -1199,7 +1195,7 @@ fn holds(model: &Model, item: &cursor::CursorItem) -> bool {
 /// the cursor ([`cursor::click_attach_slot`]).
 /// A held item stays in its bag slot, locked, until the send. A changed attachment signals
 /// `MAIL_SEND_INFO_UPDATE` (`0x4ae0de`), whose stock handler re-reads the item and postage.
-fn click_send_mail_item(lua: &Lua) {
+fn click_send_mail_item(lua: &Lua) -> mlua::Result<()> {
     let refusal = {
         let model = lua.app_data_ref::<Model>().expect("model app_data");
         match &model.cursor {
@@ -1208,16 +1204,14 @@ fn click_send_mail_item(lua: &Lua) {
         }
     };
     if let Some(key) = refusal {
-        lua.app_data_mut::<Model>()
-            .expect("model app_data")
-            .push_ui_error(key);
-        return;
+        return super::calls::display_error(lua, key);
     }
     if cursor::click_attach_slot(lua, |model| &mut model.mail_send_item) {
         super::tick::verb(lua, |model| {
             model.raise("MAIL_SEND_INFO_UPDATE", Vec::new());
         });
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1739,7 +1733,7 @@ mod tests {
         assert!(err.contains("Usage: TakeInboxItem(index)"), "{err}");
 
         s.run("CloseMail()").unwrap();
-        assert!(s.take_mail_close());
+        assert_eq!(s.take_mail_calls().last(), Some(&MailCall::Close));
     }
 
     /// `SendMail` (`0x4ae800`): an empty recipient or subject returns (`0x4ae875`, `0x4ae8a9`)
@@ -1829,17 +1823,6 @@ mod tests {
         s.run("SendMail('Bob', 'Hi', 'b')").unwrap();
         assert!(s.take_ui_errors().is_empty());
         assert_eq!(sends(&mut s).map(|r| r.item_guid), Some(0x716));
-    }
-
-    /// `CloseMail` zeroes the mailbox inside the verb (`0x4aded0` → `0x4acd8f`): a mail verb
-    /// later in the same chunk finds none.
-    #[test]
-    fn close_mail_closes_before_the_next_verb() {
-        let mut s = kept();
-        s.set_mail(Some(state()));
-        s.run("CloseMail() CheckInbox()").unwrap();
-        assert!(s.take_mail_close());
-        assert!(!checks(&mut s));
     }
 
     /// Each row verb refuses a row the reference does not send for, and then takes no lock:
@@ -2576,6 +2559,69 @@ mod tests {
             (Vec::new(), true),
             "nothing known refuses"
         );
+    }
+
+    /// Each mail verb's refusal shows inside its call (`0x496720`), so the chunk's next line reads
+    /// it: a row's unpayable COD (`0x4afa4c`), money beyond the purse, a bound attachment, and a
+    /// send whose attachment is gone, which shows its line before it drops the attachment and
+    /// signals (`0x4ae957` ahead of `0x4ae96f`-`0x4ae98d`).
+    #[test]
+    fn the_mail_verbs_refusals_show_inside_their_calls() {
+        use crate::script::cursor::two_item_bag;
+        use crate::script::ui_errors::shown::seen_in_call;
+        let mut s = UiScript::new().unwrap();
+        s.set_unit("player", Some(crate::script::UnitState::default()));
+        let mut cod = row(2589);
+        cod.cod = 100;
+        cod.mail_id = 1;
+        s.set_mail(Some(MailState {
+            inbox: vec![cod],
+            open: true,
+        }));
+        assert_eq!(
+            seen_in_call(&mut s, "TakeInboxItem(1)").0,
+            "ERR_NOT_ENOUGH_MONEY"
+        );
+        assert_eq!(
+            seen_in_call(&mut s, "SetSendMailMoney(9999)").0,
+            "ERR_NOT_ENOUGH_MONEY"
+        );
+        let mut bag = two_item_bag();
+        bag.slots.get_mut(&2).unwrap().already_bound = true;
+        s.set_container(0, Some(bag.clone()));
+        assert_eq!(
+            seen_in_call(
+                &mut s,
+                "PickupContainerItem(0, 2) ClickSendMailItemButton()"
+            )
+            .0,
+            "ERR_MAIL_BOUND_ITEM"
+        );
+        seen_in_call(
+            &mut s,
+            "ClearCursor() PickupContainerItem(0, 1) ClickSendMailItemButton()",
+        );
+        select_default_stationery(&mut s);
+        // A template, so `GetSendMailItem` answers the attachment (`0x4ae604`).
+        s.set_item_template(117, Default::default());
+        bag.slots.get_mut(&1).unwrap().guid += 0x1000;
+        s.set_container(0, Some(bag));
+        s.run(
+            r#"local f = CreateFrame("Frame")
+            f:RegisterEvent("UI_ERROR_MESSAGE")
+            f:SetScript("OnEvent", function() HELD = GetSendMailItem() ~= nil end)"#,
+        )
+        .unwrap();
+        assert_eq!(
+            seen_in_call(&mut s, "SendMail('Bob', 'Hi', 'b')").0,
+            "ERR_ITEM_NOT_FOUND"
+        );
+        assert!(
+            s.eval::<bool>("return HELD").unwrap(),
+            "the line's listener reads the attachment still held"
+        );
+        assert!(s.eval::<bool>("return GetSendMailItem() == nil").unwrap());
+        assert!(s.take_ui_errors().is_empty(), "nothing waits for the feed");
     }
 }
 

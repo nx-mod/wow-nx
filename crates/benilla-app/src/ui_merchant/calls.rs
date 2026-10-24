@@ -17,14 +17,27 @@ use crate::net::{ClientCommand, Guid, NetCommands, ObjectStore, SelfPlayer};
 #[derive(SystemParam)]
 pub(crate) struct MerchantSteps<'w, 's> {
     /// Absent in a world with no merchant window, which drops the calls.
-    open: Option<Res<'w, MerchantOpen>>,
+    open: Option<ResMut<'w, MerchantOpen>>,
     net: Res<'w, NetCommands>,
     self_q: Query<'w, 's, (&'static ObjectStore, &'static Guid), With<SelfPlayer>>,
     purse: RepairPurse<'w, 's>,
 }
 
 impl MerchantSteps<'_, '_> {
-    /// Apply one merchant call.
+    /// The vendor's cell `[0xbddfa0]`.
+    pub(crate) fn vendor(&self) -> Option<u64> {
+        self.open.as_deref().and_then(|o| o.vendor)
+    }
+
+    /// The close core's clear of the cell (`0x4fae0e`), and the VM's window with it.
+    pub(crate) fn clear_vendor(&mut self, script: &mut UiScript) {
+        if let Some(open) = self.open.as_deref_mut() {
+            open.clear();
+        }
+        script.set_merchant(None);
+    }
+
+    /// Apply one merchant call; the close is the host's ([`MerchantCall::Close`]).
     pub(crate) fn apply(&mut self, script: &mut UiScript, call: MerchantCall) {
         let Self {
             open,
@@ -116,8 +129,9 @@ impl MerchantSteps<'_, '_> {
                     count: 1,
                 });
             }
-            // The container's guid names the slot: the player's for the player's own array
-            // (`BAG_PLAYER_INVENTORY`), the bag's for a real bag; the count is the fixed 1.
+            // The slot's list names the container (`0x4f9f32`): the player's guid for the
+            // player's own array (`BAG_PLAYER_INVENTORY`), the bag's for an equipped or a bank
+            // bag; the count is the fixed 1.
             MerchantCall::BuyInSlot { bag, slot, entry } => {
                 let (Some(vendor), Some((store, guid))) = (open.vendor, me_pair) else {
                     return;
@@ -130,6 +144,10 @@ impl MerchantSteps<'_, '_> {
                 };
                 let bag_guid = if bag_index == BAG_PLAYER_INVENTORY {
                     Some(guid.0)
+                } else if let Some(bank_bag) =
+                    bag_index.checked_sub(crate::ui_items::BANK_BAG_SLOT_FIRST)
+                {
+                    store.0.player_bank_bag_slot(bank_bag).filter(|g| *g != 0)
                 } else {
                     store.0.player_inv_slot(bag_index).filter(|g| *g != 0)
                 };
@@ -146,6 +164,8 @@ impl MerchantSteps<'_, '_> {
                     count: 1,
                 });
             }
+            // The close core needs the latch, which the host lends beside this.
+            MerchantCall::Close => {}
         }
     }
 }

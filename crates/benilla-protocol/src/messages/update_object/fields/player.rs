@@ -243,6 +243,11 @@ impl ObjectFields {
     pub fn player_logging_out(&self) -> bool {
         self.get_u32(FIELD_PLAYER_FIELD_BYTES).unwrap_or(0) & 0x4 != 0
     }
+    /// `PLAYER_FIELD_BYTES` byte 0 bit `0x1` (vmangos `PLAYER_FIELD_BYTE_CONTROLLING_PET`): the
+    /// cast validator's tame rung refuses a no-active-pets spell with it `0x17` (`0x60a011`).
+    pub fn player_controlling_pet(&self) -> bool {
+        self.get_u32(FIELD_PLAYER_FIELD_BYTES).unwrap_or(0) & 0x1 != 0
+    }
     /// `PLAYER_QUEST_LOG_<slot+1>_*`: one quest-log slot, `quest_id == 0` when the server cleared
     /// it; the count-state and timer are written with the id (`Player.h:1094-1099`).
     pub fn player_quest_log(&self, slot: u8) -> Option<QuestLogSlot> {
@@ -546,6 +551,13 @@ impl ObjectFields {
     /// dishonorable kills (`HonorMgr.cpp:935`).
     pub fn player_lifetime_dishonorable_kills(&self) -> Option<u32> {
         self.get_u32(FIELD_PLAYER_FIELD_LIFETIME_DISHONORABLE_KILLS)
+    }
+    /// `PLAYER_FIELD_BYTES2` byte 1: the auras the player can see, bit `n - 1` for a spell whose
+    /// `RequiredAuraVision` is `n` (`0x5198b0`); vmangos sets bit 0 for Detect Amore
+    /// (`PLAYER_FIELD_BYTE2_DETECT_AMORE`, `Player.h:388`). 0 when the field is absent.
+    pub fn player_aura_vision(&self) -> u8 {
+        self.get_u32(FIELD_PLAYER_FIELD_BYTES2)
+            .map_or(0, |b| (b >> 8) as u8)
     }
     /// `PLAYER_FIELD_BYTES2` byte 0 (private): progress through the current rank, 0-255
     /// (`HonorMgr.cpp:905-909`); a negative rank's `-255` scale wraps in the `uint8` cast.

@@ -202,8 +202,9 @@ pub struct TrainerState {
 
 impl super::UiScript {
     /// Push the open trainer and finalize its rows, as a list (`0x4d7b3b`) and the state pass
-    /// `0x4d7d40` do, or clear it with `None`. A push builds the tree ([`build_groups`]) and keeps
-    /// only the collapsed groups that still exist, so a fold survives a content update.
+    /// `0x4d7d40` do, or clear it with `None`. The first push of a list builds the header array
+    /// ([`build_groups`]); a later one keeps it and regroups the rows under it ([`regroup`]). A
+    /// fold survives a content update.
     pub fn set_trainer(&mut self, state: Option<TrainerState>) {
         self.push_trainer(state, true);
     }
@@ -238,7 +239,12 @@ impl super::UiScript {
                 model.trainer_rows_fresh = false;
             }
             Some(mut s) => {
-                s.groups = build_groups(&s.services, s.trainer_type, &known_header);
+                // The header array is the list's (`0x4d7560`); a later push only regroups the rows
+                // under it, as a pass re-keys a row and keeps every header (`0x4d82b2`-`0x4d82c1`).
+                s.groups = match model.trainer.as_ref().filter(|_| !model.trainer_rows_fresh) {
+                    Some(listed) => regroup(&listed.groups, &s.services),
+                    None => build_groups(&s.services, s.trainer_type, &known_header),
+                };
                 let live: std::collections::HashSet<u32> = s.groups.iter().map(|g| g.key).collect();
                 model.trainer_collapsed.retain(|sl| live.contains(sl));
                 let model = &mut *model;
@@ -287,18 +293,6 @@ impl super::UiScript {
         std::mem::take(&mut self.model_mut().trainer_item_waits)
     }
 
-    /// Whether `CloseTrainer` was called since the last drain; the close sends no packet.
-    pub fn take_trainer_close(&mut self) -> bool {
-        std::mem::take(&mut self.model_mut().trainer_close)
-    }
-
-    /// `OpenTrainer`'s close (`0x5df680` → `0x4d7440` with a zero guid), which the host asks for
-    /// once it has the player: the close core runs where every `CloseTrainer` does, as it needs
-    /// the latch (Part of #2202).
-    pub fn close_trainer_for_own_list(&mut self) {
-        self.model_mut().trainer_close = true;
-    }
-
     /// The trainer calls a harness's VM kept ([`Self::keep_calls`]), in call order.
     pub fn take_trainer_calls(&mut self) -> Vec<TrainerCall> {
         self.take_calls_where(|call| match call {
@@ -315,8 +309,11 @@ pub enum TrainerCall {
     /// the trainer's cell and the row's spell id (`0x4d8a11`-`0x4d8a26`).
     Buy { trainer: u64, spell_id: u32 },
     /// `OpenTrainer()` (`0x4d8cf0`): with a player (`0x4d8d24`), `TalkToTrainer` (`0x5df680`) on
-    /// the player's own guid, which closes the window and sends `CMSG_TRAINER_LIST`.
+    /// the player's own guid, which closes the window (`0x5df6bb`) and sends `CMSG_TRAINER_LIST`
+    /// (`0x5df6fc`).
     OpenOwn,
+    /// `CloseTrainer()` (`0x4d8d50`): the close core `0x4d7440` with a zero guid.
+    Close,
 }
 
 /// Hand `call` to the host, which applies it before this returns ([`super::calls::submit`]).
@@ -454,6 +451,39 @@ fn build_groups(
                 o => sign(o),
             }
         });
+    }
+    groups
+}
+
+/// `services` grouped under the list's header array `listed`, its order and its headers kept,
+/// a group whose rows all left among them: the state pass re-keys a row now known to -1 at type 1
+/// (`0x4d82b2`-`0x4d82c1`) and touches no header (`0xb73a14` is the builder's count). A key the
+/// array lacks, which no pass writes, gets a header at its end.
+fn regroup(listed: &[TrainerGroup], services: &[TrainerService]) -> Vec<TrainerGroup> {
+    let mut groups: Vec<TrainerGroup> = listed
+        .iter()
+        .map(|g| TrainerGroup {
+            services: Vec::new(),
+            ..g.clone()
+        })
+        .collect();
+    for (i, s) in services.iter().enumerate() {
+        if s.group_key == 0 {
+            continue;
+        }
+        let gi = match groups.iter().position(|g| g.key == s.group_key) {
+            Some(gi) => gi,
+            None => {
+                groups.push(TrainerGroup {
+                    key: s.group_key,
+                    name: s.group_name.clone(),
+                    line_name: s.line_name.clone(),
+                    services: Vec::new(),
+                });
+                groups.len() - 1
+            }
+        };
+        groups[gi].services.push(i);
     }
     groups
 }
@@ -1218,15 +1248,10 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         })?,
     )?;
 
-    // CloseTrainer(): sends no packet; the app runs the close core on the flag, as the core needs
-    // the latch (Part of #2202).
+    // CloseTrainer(): the close core, no packet, inside the call.
     g.set(
         "CloseTrainer",
-        lua.create_function(|lua, ()| {
-            let mut model = lua.app_data_mut::<Model>().expect("model app_data");
-            model.trainer_close = true;
-            Ok(())
-        })?,
+        lua.create_function(|lua, ()| submit(lua, TrainerCall::Close))?,
     )?;
 
     Ok(())

@@ -89,6 +89,7 @@ pub(super) fn owned_pet() -> ObjectStore {
 /// [`owned_pet`] with more fields set, which win over its own.
 pub(super) fn owned_pet_with(extra: &[(u16, u32)]) -> ObjectStore {
     let mut pairs = vec![
+        (22, 100),
         (SUMMONEDBY, ME as u32),
         (SUMMONEDBY + 1, 0),
         (CREATEDBY, ME as u32),
@@ -176,6 +177,7 @@ pub(super) fn rig(
         bar.spells.bar[i] = PetActionEntry::from(spell_id | (u32::from(PET_ACT_ENABLED) << 24));
     }
     world.insert_non_send_resource(listening_vm());
+    world.init_resource::<super::PetBarFeed>();
     // The order the plugin gives them: the feeds that push a pet cooldown, then the flush.
     let mut feed = Schedule::default();
     feed.add_systems(
@@ -192,15 +194,17 @@ pub(super) fn rig(
         commands,
         feed,
     };
-    // The bar arriving is `PET_BAR_UPDATE`'s; every test reads what a press adds to it.
-    assert_eq!(rig.frame(), ["PET_BAR_UPDATE"], "the bar arrives");
+    // The bar arrives with no event from its feed: a packet's `PET_BAR_UPDATE` is the notice
+    // lane's (`SetPetGuid`, `0x4bc90c`). Every test reads what a press adds to it.
+    assert_eq!(rig.frame(), Vec::<String>::new(), "the bar arrives");
     rig
 }
 
 impl Rig {
-    /// The bar's feeds for one frame, and the events they fired.
+    /// The bar's feeds for one frame, then the lanes' drain, and the events they fired.
     pub(super) fn frame(&mut self) -> Vec<String> {
         self.feed.run(self.app.world_mut());
+        crate::lanes::fire_in_order(self.app.world_mut());
         let mut script = self
             .app
             .world_mut()
@@ -360,6 +364,7 @@ fn view_on(rig: &mut Rig, guid: u64) {
 /// A unit the player mind-controls: charmed by us and possessed (`SpellAuras.cpp:2968-2969`).
 fn possessed() -> ObjectStore {
     ObjectStore(benilla_protocol::ObjectFields::from_pairs(&[
+        (22, 100),
         (CHARMEDBY, ME as u32),
         (CHARMEDBY + 1, 0),
         (FLAGS, crate::target::UNIT_FLAG_POSSESSED),

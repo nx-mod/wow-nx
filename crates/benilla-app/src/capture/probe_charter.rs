@@ -323,21 +323,45 @@ fn probe_guild_name(prefix: &str) -> String {
     format!("{prefix} {secs:08}")
 }
 
+/// The gossip menu as the step reads it, taken outside the VM: the gossip verbs write the state
+/// in the host, which the step's Lua runs with.
+struct Menu {
+    npc: Option<u64>,
+    options: Vec<benilla_protocol::messages::GossipOption>,
+}
+
+impl Menu {
+    fn of(gossip: &GossipState) -> Self {
+        Menu {
+            npc: gossip.npc,
+            options: gossip.options.clone(),
+        }
+    }
+}
+
 fn charter_probe(
     time: ProbeClock,
     mut probe: ResMut<CharterProbe>,
-    registrar: Res<GuildRegistrarState>,
     objects: Objects,
     items: Res<Items>,
-    // The gossip slots wait outside the VM's turn: the gossip verbs write them in the host.
-    mut vm: crate::script_calls::VmWith<Res<'static, GossipState>>,
+    // The gossip slots and the registrar's, read outside the VM: their verbs write them in the
+    // host.
+    mut vm: crate::script_calls::VmWith<(
+        Res<'static, GossipState>,
+        Res<'static, GuildRegistrarState>,
+    )>,
     self_q: Query<&ObjectStore, With<SelfPlayer>>,
     player: Res<Player>,
     units: Query<(&Guid, &NetEntity, &ObjectStore, &Transform), Without<SelfPlayer>>,
     net: Res<NetCommands>,
     mut exit: MessageWriter<AppExit>,
 ) {
-    vm.turn(|script, gossip| {
+    // The step's Lua runs with the host lent, so the calls it makes apply inside their verbs.
+    let (gossip, registrar_npc) = {
+        let (gossip, registrar) = vm.own();
+        (Menu::of(&gossip), registrar.npc())
+    };
+    vm.run(|script| {
         let Ok(store) = self_q.single() else {
             return; // not in-world yet
         };
@@ -540,7 +564,7 @@ fn charter_probe(
                     probe.phase = Phase::Done;
                     return;
                 };
-                let parked = registrar.npc() == Some(npc);
+                let parked = registrar_npc == Some(npc);
                 let visible = vm_visible(script, "GuildRegistrarFrame");
                 let cost = vm_charter_cost(script);
                 if parked && visible && cost == CHARTER_COST_COPPER {
@@ -592,7 +616,7 @@ fn charter_probe(
                          An SMSG_PETITION_SHOWLIST with no parse arm at all \
                          falls through to ServerPacket::Other — that is what this reading looks \
                          like. Lines seen: {:?}",
-                            registrar.npc(),
+                            registrar_npc,
                             probe_lines(script)
                         ),
                     );
@@ -1067,7 +1091,7 @@ fn hop(probe: &mut CharterProbe, net: &NetCommands, now: f64) {
 /// select by the row's wire index, never its list position. Sets `probe.phase` on every path.
 fn assert_icon_and_select(
     probe: &mut CharterProbe,
-    gossip: &GossipState,
+    gossip: &Menu,
     script: &UiScript,
     net: &NetCommands,
     npc: u64,
