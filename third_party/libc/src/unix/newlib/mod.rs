@@ -49,7 +49,9 @@ pub type pthread_key_t = c_uint;
 pub type rlim_t = u32;
 
 cfg_if! {
-    if #[cfg(target_os = "horizon")] {
+    if #[cfg(all(target_os = "horizon", target_arch = "aarch64"))] {
+        pub type sa_family_t = u8; // wow-nx: libnx's BSD sockets
+    } else if #[cfg(target_os = "horizon")] {
         pub type sa_family_t = u16;
     } else {
         pub type sa_family_t = u8;
@@ -633,6 +635,8 @@ pub const PF_INET: c_int = 2;
 cfg_if! {
     if #[cfg(target_os = "espidf")] {
         pub const PF_INET6: c_int = 10;
+    } else if #[cfg(all(target_os = "horizon", target_arch = "aarch64"))] {
+        pub const PF_INET6: c_int = 28; // wow-nx: libnx
     } else {
         pub const PF_INET6: c_int = 23;
     }
@@ -686,7 +690,9 @@ pub const SO_RCVLOWAT: c_int = 0x1004;
 pub const SO_SNDTIMEO: c_int = 0x1005;
 pub const SO_RCVTIMEO: c_int = 0x1006;
 cfg_if! {
-    if #[cfg(target_os = "horizon")] {
+    if #[cfg(all(target_os = "horizon", target_arch = "aarch64"))] {
+        pub const SO_ERROR: c_int = 0x1007; // wow-nx: libnx
+    } else if #[cfg(target_os = "horizon")] {
         pub const SO_ERROR: c_int = 0x1009;
     } else {
         pub const SO_ERROR: c_int = 0x1007;
@@ -724,6 +730,9 @@ cfg_if! {
     } else if #[cfg(target_os = "espidf")] {
         pub const TCP_NODELAY: c_int = 1;
         pub const TCP_MAXSEG: c_int = 8194;
+    } else if #[cfg(all(target_os = "horizon", target_arch = "aarch64"))] {
+        pub const TCP_NODELAY: c_int = 1; // wow-nx: libnx
+        pub const TCP_MAXSEG: c_int = 2;
     } else {
         pub const TCP_NODELAY: c_int = 8193;
         pub const TCP_MAXSEG: c_int = 8194;
@@ -758,6 +767,8 @@ cfg_if! {
         pub const IP_TTL: c_int = 4;
     } else if #[cfg(target_os = "espidf")] {
         pub const IP_TTL: c_int = 2;
+    } else if #[cfg(all(target_os = "horizon", target_arch = "aarch64"))] {
+        pub const IP_TTL: c_int = 4; // wow-nx: libnx
     } else {
         pub const IP_TTL: c_int = 8;
     }
@@ -782,6 +793,9 @@ cfg_if! {
     } else if #[cfg(target_os = "espidf")] {
         pub const IP_ADD_MEMBERSHIP: c_int = 3;
         pub const IP_DROP_MEMBERSHIP: c_int = 4;
+    } else if #[cfg(all(target_os = "horizon", target_arch = "aarch64"))] {
+        pub const IP_ADD_MEMBERSHIP: c_int = 12; // wow-nx: libnx
+        pub const IP_DROP_MEMBERSHIP: c_int = 13;
     } else {
         pub const IP_ADD_MEMBERSHIP: c_int = 11;
         pub const IP_DROP_MEMBERSHIP: c_int = 12;
@@ -854,6 +868,11 @@ cfg_if! {
         pub const EAI_FAMILY: c_int = 204;
         pub const EAI_MEMORY: c_int = 203;
         pub const EAI_NONAME: c_int = 200;
+        pub const EAI_SOCKTYPE: c_int = 10;
+    } else if #[cfg(all(target_os = "horizon", target_arch = "aarch64"))] {
+        pub const EAI_FAMILY: c_int = 5; // wow-nx: libnx's netdb.h
+        pub const EAI_MEMORY: c_int = 6;
+        pub const EAI_NONAME: c_int = 8;
         pub const EAI_SOCKTYPE: c_int = 10;
     } else if #[cfg(not(target_os = "vita"))] {
         pub const EAI_FAMILY: c_int = -303;

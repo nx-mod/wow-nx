@@ -41,3 +41,21 @@ const _: () = assert!(core::mem::offset_of!(libc::stat, st_blocks) == 80, "stat.
 const _: () = assert!(core::mem::offset_of!(libc::dirent, d_name) == 3, "dirent.d_name");
 // The condition variable's initializer as devkitA64's (CLOCK_REALTIME first); the mutex's and rwlock's are zeros.
 const _: () = assert!(unsafe { core::mem::transmute::<libc::pthread_cond_t, [u8; 16]>(libc::PTHREAD_COND_INITIALIZER) }[0] == 1);
+// Sockets: libnx's, from FreeBSD (devkitA64 gcc on sys/socket.h, netinet/in.h, netdb.h). The 3DS layouts the crate had
+// put the family in the length byte, so every address getaddrinfo returned was skipped.
+layout_is!(libc::sa_family_t, 1, 1);
+layout_is!(libc::sockaddr, 16, 1);
+layout_is!(libc::sockaddr_in, 16, 4);
+layout_is!(libc::sockaddr_in6, 28, 4);
+layout_is!(libc::sockaddr_storage, 128, 8);
+layout_is!(libc::addrinfo, 48, 8);
+layout_is!(libc::timeval, 16, 8);
+layout_is!(libc::linger, 8, 4);
+const _: () = assert!(core::mem::offset_of!(libc::sockaddr_in, sin_port) == 2, "sockaddr_in.sin_port");
+const _: () = assert!(core::mem::offset_of!(libc::sockaddr_in6, sin6_port) == 2, "sockaddr_in6.sin6_port");
+const _: () = assert!(core::mem::offset_of!(libc::sockaddr_in6, sin6_addr) == 8, "sockaddr_in6.sin6_addr");
+const _: () = assert!(core::mem::offset_of!(libc::addrinfo, ai_canonname) == 24, "addrinfo.ai_canonname");
+const _: () = assert!(core::mem::offset_of!(libc::addrinfo, ai_addr) == 32, "addrinfo.ai_addr");
+const _: () = assert!(core::mem::offset_of!(libc::addrinfo, ai_next) == 40, "addrinfo.ai_next");
+const _: () = assert!(libc::AF_INET6 == 28 && libc::FIONBIO == 0x8004_667e && libc::SO_ERROR == 0x1007);
+const _: () = assert!(libc::TCP_NODELAY == 1 && libc::EAI_NONAME == 8 && libc::SO_SNDTIMEO == 4101);

@@ -34,17 +34,47 @@ s! {
         pub revents: c_int,
     }
 
+    #[cfg(not(all(target_os = "horizon", target_arch = "aarch64")))]
     pub struct sockaddr {
         pub sa_family: crate::sa_family_t,
         pub sa_data: [c_char; 26usize],
     }
 
+    // wow-nx: the Switch's sockets are libnx's, from FreeBSD: a length byte, then a one-byte family
+    // (libnx's sys/socket.h, netinet/in.h, sys/_sockaddr_storage.h; sizes in switch/hello's layouts.rs).
+    #[cfg(all(target_os = "horizon", target_arch = "aarch64"))]
+    pub struct sockaddr {
+        pub sa_len: u8,
+        pub sa_family: crate::sa_family_t,
+        pub sa_data: [c_char; 14usize],
+    }
+
+    #[cfg(not(all(target_os = "horizon", target_arch = "aarch64")))]
     pub struct sockaddr_storage {
         pub ss_family: crate::sa_family_t,
         __ss_padding: Padding<[c_char; 26usize]>,
     }
 
+    #[cfg(all(target_os = "horizon", target_arch = "aarch64"))]
+    pub struct sockaddr_storage {
+        pub ss_len: u8,
+        pub ss_family: crate::sa_family_t,
+        __ss_pad1: Padding<[c_char; 6usize]>,
+        __ss_align: i64,
+        __ss_pad2: Padding<[c_char; 112usize]>,
+    }
+
+    #[cfg(not(all(target_os = "horizon", target_arch = "aarch64")))]
     pub struct sockaddr_in {
+        pub sin_family: crate::sa_family_t,
+        pub sin_port: crate::in_port_t,
+        pub sin_addr: crate::in_addr,
+        pub sin_zero: [c_char; 8],
+    }
+
+    #[cfg(all(target_os = "horizon", target_arch = "aarch64"))]
+    pub struct sockaddr_in {
+        pub sin_len: u8,
         pub sin_family: crate::sa_family_t,
         pub sin_port: crate::in_port_t,
         pub sin_addr: crate::in_addr,
@@ -140,9 +170,18 @@ pub const TIMER_ABSTIME: c_uint = 4;
 pub const SOL_SOCKET: c_int = 65535;
 pub const MSG_OOB: c_int = 1;
 pub const MSG_PEEK: c_int = 2;
-pub const MSG_DONTWAIT: c_int = 4;
-pub const MSG_DONTROUTE: c_int = 0;
-pub const MSG_WAITALL: c_int = 0;
+cfg_if! {
+    if #[cfg(all(target_os = "horizon", target_arch = "aarch64"))] {
+        // wow-nx: libnx's sys/socket.h
+        pub const MSG_DONTWAIT: c_int = 0x80;
+        pub const MSG_DONTROUTE: c_int = 0x4;
+        pub const MSG_WAITALL: c_int = 0x40;
+    } else {
+        pub const MSG_DONTWAIT: c_int = 4;
+        pub const MSG_DONTROUTE: c_int = 0;
+        pub const MSG_WAITALL: c_int = 0;
+    }
+}
 pub const MSG_MORE: c_int = 0;
 pub const MSG_NOSIGNAL: c_int = 0;
 pub const SOL_CONFIG: c_uint = 65534;
@@ -172,9 +211,16 @@ pub const EAI_OVERFLOW: c_int = 14;
 pub const EAI_MAX: c_int = 15;
 
 pub const AF_UNIX: c_int = 1;
-pub const AF_INET6: c_int = 23;
-
-pub const FIONBIO: c_ulong = 1;
+cfg_if! {
+    if #[cfg(all(target_os = "horizon", target_arch = "aarch64"))] {
+        // wow-nx: libnx's sys/socket.h and sys/filio.h (_IOW('f', 126, int))
+        pub const AF_INET6: c_int = 28;
+        pub const FIONBIO: c_ulong = 0x8004_667e;
+    } else {
+        pub const AF_INET6: c_int = 23;
+        pub const FIONBIO: c_ulong = 1;
+    }
+}
 
 pub const RTLD_DEFAULT: *mut c_void = ptr::null_mut();
 
