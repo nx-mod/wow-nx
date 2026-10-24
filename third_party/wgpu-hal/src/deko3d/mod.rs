@@ -63,6 +63,73 @@ pub(super) mod live {
     pub static DEVICES: AtomicIsize = AtomicIsize::new(0);
 }
 
+/// What a stretch of frames cost, logged every `stats::FRAMES` presents: whether the CPU or the GPU holds the frame
+/// rate back (time blocked acquiring an image is time the GPU was behind), and what the backend did meanwhile.
+pub(super) mod stats {
+    use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    pub static BLOCKS: AtomicU64 = AtomicU64::new(0);
+    pub static RING_WAITS: AtomicU64 = AtomicU64::new(0);
+    pub static SUBMITS: AtomicU64 = AtomicU64::new(0);
+    pub static SUBMIT_TICKS: AtomicU64 = AtomicU64::new(0);
+    pub static ACQUIRE_TICKS: AtomicU64 = AtomicU64::new(0);
+    static PIPELINES: AtomicU64 = AtomicU64::new(0);
+    static PIPELINE_TICKS: AtomicU64 = AtomicU64::new(0);
+    static PRESENTS: AtomicU64 = AtomicU64::new(0);
+    static STARTED: AtomicU64 = AtomicU64::new(0);
+    pub const FRAMES: u64 = 300;
+
+    /// The system counter, 19.2 MHz.
+    pub fn ticks() -> u64 {
+        let t: u64;
+        unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) t) };
+        t
+    }
+
+    pub fn ms(ticks: u64) -> f64 {
+        ticks as f64 / 19_200.0
+    }
+
+    /// A pipeline made since `started`: its shaders translated and compiled, or read from the SD card's cache.
+    pub fn pipeline(started: u64) {
+        PIPELINES.fetch_add(1, Relaxed);
+        PIPELINE_TICKS.fetch_add(ticks() - started, Relaxed);
+    }
+
+    pub fn present(shared: &super::Shared) {
+        let now = ticks();
+        let n = PRESENTS.fetch_add(1, Relaxed) + 1;
+        if n == 1 {
+            STARTED.store(now, Relaxed);
+            shared.timing.lock().summary(1.0);
+            log::info!(
+                "deko3d: first present: {} pipelines made in {:.0} ms, {} blocks made",
+                PIPELINES.swap(0, Relaxed),
+                ms(PIPELINE_TICKS.swap(0, Relaxed)),
+                BLOCKS.swap(0, Relaxed),
+            );
+            return;
+        }
+        if n % FRAMES != 1 {
+            return;
+        }
+        let span = now - STARTED.swap(now, Relaxed);
+        let frames = FRAMES as f64;
+        log::info!(
+            "deko3d: {:.1} fps ({:.1} ms a frame): {:.1} ms acquiring, {:.1} ms submitting ({:.1} submits) a frame; {} blocks made, {} ring waits, {} pipelines made in {:.0} ms",
+            frames * 1000.0 / ms(span),
+            ms(span) / frames,
+            ms(ACQUIRE_TICKS.swap(0, Relaxed)) / frames,
+            ms(SUBMIT_TICKS.swap(0, Relaxed)) / frames,
+            SUBMITS.swap(0, Relaxed) as f64 / frames,
+            BLOCKS.swap(0, Relaxed),
+            RING_WAITS.swap(0, Relaxed),
+            PIPELINES.swap(0, Relaxed),
+            ms(PIPELINE_TICKS.swap(0, Relaxed)),
+        );
+        log::info!("deko3d: {}", shared.timing.lock().summary(frames));
+    }
+}
+
 /// What still owns deko3d memory: buffers, textures, encoders, swapchains, devices.
 pub fn live_objects() -> String {
     use core::sync::atomic::Ordering::Relaxed;
@@ -102,6 +169,7 @@ pub(super) unsafe fn mem_block(device: DkDevice, size: u32, flags: u32) -> Optio
     let mut maker = unsafe { core::mem::zeroed::<DkMemBlockMaker>() };
     unsafe { dkMemBlockMakerDefaults(&mut maker, device, size) };
     maker.flags = flags;
+    stats::BLOCKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let mem_block = unsafe { dkMemBlockCreate(&maker) };
     (!mem_block.is_null()).then_some(mem_block)
 }
@@ -208,6 +276,10 @@ pub(super) struct Shared {
     code: Mutex<CodeMemory>,
     descriptors: Mutex<Descriptors>,
     ubo: DkMemBlock,
+    /// Small buffers' memory (buffer.rs).
+    buffers: Mutex<buffer::Pool>,
+    /// The passes' GPU timestamps (`Timing`).
+    timing: Mutex<Timing>,
     _counted: Counted,
 }
 
@@ -235,6 +307,8 @@ impl Drop for Shared {
         unsafe {
             dkQueueWaitIdle(self.queue);
             dkQueueDestroy(self.queue);
+            self.buffers.get_mut().destroy();
+            dkMemBlockDestroy(self.timing.get_mut().memory);
             dkMemBlockDestroy(self.zeros);
             dkMemBlockDestroy(self.code.get_mut().mem_block);
             let d = self.descriptors.get_mut();
@@ -321,6 +395,85 @@ unsafe impl Sync for TextureView {}
 
 #[derive(Debug)]
 pub struct Resource;
+
+/// One render or compute pass's GPU time: the slots of its start and end timestamps in the timing ring.
+#[derive(Debug)]
+pub(super) struct PassTime {
+    pub(super) label: String,
+    pub(super) start: u32,
+    pub(super) end: u32,
+}
+
+/// Report slots: a frame's passes take two each, and they are read a frame or two later.
+const TIMING_SLOTS: u32 = 4096;
+/// deko3d's four-word report: the counter, then the GPU timestamp (dk_variable.cpp, dkCmdBufReportCounter).
+const TIMING_REPORT: u32 = 16;
+
+/// Where the passes of each frame went on the GPU: their timestamps in a CPU-readable ring, the submissions not yet
+/// run (each with a fence), and per-label totals that the frame statistics print and reset.
+#[derive(Debug)]
+struct Timing {
+    memory: DkMemBlock,
+    next: u32,
+    pending: Vec<(Box<DkFence>, Vec<PassTime>)>,
+    totals: Vec<(String, u64)>,
+}
+
+unsafe impl Send for Timing {}
+
+impl Timing {
+    fn new(memory: DkMemBlock) -> Self {
+        Timing { memory, next: 0, pending: Vec::new(), totals: Vec::new() }
+    }
+
+    /// The next report slot and its GPU address.
+    fn slot(&mut self) -> (u32, DkGpuAddr) {
+        let slot = self.next;
+        self.next = (self.next + 1) % TIMING_SLOTS;
+        (slot, unsafe { dkMemBlockGetGpuAddr(self.memory) } + (slot * TIMING_REPORT) as u64)
+    }
+
+    fn timestamp(&self, slot: u32) -> u64 {
+        // The second word of the report; the block is CPU-uncached.
+        unsafe { dkMemBlockGetCpuAddr(self.memory).cast::<u64>().add(slot as usize * 2 + 1).read_volatile() }
+    }
+
+    /// Adds up the passes of every submission the GPU has finished.
+    fn collect(&mut self) {
+        let mut i = 0;
+        while i < self.pending.len() {
+            if unsafe { dkFenceWait(&mut *self.pending[i].0, 0) } != DkResult::DkResult_Success {
+                i += 1;
+                continue;
+            }
+            let (_, passes) = self.pending.swap_remove(i);
+            for p in passes {
+                let ticks = self.timestamp(p.end).saturating_sub(self.timestamp(p.start));
+                match self.totals.iter_mut().find(|(l, _)| *l == p.label) {
+                    Some((_, t)) => *t += ticks,
+                    None => self.totals.push((p.label, ticks)),
+                }
+            }
+        }
+        // A ring slot is reused after TIMING_SLOTS reports: submissions that old are not read.
+        if self.pending.len() > 32 {
+            self.pending.drain(..self.pending.len() - 32);
+        }
+    }
+
+    /// The costliest passes, in GPU ms a frame, and the sum of all; the totals start again.
+    fn summary(&mut self, frames: f64) -> String {
+        let ms = |ticks: u64| ticks as f64 * 625.0 / 384.0 / 1e6 / frames;
+        let mut totals = core::mem::take(&mut self.totals);
+        totals.sort_by(|a, b| b.1.cmp(&a.1));
+        let sum: u64 = totals.iter().map(|(_, t)| t).sum();
+        let mut out = alloc::format!("GPU {:.2} ms a frame in passes:", ms(sum));
+        for (label, ticks) in totals.iter().take(10) {
+            out += &alloc::format!(" {label} {:.2}", ms(*ticks));
+        }
+        out
+    }
+}
 
 /// GPFIFO entries the GPU's ring holds (libnx's GPFIFO_QUEUE_SIZE) less a margin, and what deko3d adds to a flush
 /// besides the lists (its cache invalidation and a processing barrier, gpu_base.cpp).
@@ -547,6 +700,42 @@ impl Drop for Surface {
     }
 }
 
+/// Clears new swapchain images to black: until the app draws, what a present shows is whatever the memory held,
+/// which on the console was a white flash before the first frame.
+unsafe fn clear_to_black(shared: &Shared, images: &[DkImage], extent: wgt::Extent3d) {
+    const SIZE: u32 = DK_MEMBLOCK_ALIGNMENT;
+    let Some(memory) = (unsafe { mem_block(shared.device, SIZE, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached) })
+    else {
+        return;
+    };
+    let mut maker = unsafe { core::mem::zeroed::<DkCmdBufMaker>() };
+    unsafe { dkCmdBufMakerDefaults(&mut maker, shared.device) };
+    let cmd = unsafe { dkCmdBufCreate(&maker) };
+    if !cmd.is_null() {
+        unsafe {
+            dkCmdBufAddMemory(cmd, memory, 0, SIZE);
+            let mut write_all = core::mem::zeroed::<DkColorWriteState>();
+            dkColorWriteStateDefaults(&mut write_all);
+            dkCmdBufBindColorWriteState(cmd, &write_all);
+            let (width, height) = (extent.width, extent.height);
+            dkCmdBufSetScissors(cmd, 0, &DkScissor { x: 0, y: 0, width, height }, 1);
+            for image in images {
+                let mut view = core::mem::zeroed::<DkImageView>();
+                dkImageViewDefaults(&mut view, image);
+                dkCmdBufBindRenderTarget(cmd, &view, ptr::null());
+                dkCmdBufClearColorFloat(cmd, 0, DkColorMask_RGBA, 0.0, 0.0, 0.0, 1.0);
+            }
+            let list = dkCmdBufFinishList(cmd);
+            let mut in_flight = shared.lock_queue();
+            dkQueueSubmitCommands(shared.queue, list);
+            dkQueueWaitIdle(shared.queue);
+            *in_flight = 0;
+            dkCmdBufDestroy(cmd);
+        }
+    }
+    unsafe { dkMemBlockDestroy(memory) };
+}
+
 impl crate::Surface for Surface {
     type A = Api;
 
@@ -575,6 +764,7 @@ impl crate::Surface for Surface {
         for (i, image) in images.iter_mut().enumerate() {
             unsafe { dkImageInitialize(image, &layout, memory, (i as u64 * size) as u32) };
         }
+        unsafe { clear_to_black(&device.shared, &images, config.extent) };
         let pointers: Vec<*const DkImage> = images.iter().map(ptr::from_ref).collect();
         let mut sm = unsafe { core::mem::zeroed::<DkSwapchainMaker>() };
         unsafe { dkSwapchainMakerDefaults(&mut sm, dk, self.window, pointers.as_ptr(), count) };
@@ -612,7 +802,10 @@ impl crate::Surface for Surface {
         let slot = {
             let mut in_flight = c._shared.lock_queue();
             *in_flight += FLUSH_ENTRIES;
-            unsafe { dkQueueAcquireImage(c.queue, c.dk) }
+            let started = stats::ticks();
+            let slot = unsafe { dkQueueAcquireImage(c.queue, c.dk) };
+            stats::ACQUIRE_TICKS.fetch_add(stats::ticks() - started, core::sync::atomic::Ordering::Relaxed);
+            slot
         };
         if slot < 0 {
             return Err(crate::SurfaceError::Lost);
@@ -667,8 +860,9 @@ impl crate::Adapter for Adapter {
         let images = unsafe { mem_block(device, size_of_set(MAX_IMAGES, core::mem::size_of::<DkImageDescriptor>()), plain) };
         let samplers = unsafe { mem_block(device, size_of_set(MAX_SAMPLERS, core::mem::size_of::<DkSamplerDescriptor>()), plain) };
         let ubo = unsafe { mem_block(device, DK_MEMBLOCK_ALIGNMENT, plain) };
-        let (false, Some(zeros), Some(code), Some(images), Some(samplers), Some(ubo)) =
-            (queue.is_null(), zeros, code, images, samplers, ubo)
+        let timing = unsafe { mem_block(device, TIMING_SLOTS * TIMING_REPORT, plain) };
+        let (false, Some(zeros), Some(code), Some(images), Some(samplers), Some(ubo), Some(timing)) =
+            (queue.is_null(), zeros, code, images, samplers, ubo, timing)
         else {
             unsafe { dkDeviceDestroy(device) };
             return Err(crate::DeviceError::OutOfMemory);
@@ -686,6 +880,8 @@ impl crate::Adapter for Adapter {
                 free_samplers: (0..MAX_SAMPLERS).rev().collect(),
             }),
             ubo,
+            buffers: Mutex::new(buffer::Pool::default()),
+            timing: Mutex::new(Timing::new(timing)),
             _counted: Counted::new(&live::DEVICES),
         });
         Ok(crate::OpenDevice {
@@ -752,29 +948,40 @@ impl crate::Queue for Queue {
     ) -> DeviceResult<()> {
         let queue = self.shared.queue;
         let mut in_flight = self.shared.lock_queue();
-        // Each list flushed as it goes, so libnx's 2048 GPFIFO entries between kickoffs never fill (command.rs). The
-        // GPU's own ring is those 2048 entries too, and a kickoff that does not fit times out (LibnxNvidiaError_Timeout,
-        // "gpu channel kickoff failed"): before a list could overrun it, the GPU is let finish what it has.
+        let started = stats::ticks();
+        // The GPU's ring holds 2048 GPFIFO entries, libnx's channel as many between kickoffs, and a kickoff that does
+        // not fit times out (LibnxNvidiaError_Timeout, "gpu channel kickoff failed"): before a list could overrun
+        // them, the GPU is let finish what it has (the wait flushes). Otherwise the submission is one flush, below:
+        // each flush is a kernel call, and deko3d flushes L2 and drops the image, shader and descriptor caches at
+        // every one (gpu_base.cpp).
         for cb in command_buffers {
             for &(list, entries) in &cb.lists {
                 if *in_flight + entries + FLUSH_ENTRIES > RING_BUDGET {
                     unsafe { dkQueueWaitIdle(queue) };
                     *in_flight = 0;
+                    stats::RING_WAITS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 }
-                *in_flight += entries + FLUSH_ENTRIES;
-                unsafe {
-                    dkQueueSubmitCommands(queue, list);
-                    dkQueueFlush(queue);
-                }
+                *in_flight += entries;
+                unsafe { dkQueueSubmitCommands(queue, list) };
             }
         }
         *in_flight += FLUSH_ENTRIES;
+        let passes: Vec<PassTime> = command_buffers.iter().flat_map(|cb| cb.passes.iter()).map(|p| PassTime {
+            label: p.label.clone(),
+            start: p.start,
+            end: p.end,
+        }).collect();
+        if !passes.is_empty() {
+            let mut done = Box::new(unsafe { core::mem::zeroed::<DkFence>() });
+            unsafe { dkQueueSignalFence(queue, &mut *done, false) };
+            self.shared.timing.lock().pending.push((done, passes));
+        }
         let mut dk = Box::new(unsafe { core::mem::zeroed::<DkFence>() });
         unsafe {
             dkQueueSignalFence(queue, &mut *dk, true);
             dkQueueFlush(queue);
         }
-        #[cfg(deko3d_depurar)]
+        #[cfg(deko3d_debug)]
         {
             static SUBMISSIONS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
             let n = SUBMISSIONS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -785,6 +992,8 @@ impl crate::Queue for Queue {
             }
         }
         fence.state.lock().in_flight.push((fence_value, dk));
+        stats::SUBMITS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        stats::SUBMIT_TICKS.fetch_add(stats::ticks() - started, core::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
     unsafe fn present(&self, surface: &Surface, texture: Texture) -> Result<(), crate::SurfaceError> {
@@ -794,12 +1003,15 @@ impl crate::Queue for Queue {
         let mut in_flight = c._shared.lock_queue();
         *in_flight += FLUSH_ENTRIES;
         unsafe { dkQueuePresentImage(c.queue, c.dk, slot) };
+        drop(in_flight);
+        c._shared.timing.lock().collect();
+        stats::present(&c._shared);
         Ok(())
     }
 
     unsafe fn get_timestamp_period(&self) -> f32 {
-        // deko3d timestamps tick at 19.2 MHz (dkTimestampToNs).
-        1e9 / 19_200_000.0
+        // A GPU report's timestamp ticks every 625/384 ns (deko3d's dkTimestampToNs).
+        625.0 / 384.0
     }
 }
 
@@ -811,7 +1023,7 @@ impl crate::Device for Device {
     }
 
     unsafe fn destroy_buffer(&self, buffer: Buffer) {
-        unsafe { dkMemBlockDestroy(buffer.mem_block) };
+        unsafe { buffer.free() };
     }
     unsafe fn add_raw_buffer(&self, _buffer: &Buffer) {}
 
@@ -981,14 +1193,20 @@ impl crate::Device for Device {
         &self,
         desc: &crate::RenderPipelineDescriptor<PipelineLayout, ShaderModule, Resource>,
     ) -> Result<RenderPipeline, crate::PipelineError> {
-        self.new_render_pipeline(desc)
+        let started = stats::ticks();
+        let pipeline = self.new_render_pipeline(desc);
+        stats::pipeline(started);
+        pipeline
     }
     unsafe fn destroy_render_pipeline(&self, pipeline: RenderPipeline) {}
     unsafe fn create_compute_pipeline(
         &self,
         desc: &crate::ComputePipelineDescriptor<PipelineLayout, ShaderModule, Resource>,
     ) -> Result<ComputePipeline, crate::PipelineError> {
-        self.new_compute_pipeline(desc)
+        let started = stats::ticks();
+        let pipeline = self.new_compute_pipeline(desc);
+        stats::pipeline(started);
+        pipeline
     }
     unsafe fn destroy_compute_pipeline(&self, pipeline: ComputePipeline) {}
     unsafe fn create_pipeline_cache(&self, desc: &crate::PipelineCacheDescriptor<'_>) -> Result<Resource, crate::PipelineCacheError> {

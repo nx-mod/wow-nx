@@ -13,10 +13,10 @@ fn main() {
         // WOWNX_DEKO3D_DEBUG=1: deko3d's debug build, which checks every call and reports through the debug
         // callback, and a wait after every submission that names the one that faulted the GPU (src/deko3d).
         println!("cargo:rerun-if-env-changed=WOWNX_DEKO3D_DEBUG");
-        println!("cargo:rustc-check-cfg=cfg(deko3d_depurar)");
+        println!("cargo:rustc-check-cfg=cfg(deko3d_debug)");
         if std::env::var_os("WOWNX_DEKO3D_DEBUG").is_some() {
             println!("cargo:rustc-link-lib=static=deko3dd");
-            println!("cargo:rustc-cfg=deko3d_depurar");
+            println!("cargo:rustc-cfg=deko3d_debug");
         } else {
             println!("cargo:rustc-link-lib=static=deko3d");
         }

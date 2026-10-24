@@ -74,6 +74,9 @@ pub struct CommandEncoder {
     /// A barrier asked for and not yet written: consecutive transitions make one, before the next command.
     barrier_pending: bool,
     state: DrawState,
+    /// The passes timed in this encoding, and the one open (its label and start slot).
+    passes: Vec<super::PassTime>,
+    open_pass: Option<(alloc::string::String, u32)>,
 }
 
 unsafe impl Send for CommandEncoder {}
@@ -81,17 +84,19 @@ unsafe impl Sync for CommandEncoder {}
 
 #[derive(Debug)]
 pub struct CommandBuffer {
-    /// Short lists, each submitted and flushed on its own (`LIST_COMMANDS`), with the GPFIFO entries each takes at
-    /// most (`Queue::submit` keeps the GPU's ring from filling).
+    /// Its passes' GPU timestamps, read once the GPU has run it (`Queue::submit`, `Queue::present`).
+    pub(super) passes: Vec<super::PassTime>,
+    /// Short lists (`LIST_COMMANDS`), with the GPFIFO entries each takes at most, by which `Queue::submit` keeps the
+    /// GPU's ring from filling.
     pub(super) lists: Vec<(DkCmdList, u32)>,
 }
 
 /// GPFIFO entries any list takes besides the ones counted (its start, its end, a change of command memory).
 const LIST_ENTRIES: u32 = 4;
 
-/// Commands per deko3d list. libnx's GPU channel holds 2048 GPFIFO entries between flushes, and a long list (a
-/// frame's texture uploads) overflows it ("gpfifo entry append failed"): lists are kept short and each one is flushed
-/// as it is submitted. GPU state carries from one list to the next on the queue.
+/// Commands per deko3d list. libnx's GPU channel holds 2048 GPFIFO entries between flushes, and one long list (a
+/// frame's texture uploads) overflowed it ("gpfifo entry append failed"): lists are kept short, so `Queue::submit` can
+/// let the GPU catch up between them. GPU state carries from one list to the next on the queue.
 const LIST_COMMANDS: u32 = 256;
 
 impl CommandEncoder {
@@ -121,6 +126,8 @@ impl CommandEncoder {
             entries: 0,
             barrier_pending: false,
             state: DrawState::default(),
+            passes: Vec::new(),
+            open_pass: None,
         })
     }
 
@@ -231,6 +238,26 @@ fn texture_needs_barrier(t: &crate::StateTransition<wgt::TextureUses>) -> bool {
 }
 
 impl CommandEncoder {
+    /// A GPU timestamp once the work before it is done, in a slot of the device's timing ring.
+    fn timestamp(&mut self) -> u32 {
+        let (slot, gpu) = self.shared.timing.lock().slot();
+        let c = self.cmd();
+        unsafe { dkCmdBufReportCounter(c, DkCounter::DkCounter_Timestamp, gpu) };
+        slot
+    }
+
+    fn begin_timing(&mut self, label: crate::Label) {
+        let start = self.timestamp();
+        self.open_pass = Some((label.unwrap_or("unlabelled").into(), start));
+    }
+
+    fn end_timing(&mut self) {
+        if let Some((label, start)) = self.open_pass.take() {
+            let end = self.timestamp();
+            self.passes.push(super::PassTime { label, start, end });
+        }
+    }
+
     fn indirect(&mut self) {
         // An indirect draw or dispatch splits its entry and adds its parameters as another (gpu_3d_base.cpp).
         self.entries += 2;
@@ -333,6 +360,8 @@ impl crate::CommandEncoder for CommandEncoder {
         self.entries = 0;
         self.barrier_pending = false;
         self.state = DrawState::default();
+        self.passes.clear();
+        self.open_pass = None;
         Ok(())
     }
     unsafe fn discard_encoding(&mut self) {
@@ -342,6 +371,8 @@ impl crate::CommandEncoder for CommandEncoder {
         self.commands = 0;
         self.entries = 0;
         self.barrier_pending = false;
+        self.passes.clear();
+        self.open_pass = None;
     }
     unsafe fn end_encoding(&mut self) -> DeviceResult<CommandBuffer> {
         if self.barrier_pending {
@@ -353,15 +384,18 @@ impl crate::CommandEncoder for CommandEncoder {
         }
         self.commands = 0;
         self.entries = 0;
-        Ok(CommandBuffer { lists: core::mem::take(&mut self.lists) })
+        Ok(CommandBuffer {
+            lists: core::mem::take(&mut self.lists),
+            passes: core::mem::take(&mut self.passes),
+        })
     }
     unsafe fn reset_all<I>(&mut self, command_buffers: I) {
         // Every list from this encoder has executed: start over in the first block, free the rest.
         unsafe { dkCmdBufClear(self.cmdbuf) };
         let mut blocks = core::mem::take(&mut self.memory.blocks).into_iter();
         if let Some((b, size)) = blocks.next() {
-            for (resto, _) in blocks {
-                unsafe { dkMemBlockDestroy(resto) };
+            for (rest, _) in blocks {
+                unsafe { dkMemBlockDestroy(rest) };
             }
             unsafe { dkCmdBufAddMemory(self.cmdbuf, b, 0, size) };
             self.memory.blocks.push((b, size));
@@ -480,6 +514,7 @@ impl crate::CommandEncoder for CommandEncoder {
     // render
 
     unsafe fn begin_render_pass(&mut self, desc: &crate::RenderPassDescriptor<Resource, TextureView>) -> DeviceResult<()> {
+        self.begin_timing(desc.label);
         let c = self.cmd();
         let views: Vec<Option<DkImageView>> = desc
             .color_attachments
@@ -487,8 +522,8 @@ impl crate::CommandEncoder for CommandEncoder {
             .map(|a| {
                 a.as_ref().map(|a| {
                     let mut v = a.target.view.view;
-                    if let Some(rebanada) = a.depth_slice {
-                        v.layerOffset = rebanada as u16;
+                    if let Some(slice) = a.depth_slice {
+                        v.layerOffset = slice as u16;
                         v.layerCount = 1;
                     }
                     v
@@ -564,11 +599,17 @@ impl crate::CommandEncoder for CommandEncoder {
     }
     unsafe fn end_render_pass(&mut self) {
         let c = self.cmd();
-        for (src, dst) in core::mem::take(&mut self.state.resolves) {
+        let resolves = core::mem::take(&mut self.state.resolves);
+        if !resolves.is_empty() {
+            // A resolve is the 2D engine's, and reads what the pass's fragments wrote.
+            unsafe { dkCmdBufBarrier(c, DkBarrier::DkBarrier_Fragments, DkInvalidateFlags_Image) };
+        }
+        for (src, dst) in resolves {
             unsafe { dkCmdBufResolveImage(c, &src, &dst) };
         }
-        // What the pass rendered may be sampled next.
-        unsafe { dkCmdBufBarrier(c, DkBarrier::DkBarrier_Fragments, DkInvalidateFlags_Image) };
+        // No barrier after the pass: what reads or overwrites its targets next is a transition wgpu records before
+        // that use (transition_textures), which waits; one here held every pass up behind the last.
+        self.end_timing();
     }
 
     unsafe fn set_bind_group(
@@ -793,12 +834,13 @@ impl crate::CommandEncoder for CommandEncoder {
     unsafe fn begin_compute_pass(&mut self, desc: &crate::ComputePassDescriptor<Resource>) {
         self.state.compute = true;
         self.state.textures_dirty = true;
+        self.begin_timing(desc.label);
     }
     unsafe fn end_compute_pass(&mut self) {
         self.state.compute = false;
         self.state.textures_dirty = true;
-        let c = self.cmd();
-        unsafe { dkCmdBufBarrier(c, DkBarrier::DkBarrier_Primitives, DkInvalidateFlags_Image | DkInvalidateFlags_Shader) };
+        // (as after a render pass, a later read of what the dispatches wrote is a transition, and waits)
+        self.end_timing();
     }
 
     unsafe fn set_compute_pipeline(&mut self, p: &ComputePipeline) {
