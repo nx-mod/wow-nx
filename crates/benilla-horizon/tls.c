@@ -55,3 +55,13 @@ int __wrap_pthread_create(pthread_t* thread, const pthread_attr_t* attr, void* (
     if (r != 0) free(s);
     return r;
 }
+
+// Fork handlers: rand 0.8's reseeding RNG registers some (rand's reseeding.rs) and panics when it cannot, and
+// newlib's pthread_atfork answers ENOSYS on the Switch. There is no fork here, so registering is a no-op that
+// succeeds. Wrapped at link time (-Wl,--wrap=pthread_atfork, benilla's build.rs).
+int __wrap_pthread_atfork(void (*prepare)(void), void (*parent)(void), void (*child)(void)) {
+    (void)prepare;
+    (void)parent;
+    (void)child;
+    return 0;
+}

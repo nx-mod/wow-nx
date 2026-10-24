@@ -83,8 +83,15 @@ impl Plugin for VmPassPlugin {
     }
 
     fn cleanup(&self, app: &mut App) {
+        let started = std::time::Instant::now();
         let order = order_the_pass(app.world_mut(), Update);
+        let ordered = started.elapsed();
         flush_unit_edits_elsewhere(app.world_mut());
+        info!(
+            "vm pass: ordered in {} ms, flushes placed in {} ms",
+            ordered.as_millis(),
+            (started.elapsed() - ordered).as_millis()
+        );
         #[cfg(test)]
         app.insert_resource(PassOrder(order));
         #[cfg(not(test))]
@@ -254,9 +261,12 @@ pub(crate) fn order_the_pass(world: &mut World, label: impl ScheduleLabel) -> Ve
                     return Joins::No;
                 }
                 let combined = declared.combined_access();
-                let mut with_host = declared.clone();
-                with_host.extend(host.clone());
-                let hosted = with_host.combined_access() == combined;
+                // wow-nx: the combined access of the set with the host's is the two combined accesses merged
+                // (`FilteredAccessSet::extend`), so only those are cloned: cloning the whole set and the host's
+                // per system took most of the start's eight seconds on the Switch (upstream #2324).
+                let mut with_host = combined.clone();
+                with_host.extend(host.combined_access());
+                let hosted = with_host == *combined;
                 let meets = in_phase[index[&key]] && !declared.is_compatible(&host);
                 if hosted || meets {
                     Joins::Always
