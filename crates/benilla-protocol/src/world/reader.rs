@@ -7,11 +7,13 @@ use crate::messages::{self, ServerPacket};
 
 use super::{read_frame, recv_packet};
 
-/// The read half of a split [`WorldSession`](super::WorldSession): cloned socket and decrypter,
+/// The read half of a split [`WorldSession`](super::WorldSession): the shared socket and the decrypter,
 /// and what the connection learned before the split, for
 /// [`WorldSession::rejoin`](super::WorldSession::rejoin).
 pub struct WorldReader {
-    pub(super) stream: TcpStream,
+    /// The one socket, shared with the writer (`&TcpStream` reads and writes): a duplicated descriptor is not a socket
+    /// on the Switch, whose libnx sockets refuse a `dup` (`try_clone`'s first read failed with EBADF).
+    pub(super) stream: std::sync::Arc<TcpStream>,
     pub(super) decrypter: DecrypterHalf,
     pub(super) link: super::session::LinkFacts,
     pub(super) traffic: std::sync::Arc<super::LinkTraffic>,
@@ -20,13 +22,13 @@ pub struct WorldReader {
 impl WorldReader {
     /// Read + decrypt one server packet (blocking).
     pub fn recv(&mut self) -> Result<ServerPacket> {
-        recv_packet(&mut self.stream, Some(&mut self.decrypter), &self.traffic)
+        recv_packet(&mut &*self.stream, Some(&mut self.decrypter), &self.traffic)
     }
 
     /// Read one packet and decode it into a [`crate::Poll`]; errors only when the socket fails. The
     /// whole body is read before parsing, so an unparseable packet is skipped, the stream aligned.
     pub fn poll(&mut self) -> Result<crate::Poll> {
-        let (opcode, body) = read_frame(&mut self.stream, Some(&mut self.decrypter), &self.traffic)
+        let (opcode, body) = read_frame(&mut &*self.stream, Some(&mut self.decrypter), &self.traffic)
             .map_err(|e| anyhow!("world stream closed: {e}"))?;
         match messages::parse_server_with_tail(opcode, &body) {
             Ok((packet, tail)) => Ok(crate::Poll::Events {

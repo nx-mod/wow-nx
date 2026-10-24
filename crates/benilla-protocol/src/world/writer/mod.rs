@@ -60,7 +60,8 @@ mod vendor;
 /// ([`WorldSession::set_active_mover`](super::WorldSession::set_active_mover)). Positions are raw
 /// WoW yards; `orientation` is radians.
 pub struct WorldWriter {
-    pub(super) stream: TcpStream,
+    /// The socket the reader shares ([`super::WorldReader`]'s `stream`).
+    pub(super) stream: std::sync::Arc<TcpStream>,
     pub(super) encrypter: EncrypterHalf,
     /// The character's faction language, set at login from its race, which a chat send naming no
     /// language carries. vmangos drops the whole message, dot-commands included, when the
@@ -73,7 +74,7 @@ impl WorldWriter {
     /// Frame, encrypt and write one packet: the sole write path every verb goes through.
     fn send(&mut self, opcode: u16, body: &[u8]) -> Result<()> {
         send_packet(
-            &mut self.stream,
+            &mut &*self.stream,
             Some(&mut self.encrypter),
             &self.traffic,
             opcode,

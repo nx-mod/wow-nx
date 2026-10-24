@@ -870,26 +870,24 @@ impl WorldSession {
         self.send(opcode::CMSG_LOOT_RELEASE, &messages::loot_release(guid))
     }
 
-    /// Split into a reader and a writer on cloned sockets, after [`Self::player_login`].
+    /// Split into a reader and a writer sharing the socket, after [`Self::player_login`].
     pub fn into_split(self) -> Result<(WorldReader, WorldWriter)> {
         // A quiet world is legal, so streaming reads block without a timeout.
         self.stream
             .set_read_timeout(None)
             .context("clearing handshake read timeout")?;
-        let read_stream = self
-            .stream
-            .try_clone()
-            .context("cloning world socket for split")?;
+        // Shared, not cloned: `try_clone` is a `dup`, which the Switch's sockets refuse (WorldReader's `stream`).
+        let stream = Arc::new(self.stream);
         let (encrypter, decrypter) = self.crypto.split();
         Ok((
             WorldReader {
-                stream: read_stream,
+                stream: Arc::clone(&stream),
                 decrypter,
                 link: self.link,
                 traffic: Arc::clone(&self.traffic),
             },
             WorldWriter {
-                stream: self.stream,
+                stream,
                 encrypter,
                 chat_language: self.chat_language,
                 traffic: self.traffic,
@@ -903,12 +901,14 @@ impl WorldSession {
     /// no new authentication. The cipher keeps the state each direction reached, and the reads
     /// wait with the handshake's bound again, as every park step awaits one reply.
     pub fn rejoin(reader: WorldReader, writer: WorldWriter) -> Result<Self> {
-        // The read half is a clone of the write half's socket; dropping it closes nothing.
+        // The read half shares the write half's socket; dropped here, the writer holds the only handle.
         let WorldReader {
             decrypter, link, ..
         } = reader;
+        let stream = Arc::try_unwrap(writer.stream)
+            .map_err(|_| anyhow!("rejoining the world session: its socket is still shared"))?;
         let session = WorldSession {
-            stream: writer.stream,
+            stream,
             crypto: HeaderCrypto::join(writer.encrypter, decrypter),
             link,
             traffic: writer.traffic,
