@@ -89,15 +89,39 @@ pub(super) mod stats {
         ticks as f64 / 19_200.0
     }
 
+    /// Every pipeline made, for the start's black hold (`StartHold`).
+    pub static PIPELINES_EVER: AtomicU64 = AtomicU64::new(0);
+
     /// A pipeline made since `started`: its shaders translated and compiled, or read from the SD card's cache.
     pub fn pipeline(started: u64) {
         PIPELINES.fetch_add(1, Relaxed);
+        PIPELINES_EVER.fetch_add(1, Relaxed);
         PIPELINE_TICKS.fetch_add(ticks() - started, Relaxed);
+    }
+
+    /// The overlay's reading (benilla-app's switch.rs): frames a second and GPU ms a frame, as f32 bits, every
+    /// `HUD_FRAMES` presents.
+    static HUD_FPS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    static HUD_GPU: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    static HUD_STARTED: AtomicU64 = AtomicU64::new(0);
+    const HUD_FRAMES: u64 = 15;
+
+    /// Frames a second and GPU ms a frame over the last few frames.
+    pub fn frame_rate() -> (f32, f32) {
+        (f32::from_bits(HUD_FPS.load(Relaxed)), f32::from_bits(HUD_GPU.load(Relaxed)))
     }
 
     pub fn present(shared: &super::Shared) {
         let now = ticks();
         let n = PRESENTS.fetch_add(1, Relaxed) + 1;
+        if n % HUD_FRAMES == 0 {
+            let span = now - HUD_STARTED.swap(now, Relaxed);
+            if n > HUD_FRAMES {
+                let gpu = shared.timing.lock().take_hud_ticks() as f32 * 625.0 / 384.0 / 1e6 / HUD_FRAMES as f32;
+                HUD_FPS.store(((HUD_FRAMES as f64 * 1000.0 / ms(span)) as f32).to_bits(), Relaxed);
+                HUD_GPU.store(gpu.to_bits(), Relaxed);
+            }
+        }
         if n == 1 {
             STARTED.store(now, Relaxed);
             shared.timing.lock().summary(1.0);
@@ -271,7 +295,7 @@ pub(super) struct Shared {
     queue: DkQueue,
     /// A deko3d queue is not thread-safe, and wgpu calls acquire, submit and present from whichever thread asks. It
     /// holds the GPFIFO entries submitted since the GPU was last idle (`Queue::submit`).
-    queue_lock: Mutex<u32>,
+    queue_lock: Mutex<QueueState>,
     zeros: DkMemBlock,
     code: Mutex<CodeMemory>,
     descriptors: Mutex<Descriptors>,
@@ -288,7 +312,7 @@ unsafe impl Sync for Shared {}
 
 impl Shared {
     /// The queue for this thread alone; says so once if another thread had it.
-    fn lock_queue(&self) -> parking_lot::MutexGuard<'_, u32> {
+    fn lock_queue(&self) -> parking_lot::MutexGuard<'_, QueueState> {
         static TOLD: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
         self.queue_lock.try_lock().unwrap_or_else(|| {
             if !TOLD.swap(true, core::sync::atomic::Ordering::Relaxed) {
@@ -404,8 +428,79 @@ pub(super) struct PassTime {
     pub(super) end: u32,
 }
 
+/// The screen, held by whoever must keep frames off it: the system keyboard (a library applet) takes the display, and
+/// a frame queued meanwhile is refused ("failed to enqueue buffer", which deko3d raises as a break). Acquire and
+/// present wait on it, so the render thread stops at a frame boundary while the app holds it.
+static SCREEN: Mutex<()> = parking_lot::const_mutex(());
+
+/// The start's black hold: the first frames build their pipelines as they go, and their scene pops in piece by piece
+/// (a pipeline not ready yet draws nothing). Until no pipeline has been made for `QUIET_FRAMES` presents, or
+/// `MAX_TICKS` have passed, each frame is cleared to black before it is shown.
+struct StartHold {
+    done: bool,
+    first: u64,
+    pipelines: u64,
+    quiet: u32,
+    frames: u32,
+}
+
+static START_HOLD: Mutex<StartHold> =
+    parking_lot::const_mutex(StartHold { done: false, first: 0, pipelines: 0, quiet: 0, frames: 0 });
+
+impl StartHold {
+    const QUIET_FRAMES: u32 = 20;
+    /// 6 s of the 19.2 MHz counter.
+    const MAX_TICKS: u64 = 6 * 19_200_000;
+
+    /// Whether this present is still held black; counts it.
+    fn holding(&mut self) -> bool {
+        if self.done {
+            return false;
+        }
+        let now = stats::ticks();
+        let made = stats::PIPELINES_EVER.load(core::sync::atomic::Ordering::Relaxed);
+        if self.frames == 0 {
+            self.first = now;
+        }
+        self.frames += 1;
+        self.quiet = if made == self.pipelines { self.quiet + 1 } else { 0 };
+        self.pipelines = made;
+        if self.quiet >= Self::QUIET_FRAMES || now - self.first > Self::MAX_TICKS {
+            self.done = true;
+            log::info!("deko3d: the screen shows from frame {} ({:.0} ms after the first)", self.frames, stats::ms(now - self.first));
+            return false;
+        }
+        true
+    }
+}
+
+/// Frames a second and GPU ms a frame over the last few frames, for benilla-app's overlay.
+pub fn frame_rate() -> (f32, f32) {
+    stats::frame_rate()
+}
+
+/// Holds every acquire and present until the guard drops (benilla-app's switch.rs, around the system keyboard).
+pub fn hold_screen() -> parking_lot::MutexGuard<'static, ()> {
+    SCREEN.lock()
+}
+
+/// What starts a pipeline's label among the timed spans, to print pipelines apart from passes.
+pub(super) const PIPELINE_MARK: &str = "@";
+
+/// Whether pipelines are timed too: `WOWNX_GPU_PIPELINES=1` (benilla.env). Off by default, since a report between
+/// draws can hold the GPU's pipeline up a little; the passes are always timed.
+pub(super) static PIPELINE_TIMING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+fn pipeline_timing_asked() -> bool {
+    unsafe extern "C" {
+        fn getenv(name: *const core::ffi::c_char) -> *const core::ffi::c_char;
+    }
+    let value = unsafe { getenv(c"WOWNX_GPU_PIPELINES".as_ptr()) };
+    !value.is_null() && unsafe { core::ffi::CStr::from_ptr(value) }.to_bytes() == b"1"
+}
+
 /// Report slots: a frame's passes take two each, and they are read a frame or two later.
-const TIMING_SLOTS: u32 = 4096;
+const TIMING_SLOTS: u32 = 16384;
 /// deko3d's four-word report: the counter, then the GPU timestamp (dk_variable.cpp, dkCmdBufReportCounter).
 const TIMING_REPORT: u32 = 16;
 
@@ -417,13 +512,15 @@ struct Timing {
     next: u32,
     pending: Vec<(Box<DkFence>, Vec<PassTime>)>,
     totals: Vec<(String, u64)>,
+    /// The passes' ticks since the overlay last read them.
+    hud_ticks: u64,
 }
 
 unsafe impl Send for Timing {}
 
 impl Timing {
     fn new(memory: DkMemBlock) -> Self {
-        Timing { memory, next: 0, pending: Vec::new(), totals: Vec::new() }
+        Timing { memory, next: 0, pending: Vec::new(), totals: Vec::new(), hud_ticks: 0 }
     }
 
     /// The next report slot and its GPU address.
@@ -449,6 +546,9 @@ impl Timing {
             let (_, passes) = self.pending.swap_remove(i);
             for p in passes {
                 let ticks = self.timestamp(p.end).saturating_sub(self.timestamp(p.start));
+                if !p.label.starts_with(PIPELINE_MARK) {
+                    self.hud_ticks += ticks;
+                }
                 match self.totals.iter_mut().find(|(l, _)| *l == p.label) {
                     Some((_, t)) => *t += ticks,
                     None => self.totals.push((p.label, ticks)),
@@ -456,9 +556,13 @@ impl Timing {
             }
         }
         // A ring slot is reused after TIMING_SLOTS reports: submissions that old are not read.
-        if self.pending.len() > 32 {
-            self.pending.drain(..self.pending.len() - 32);
+        if self.pending.len() > 16 {
+            self.pending.drain(..self.pending.len() - 16);
         }
+    }
+
+    fn take_hud_ticks(&mut self) -> u64 {
+        core::mem::take(&mut self.hud_ticks)
     }
 
     /// The costliest passes, in GPU ms a frame, and the sum of all; the totals start again.
@@ -466,12 +570,60 @@ impl Timing {
         let ms = |ticks: u64| ticks as f64 * 625.0 / 384.0 / 1e6 / frames;
         let mut totals = core::mem::take(&mut self.totals);
         totals.sort_by(|a, b| b.1.cmp(&a.1));
-        let sum: u64 = totals.iter().map(|(_, t)| t).sum();
+        let (pipelines, passes): (Vec<_>, Vec<_>) = totals.iter().partition(|(l, _)| l.starts_with(PIPELINE_MARK));
+        let sum: u64 = passes.iter().map(|(_, t)| t).sum();
         let mut out = alloc::format!("GPU {:.2} ms a frame in passes:", ms(sum));
-        for (label, ticks) in totals.iter().take(10) {
+        for (label, ticks) in passes.iter().take(10) {
             out += &alloc::format!(" {label} {:.2}", ms(*ticks));
         }
+        out += "; pipelines:";
+        for (label, ticks) in pipelines.iter().take(12) {
+            out += &alloc::format!(" {} {:.2}", &label[PIPELINE_MARK.len()..], ms(*ticks));
+        }
         out
+    }
+}
+
+/// The GPFIFO entries in the GPU's ring, as far as the CPU knows: added at each submission, acquire and present,
+/// and given back as the fences after them pass. Counting only up until a wait for idle stalled the CPU every few
+/// frames (the ring budget filled with work long done).
+#[derive(Debug, Default)]
+struct QueueState {
+    in_flight: u32,
+    /// Added since the last fence.
+    unfenced: u32,
+    fenced: alloc::collections::VecDeque<(Box<DkFence>, u32)>,
+}
+
+unsafe impl Send for QueueState {}
+
+impl QueueState {
+    fn add(&mut self, entries: u32) {
+        self.in_flight += entries;
+        self.unfenced += entries;
+    }
+
+    /// A fence signalled after everything added so far.
+    fn fenced(&mut self, fence: Box<DkFence>) {
+        self.fenced.push_back((fence, core::mem::take(&mut self.unfenced)));
+    }
+
+    /// Gives back the entries of every fence the GPU has passed.
+    fn reclaim(&mut self) {
+        while let Some((fence, entries)) = self.fenced.front_mut() {
+            if unsafe { dkFenceWait(&mut **fence, 0) } != DkResult::DkResult_Success {
+                break;
+            }
+            self.in_flight = self.in_flight.saturating_sub(*entries);
+            self.fenced.pop_front();
+        }
+    }
+
+    /// The GPU is idle: nothing is in its ring.
+    fn idle(&mut self) {
+        self.in_flight = 0;
+        self.unfenced = 0;
+        self.fenced.clear();
     }
 }
 
@@ -684,7 +836,8 @@ const SURFACE_FORMATS: [wgt::TextureFormat; 2] =
 impl Surface {
     unsafe fn release(&self) {
         if let Some(c) = self.swapchain.lock().take() {
-            let _queue = c._shared.lock_queue();
+            let mut q = c._shared.lock_queue();
+            q.idle();
             unsafe {
                 dkQueueWaitIdle(c.queue);
                 dkSwapchainDestroy(c.dk);
@@ -726,10 +879,10 @@ unsafe fn clear_to_black(shared: &Shared, images: &[DkImage], extent: wgt::Exten
                 dkCmdBufClearColorFloat(cmd, 0, DkColorMask_RGBA, 0.0, 0.0, 0.0, 1.0);
             }
             let list = dkCmdBufFinishList(cmd);
-            let mut in_flight = shared.lock_queue();
+            let mut q = shared.lock_queue();
             dkQueueSubmitCommands(shared.queue, list);
             dkQueueWaitIdle(shared.queue);
-            *in_flight = 0;
+            q.idle();
             dkCmdBufDestroy(cmd);
         }
     }
@@ -799,9 +952,10 @@ impl crate::Surface for Surface {
     ) -> Result<Option<crate::AcquiredSurfaceTexture<Api>>, crate::SurfaceError> {
         let guard = self.swapchain.lock();
         let c = guard.as_ref().ok_or(crate::SurfaceError::Outdated)?;
+        let _screen = SCREEN.lock();
         let slot = {
-            let mut in_flight = c._shared.lock_queue();
-            *in_flight += FLUSH_ENTRIES;
+            let mut q = c._shared.lock_queue();
+            q.add(FLUSH_ENTRIES);
             let started = stats::ticks();
             let slot = unsafe { dkQueueAcquireImage(c.queue, c.dk) };
             stats::ACQUIRE_TICKS.fetch_add(stats::ticks() - started, core::sync::atomic::Ordering::Relaxed);
@@ -839,6 +993,7 @@ impl crate::Adapter for Adapter {
         _limits: &wgt::Limits,
         _memory_hints: &wgt::MemoryHints,
     ) -> DeviceResult<crate::OpenDevice<Api>> {
+        PIPELINE_TIMING.store(pipeline_timing_asked(), core::sync::atomic::Ordering::Relaxed);
         let mut dm = unsafe { core::mem::zeroed::<DkDeviceMaker>() };
         // Depth [0, 1] and an upper-left origin: WebGPU's conventions.
         unsafe { dkDeviceMakerDefaults(&mut dm) };
@@ -870,7 +1025,7 @@ impl crate::Adapter for Adapter {
         let shared = Arc::new(Shared {
             device,
             queue,
-            queue_lock: Mutex::new(0),
+            queue_lock: Mutex::new(QueueState::default()),
             zeros,
             code: Mutex::new(CodeMemory { mem_block: code, used: 0 }),
             descriptors: Mutex::new(Descriptors {
@@ -947,8 +1102,9 @@ impl crate::Queue for Queue {
         (fence, fence_value): (&mut Fence, crate::FenceValue),
     ) -> DeviceResult<()> {
         let queue = self.shared.queue;
-        let mut in_flight = self.shared.lock_queue();
+        let mut q = self.shared.lock_queue();
         let started = stats::ticks();
+        q.reclaim();
         // The GPU's ring holds 2048 GPFIFO entries, libnx's channel as many between kickoffs, and a kickoff that does
         // not fit times out (LibnxNvidiaError_Timeout, "gpu channel kickoff failed"): before a list could overrun
         // them, the GPU is let finish what it has (the wait flushes). Otherwise the submission is one flush, below:
@@ -956,16 +1112,20 @@ impl crate::Queue for Queue {
         // every one (gpu_base.cpp).
         for cb in command_buffers {
             for &(list, entries) in &cb.lists {
-                if *in_flight + entries + FLUSH_ENTRIES > RING_BUDGET {
+                if q.in_flight + entries + FLUSH_ENTRIES > RING_BUDGET {
                     unsafe { dkQueueWaitIdle(queue) };
-                    *in_flight = 0;
+                    q.idle();
                     stats::RING_WAITS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 }
-                *in_flight += entries;
+                q.add(entries);
                 unsafe { dkQueueSubmitCommands(queue, list) };
             }
         }
-        *in_flight += FLUSH_ENTRIES;
+        q.add(FLUSH_ENTRIES);
+        // The entries so far leave the GPU's ring when this fence passes (QueueState::reclaim).
+        let mut through = Box::new(unsafe { core::mem::zeroed::<DkFence>() });
+        unsafe { dkQueueSignalFence(queue, &mut *through, false) };
+        q.fenced(through);
         let passes: Vec<PassTime> = command_buffers.iter().flat_map(|cb| cb.passes.iter()).map(|p| PassTime {
             label: p.label.clone(),
             start: p.start,
@@ -986,7 +1146,7 @@ impl crate::Queue for Queue {
             static SUBMISSIONS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
             let n = SUBMISSIONS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             unsafe { dkQueueWaitIdle(queue) };
-            *in_flight = 0;
+            q.idle();
             if unsafe { dkQueueIsInErrorState(queue) } {
                 log::error!("deko3d: the GPU faulted in submission {n} ({} command buffers)", command_buffers.len());
             }
@@ -1000,10 +1160,17 @@ impl crate::Queue for Queue {
         let guard = surface.swapchain.lock();
         let c = guard.as_ref().ok_or(crate::SurfaceError::Outdated)?;
         let slot = texture.slot.ok_or(crate::SurfaceError::Other("not a surface texture"))?;
-        let mut in_flight = c._shared.lock_queue();
-        *in_flight += FLUSH_ENTRIES;
+        let screen = SCREEN.lock();
+        if START_HOLD.lock().holding() {
+            if let Some(image) = c.images.get(slot as usize) {
+                unsafe { clear_to_black(&c._shared, core::slice::from_ref(image), c.size) };
+            }
+        }
+        let mut q = c._shared.lock_queue();
+        q.add(FLUSH_ENTRIES);
         unsafe { dkQueuePresentImage(c.queue, c.dk, slot) };
-        drop(in_flight);
+        drop(screen);
+        drop(q);
         c._shared.timing.lock().collect();
         stats::present(&c._shared);
         Ok(())

@@ -36,7 +36,14 @@ struct DrawState {
     compute: bool,
     /// Multisampled targets and where the pass resolves them, at its end.
     resolves: Vec<(DkImageView, DkImageView)>,
+    /// The texture and image handles this encoding last bound, by stage (`DkStage`) and slot: a slot is bound
+    /// again only when its handle changes. Unknown at the start of an encoding, whose lists may follow anyone's.
+    bound_textures: [[Option<DkResHandle>; DK_NUM_TEXTURE_BINDINGS as usize]; STAGES],
+    bound_images: [[Option<DkResHandle>; DK_NUM_IMAGE_BINDINGS as usize]; STAGES],
 }
+
+/// deko3d's stages, vertex to compute.
+const STAGES: usize = 6;
 
 /// Command memory of one encoder: deko3d asks for more through `add_memory`.
 #[derive(Debug)]
@@ -77,6 +84,8 @@ pub struct CommandEncoder {
     /// The passes timed in this encoding, and the one open (its label and start slot).
     passes: Vec<super::PassTime>,
     open_pass: Option<(alloc::string::String, u32)>,
+    /// The pipeline drawing since its bind, timed like a pass (its label prefixed `PIPELINE_MARK`).
+    open_pipeline: Option<(alloc::string::String, u32)>,
 }
 
 unsafe impl Send for CommandEncoder {}
@@ -128,6 +137,7 @@ impl CommandEncoder {
             state: DrawState::default(),
             passes: Vec::new(),
             open_pass: None,
+            open_pipeline: None,
         })
     }
 
@@ -181,17 +191,27 @@ impl CommandEncoder {
         }
         self.state.textures_dirty = false;
         let c = self.cmd();
-        let e = &self.state;
-        for &stage in self.stages() {
+        let stages = self.stages();
+        let e = &mut self.state;
+        for &stage in stages {
+            let s = stage as usize;
             for &(t, m) in &e.sampling.textures {
                 let image = e.textures.get(t as usize).copied().flatten().unwrap_or(0);
                 let sampler = m.and_then(|m| e.samplers.get(m as usize).copied().flatten()).unwrap_or(0);
                 let h = unsafe { dkMakeTextureHandle(image, sampler) };
-                unsafe { dkCmdBufBindTextures(c, stage, t as u32, &h, 1) };
+                let Some(bound) = e.bound_textures[s].get_mut(t as usize) else { continue };
+                if *bound != Some(h) {
+                    *bound = Some(h);
+                    unsafe { dkCmdBufBindTextures(c, stage, t as u32, &h, 1) };
+                }
             }
             for &i in &e.sampling.images {
                 let h = unsafe { dkMakeImageHandle(e.images.get(i as usize).copied().flatten().unwrap_or(0)) };
-                unsafe { dkCmdBufBindImages(c, stage, i as u32, &h, 1) };
+                let Some(bound) = e.bound_images[s].get_mut(i as usize) else { continue };
+                if *bound != Some(h) {
+                    *bound = Some(h);
+                    unsafe { dkCmdBufBindImages(c, stage, i as u32, &h, 1) };
+                }
             }
         }
     }
@@ -251,7 +271,25 @@ impl CommandEncoder {
         self.open_pass = Some((label.unwrap_or("unlabelled").into(), start));
     }
 
+    /// A pipeline's draws from its bind to the next bind or the pass's end, under the pipeline's label.
+    fn begin_pipeline_timing(&mut self, label: &str) {
+        if !super::PIPELINE_TIMING.load(core::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        self.end_pipeline_timing();
+        let start = self.timestamp();
+        self.open_pipeline = Some((alloc::format!("{}{label}", super::PIPELINE_MARK), start));
+    }
+
+    fn end_pipeline_timing(&mut self) {
+        if let Some((label, start)) = self.open_pipeline.take() {
+            let end = self.timestamp();
+            self.passes.push(super::PassTime { label, start, end });
+        }
+    }
+
     fn end_timing(&mut self) {
+        self.end_pipeline_timing();
         if let Some((label, start)) = self.open_pass.take() {
             let end = self.timestamp();
             self.passes.push(super::PassTime { label, start, end });
@@ -362,6 +400,7 @@ impl crate::CommandEncoder for CommandEncoder {
         self.state = DrawState::default();
         self.passes.clear();
         self.open_pass = None;
+        self.open_pipeline = None;
         Ok(())
     }
     unsafe fn discard_encoding(&mut self) {
@@ -373,6 +412,7 @@ impl crate::CommandEncoder for CommandEncoder {
         self.barrier_pending = false;
         self.passes.clear();
         self.open_pass = None;
+        self.open_pipeline = None;
     }
     unsafe fn end_encoding(&mut self) -> DeviceResult<CommandBuffer> {
         if self.barrier_pending {
@@ -622,6 +662,7 @@ impl crate::CommandEncoder for CommandEncoder {
         let c = self.cmd();
         let group_layout = &layout.groups[index as usize];
         let mut offsets = dynamic_offsets.iter();
+        let mut textures = false;
         for r in group.resources.iter() {
             let slot = (group_layout.slots[r.binding as usize] + r.array_index) as u32;
             let dynamic_offset = |dynamic: bool, d: &mut core::slice::Iter<'_, u32>| {
@@ -641,23 +682,27 @@ impl crate::CommandEncoder for CommandEncoder {
                     }
                 }
                 Kind::SampledTexture { descriptor } => {
+                    textures = true;
                     if let Some(t) = self.state.textures.get_mut(slot as usize) {
                         *t = Some(descriptor);
                     }
                 }
                 Kind::StorageImage { descriptor } => {
+                    textures = true;
                     if let Some(t) = self.state.images.get_mut(slot as usize) {
                         *t = Some(descriptor);
                     }
                 }
                 Kind::BoundSampler { descriptor } => {
+                    textures = true;
                     if let Some(t) = self.state.samplers.get_mut(slot as usize) {
                         *t = Some(descriptor);
                     }
                 }
             }
         }
-        self.state.textures_dirty = true;
+        // A group of uniforms alone (Bevy's view and mesh groups, at every draw) leaves the textures bound.
+        self.state.textures_dirty |= textures;
     }
     unsafe fn set_push_constants(&mut self, layout: &PipelineLayout, stages: wgt::ShaderStages, offset_bytes: u32, data: &[u32]) {
         let c = self.cmd();
@@ -673,6 +718,7 @@ impl crate::CommandEncoder for CommandEncoder {
     unsafe fn end_debug_marker(&mut self) {}
 
     unsafe fn set_render_pipeline(&mut self, p: &RenderPipeline) {
+        self.begin_pipeline_timing(&p.label);
         let c = self.cmd();
         let mut shaders: arrayvec::ArrayVec<*const DkShader, 2> = arrayvec::ArrayVec::new();
         shaders.push(&*p.vs.shader);
@@ -844,6 +890,7 @@ impl crate::CommandEncoder for CommandEncoder {
     }
 
     unsafe fn set_compute_pipeline(&mut self, p: &ComputePipeline) {
+        self.begin_pipeline_timing(&p.label);
         let c = self.cmd();
         let cs: *const DkShader = &*p.cs.shader;
         unsafe { dkCmdBufBindShaders(c, DkStageFlag_Compute, &cs, 1) };

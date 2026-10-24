@@ -111,6 +111,8 @@ pub struct RenderPipeline {
     pub(super) stencil: (u8, u8),
     pub(super) attribs: Vec<DkVtxAttribState>,
     pub(super) vertex_buffers: Vec<DkVtxBufferState>,
+    /// Its label, for the per-pipeline GPU times (`CommandEncoder::begin_pipeline_timing`).
+    pub(super) label: alloc::string::String,
 }
 
 #[derive(Debug)]
@@ -118,6 +120,7 @@ pub struct ComputePipeline {
     pub(super) cs: CompiledStage,
     pub(super) push_constants: bool,
     pub(super) sampling: Sampling,
+    pub(super) label: alloc::string::String,
 }
 
 unsafe impl Send for RenderPipeline {}
@@ -482,6 +485,7 @@ impl super::Device {
             stencil,
             attribs,
             vertex_buffers: buffer_states,
+            label: desc.label.unwrap_or("unlabelled").into(),
         })
     }
 
@@ -495,6 +499,7 @@ impl super::Device {
             push_constants: g.contains("_push_constant_binding_"),
             cs: self.compile(&g, naga::ShaderStage::Compute)?,
             sampling,
+            label: desc.label.unwrap_or("unlabelled").into(),
         })
     }
 }
