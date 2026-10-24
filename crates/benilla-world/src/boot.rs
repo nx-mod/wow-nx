@@ -83,7 +83,8 @@ pub fn tuned_default_plugins(primary_window: Window) -> PluginGroupBuilder {
             ..default()
         })
         .set(bevy::log::LogPlugin {
-            filter: "wgpu=error,naga=warn".into(),
+            // (wgpu_hal::gles is the Switch's deko3d backend: its frame statistics are info)
+            filter: "wgpu=error,wgpu_hal::gles=info,naga=warn".into(),
             custom_layer: |_| {
                 // Created, not appended: appending fails on the Switch's SD card.
                 let f = std::fs::File::create("sdmc:/wow-nx/benilla.txt").ok()?;

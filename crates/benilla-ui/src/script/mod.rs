@@ -1496,6 +1496,27 @@ impl UiScript {
             .is_some_and(|h| model.arena.frame(h).is_some_and(|f| f.effective_visible))
     }
 
+    /// wow-nx: the focused EditBox's frame id, for [`Self::focused_editbox_text`].
+    pub fn focused_editbox_id(&self) -> Option<u32> {
+        let model = self.model_ref();
+        model.frame_to_id.get(&model.focused_editbox?).copied()
+    }
+
+    /// wow-nx: the focused visible EditBox's text and whether it is a password box, if the frame `id` is that box:
+    /// the Switch opens its system keyboard on a tap on the box, and types the result in (benilla-app's switch.rs).
+    pub fn focused_editbox_text(&self, id: u32) -> Option<(String, bool)> {
+        let model = self.model_ref();
+        let h = model.focused_editbox?;
+        if model.frame_to_id.get(&h) != Some(&id) {
+            return None;
+        }
+        let f = model.arena.frame(h)?;
+        match &f.kind_state {
+            crate::widget::KindState::EditBox(eb) if f.effective_visible => Some((eb.text.clone(), eb.password)),
+            _ => None,
+        }
+    }
+
     /// The focused EditBox's name, unfiltered by visibility, unlike [`Self::has_keyboard_focus`].
     /// Host-side only: 1.12's EditBox table has `SetFocus`/`ClearFocus` and no getter.
     pub fn focused_editbox_name(&self) -> Option<String> {

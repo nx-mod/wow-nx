@@ -52,6 +52,7 @@ impl Plugin for SwitchPlugin {
         app.add_systems(PreUpdate, give_window_handle)
             .add_systems(PostUpdate, pin_window)
             .add_systems(PreUpdate, input::read.before(bevy::input::InputSystems))
+            .add_systems(Update, input::system_keyboard.after(crate::ui_script::UiInput))
             .init_non_send_resource::<input::Hid>()
             .set_runner(run);
     }
@@ -105,21 +106,44 @@ fn pin_window(mut windows: Query<&mut Window>) {
 }
 
 /// Steps the app inside libnx's applet loop.
+///
+/// The process ends on the exit frame, with no teardown: dropping the world (its assets, the GPU's objects) took
+/// seconds, and the system frees all of it anyway (benilla-horizon's exit). The exit frame has saved the config,
+/// and the log file is written unbuffered.
 fn run(mut app: App) -> AppExit {
+    let started = std::time::Instant::now();
     while app.plugins_state() == bevy::app::PluginsState::Adding {
         bevy::tasks::tick_global_task_pools_on_main_thread();
     }
+    info!("switch: plugins ready at {} ms", started.elapsed().as_millis());
     app.finish();
     app.cleanup();
-    loop {
+    info!("switch: plugins finished at {} ms", started.elapsed().as_millis());
+    let mut frames = 0u32;
+    let exit = loop {
         if !unsafe { appletMainLoop() } {
-            return AppExit::Success;
+            break AppExit::Success;
         }
         app.update();
-        if let Some(exit) = app.should_exit() {
-            return exit;
+        frames += 1;
+        if frames == 1 || frames == 2 || frames == 60 {
+            info!("switch: frame {frames} done at {} ms", started.elapsed().as_millis());
         }
+        if let Some(exit) = app.should_exit() {
+            break exit;
+        }
+    };
+    info!("switch: exit after {frames} frames");
+    // The render thread (pipelined rendering) may be presenting: take the render world back, which waits for its
+    // frame, so nothing draws while the exit closes the display and GPU services under it.
+    if let Some(mut channels) = app.world_mut().remove_resource::<bevy::render::pipelined_rendering::RenderAppChannels>() {
+        let render_app = bevy::tasks::block_on(channels.recv());
+        core::mem::forget((channels, render_app));
     }
+    std::process::exit(match exit {
+        AppExit::Success => 0,
+        AppExit::Error(code) => code.get().into(),
+    })
 }
 
 /// libnx's HID, as the events winit would send: a USB keyboard and mouse pass straight through; touch moves the
@@ -133,6 +157,9 @@ fn run(mut app: App) -> AppExit {
 /// | X | Tab | | Y | 1 |
 /// | L / R | Q / E | | + | Enter |
 /// | D-pad up, right, down, left | 2, 3, 4, 5 | | − | M |
+/// | right stick press | the system keyboard, for the focused text box | | | |
+///
+/// A tap or click on a text box opens the system keyboard too ([`input::system_keyboard`]).
 mod input {
     use bevy::input::keyboard::{Key, KeyCode, KeyboardInput, NativeKey};
     use bevy::input::mouse::{MouseButton, MouseButtonInput, MouseMotion, MouseScrollUnit, MouseWheel};
@@ -224,6 +251,7 @@ mod input {
     const UP: u64 = 1 << 13;
     const RIGHT: u64 = 1 << 14;
     const DOWN: u64 = 1 << 15;
+    const STICK_R: u64 = 1 << 5;
     /// Buttons that play a key.
     const KEYS: [(u64, KeyCode); 10] = [
         (A, KeyCode::Space),
@@ -253,6 +281,10 @@ mod input {
         touching: bool,
         cursor: Vec2,
         last_mouse: (i32, i32),
+        /// A left press this frame (a tap, ZR, the mouse), and the right stick pressed in: either may open the
+        /// system keyboard.
+        tapped: bool,
+        keyboard_asked: bool,
     }
 
     impl Default for Hid {
@@ -275,6 +307,8 @@ mod input {
                 touching: false,
                 cursor: Vec2::new(640.0, 360.0),
                 last_mouse: (0, 0),
+                tapped: false,
+                keyboard_asked: false,
             }
         }
     }
@@ -355,6 +389,9 @@ mod input {
                 buttons.write(MouseButtonInput { button, state, window });
             }
         }
+        let pressed = held & !hid.pad_buttons;
+        hid.tapped = pressed & ZR != 0;
+        hid.keyboard_asked = pressed & STICK_R != 0;
         hid.pad_buttons = held;
         let tilt = |v: i32| if v.abs() > DEAD / 2 { v as f32 / 32767.0 } else { 0.0 };
         let (rx, ry) = (tilt(rs[0]), -tilt(rs[1]));
@@ -379,6 +416,7 @@ mod input {
             for (bit, button) in [(1, MouseButton::Left), (2, MouseButton::Right), (4, MouseButton::Middle)] {
                 if (m.buttons ^ hid.mouse_buttons) & bit != 0 {
                     let state = if m.buttons & bit != 0 { ButtonState::Pressed } else { ButtonState::Released };
+                    hid.tapped |= bit == 1 && state == ButtonState::Pressed;
                     buttons.write(MouseButtonInput { button, state, window });
                 }
             }
@@ -410,12 +448,50 @@ mod input {
                 let state = if touching { ButtonState::Pressed } else { ButtonState::Released };
                 buttons.write(MouseButtonInput { button: MouseButton::Left, state, window });
                 hid.touching = touching;
+                hid.tapped |= touching;
             }
         }
 
         if hid.cursor != start || win.cursor_position().is_none() {
             win.set_cursor_position(Some(hid.cursor));
             moved.write(CursorMoved { window, position: hid.cursor, delta: Some(hid.cursor - start) });
+        }
+    }
+
+    unsafe extern "C" {
+        /// benilla-horizon's keyboard.c.
+        fn wownx_keyboard(initial: *const core::ffi::c_char, password: i32, out: *mut u8, size: usize) -> i32;
+    }
+
+    /// The system keyboard for the focused text box: on a tap on the box, after the UI pass has given it the focus,
+    /// or on the right stick pressed in. What the player typed replaces the box's text, typed in as a paste is, so
+    /// the box's own rules and events apply.
+    pub(super) fn system_keyboard(
+        mut hid: NonSendMut<Hid>,
+        script: Option<NonSendMut<benilla_ui::script::UiScript>>,
+        hover: Res<crate::ui_script::PlayerUiHover>,
+    ) {
+        let (tapped, asked) = (core::mem::take(&mut hid.tapped), core::mem::take(&mut hid.keyboard_asked));
+        let Some(mut script) = script else { return };
+        if !tapped && !asked {
+            return;
+        }
+        // A tap opens it over the box only; the stick, over whichever box has the focus.
+        let target = if tapped && !asked { hover.0 } else { script.focused_editbox_id() };
+        let Some((text, password)) = target.and_then(|id| script.focused_editbox_text(id)) else { return };
+        let initial = std::ffi::CString::new(text).unwrap_or_default();
+        let mut out = [0u8; 512];
+        if unsafe { wownx_keyboard(initial.as_ptr(), password as i32, out.as_mut_ptr(), out.len()) } == 0 {
+            return;
+        }
+        let end = out.iter().position(|&b| b == 0).unwrap_or(out.len());
+        let typed = String::from_utf8_lossy(&out[..end]).into_owned();
+        use benilla_ui::script::{EditAction, EditUnit};
+        script.editbox_action(EditAction::SelectAll);
+        if typed.is_empty() {
+            script.editbox_action(EditAction::Delete { unit: EditUnit::Char, back: true });
+        } else {
+            script.paste(&typed);
         }
     }
 

@@ -1,8 +1,10 @@
-//! On the Switch: tls.c, which makes Rust's thread-locals work under libnx, and kickoff.c, which reports a failed GPU
-//! kickoff (both whole-archive, so their constructor and link-time wrappers are linked even though nothing names them).
+//! On the Switch: tls.c, which makes Rust's thread-locals work under libnx; kickoff.c, which reports a failed GPU
+//! kickoff; keyboard.c, the system keyboard (whole-archive, so the constructor and link-time wrappers are linked even
+//! though nothing names them).
 fn main() {
     println!("cargo:rerun-if-changed=tls.c");
     println!("cargo:rerun-if-changed=kickoff.c");
+    println!("cargo:rerun-if-changed=keyboard.c");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("horizon") {
         return;
     }
@@ -10,6 +12,7 @@ fn main() {
     cc::Build::new()
         .file("tls.c")
         .file("kickoff.c")
+        .file("keyboard.c")
         .include(format!("{devkitpro}/libnx/include"))
         .cargo_metadata(false)
         .compile("wownx_tls");
