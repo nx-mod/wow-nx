@@ -26,7 +26,27 @@ unsafe extern "C" {
 
 /// Before anything reads the environment: the SD card paths and settings.
 pub(crate) fn prepare() {
+    since_start_ms();
+    unsafe extern "C" {
+        /// benilla-horizon's screen.c.
+        fn wownx_black_screen();
+    }
+    unsafe { wownx_black_screen() };
     let _ = std::fs::create_dir_all("sdmc:/wow-nx");
+    // A panic aborts (the target's panic strategy), and newlib's abort leaves through libnx's exit: no crash report,
+    // and the message went to a stderr nothing reads. The first panic's message, place and thread go to
+    // sdmc:/wow-nx/panic.txt (created: appending fails on the SD card) and to the log.
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        static FIRST: std::sync::Once = std::sync::Once::new();
+        let thread = std::thread::current().name().unwrap_or("unnamed").to_owned();
+        let text = format!("panic on thread {thread}: {info}\n");
+        FIRST.call_once(|| {
+            let _ = std::fs::write("sdmc:/wow-nx/panic.txt", &text);
+        });
+        error!("{text}");
+        previous(info);
+    }));
     if let Ok(text) = std::fs::read_to_string("sdmc:/wow-nx/benilla.env") {
         for line in text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
             if let Some((k, v)) = line.split_once('=') {
@@ -45,6 +65,27 @@ pub(crate) fn prepare() {
     }
 }
 
+/// When the process started, for the start's timings.
+static STARTED: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+fn since_start_ms() -> u128 {
+    STARTED.get_or_init(std::time::Instant::now).elapsed().as_millis()
+}
+
+/// A mark in the plugin order: its `finish` logs the time, so the log shows which plugins' `finish` took the start's
+/// seconds (lib.rs places them).
+pub(crate) struct FinishMark(pub(crate) &'static str);
+
+impl Plugin for FinishMark {
+    fn build(&self, _app: &mut App) {}
+    fn finish(&self, _app: &mut App) {
+        info!("switch: finish reached the {} mark at {} ms", self.0, since_start_ms());
+    }
+    fn is_unique(&self) -> bool {
+        false
+    }
+}
+
 pub(crate) struct SwitchPlugin;
 
 impl Plugin for SwitchPlugin {
@@ -53,6 +94,7 @@ impl Plugin for SwitchPlugin {
             .add_systems(PostUpdate, pin_window)
             .add_systems(PreUpdate, input::read.before(bevy::input::InputSystems))
             .add_systems(Update, input::system_keyboard.after(crate::ui_script::UiInput))
+            .add_systems(Update, input::fps_overlay.in_set(crate::ui_pass::UiQuadAppend))
             .init_non_send_resource::<input::Hid>()
             .set_runner(run);
     }
@@ -115,10 +157,11 @@ fn run(mut app: App) -> AppExit {
     while app.plugins_state() == bevy::app::PluginsState::Adding {
         bevy::tasks::tick_global_task_pools_on_main_thread();
     }
-    info!("switch: plugins ready at {} ms", started.elapsed().as_millis());
+    info!("switch: plugins ready at {} ms (process {} ms)", started.elapsed().as_millis(), since_start_ms());
     app.finish();
-    app.cleanup();
     info!("switch: plugins finished at {} ms", started.elapsed().as_millis());
+    app.cleanup();
+    info!("switch: plugins cleaned up at {} ms", started.elapsed().as_millis());
     let mut frames = 0u32;
     let exit = loop {
         if !unsafe { appletMainLoop() } {
@@ -157,7 +200,7 @@ fn run(mut app: App) -> AppExit {
 /// | X | Tab | | Y | 1 |
 /// | L / R | Q / E | | + | Enter |
 /// | D-pad up, right, down, left | 2, 3, 4, 5 | | − | M |
-/// | right stick press | the system keyboard, for the focused text box | | | |
+/// | right stick press | the system keyboard, for the focused text box | | both sticks pressed | the fps overlay |
 ///
 /// A tap or click on a text box opens the system keyboard too ([`input::system_keyboard`]).
 mod input {
@@ -251,6 +294,7 @@ mod input {
     const UP: u64 = 1 << 13;
     const RIGHT: u64 = 1 << 14;
     const DOWN: u64 = 1 << 15;
+    const STICK_L: u64 = 1 << 4;
     const STICK_R: u64 = 1 << 5;
     /// Buttons that play a key.
     const KEYS: [(u64, KeyCode); 10] = [
@@ -285,6 +329,8 @@ mod input {
         /// system keyboard.
         tapped: bool,
         keyboard_asked: bool,
+        /// The fps overlay ([`fps_overlay`]), both sticks pressed together.
+        pub(super) overlay: bool,
     }
 
     impl Default for Hid {
@@ -309,6 +355,7 @@ mod input {
                 last_mouse: (0, 0),
                 tapped: false,
                 keyboard_asked: false,
+                overlay: false,
             }
         }
     }
@@ -391,7 +438,12 @@ mod input {
         }
         let pressed = held & !hid.pad_buttons;
         hid.tapped = pressed & ZR != 0;
-        hid.keyboard_asked = pressed & STICK_R != 0;
+        let sticks = STICK_L | STICK_R;
+        if held & sticks == sticks && pressed & sticks != 0 {
+            hid.overlay = !hid.overlay;
+        } else {
+            hid.keyboard_asked = pressed & STICK_R != 0 && held & STICK_L == 0;
+        }
         hid.pad_buttons = held;
         let tilt = |v: i32| if v.abs() > DEAD / 2 { v as f32 / 32767.0 } else { 0.0 };
         let (rx, ry) = (tilt(rs[0]), -tilt(rs[1]));
@@ -481,7 +533,13 @@ mod input {
         let Some((text, password)) = target.and_then(|id| script.focused_editbox_text(id)) else { return };
         let initial = std::ffi::CString::new(text).unwrap_or_default();
         let mut out = [0u8; 512];
-        if unsafe { wownx_keyboard(initial.as_ptr(), password as i32, out.as_mut_ptr(), out.len()) } == 0 {
+        // The applet takes the screen, and the display refuses a frame the render thread queues meanwhile ("failed
+        // to enqueue buffer", which deko3d raises as a break): the render thread waits at its next acquire or present
+        // while the screen is held.
+        let screen = wgpu_hal::gles::hold_screen();
+        let confirmed = unsafe { wownx_keyboard(initial.as_ptr(), password as i32, out.as_mut_ptr(), out.len()) } != 0;
+        drop(screen);
+        if !confirmed {
             return;
         }
         let end = out.iter().position(|&b| b == 0).unwrap_or(out.len());
@@ -493,6 +551,62 @@ mod input {
         } else {
             script.paste(&typed);
         }
+    }
+
+    /// The fps overlay, top left: frames a second, ms a frame, and the GPU's ms a frame (the deko3d backend's pass
+    /// timestamps). Drawn on the player-UI quad pass as the dev build's pill is, laid out again four times a second.
+    pub(super) fn fps_overlay(
+        hid: NonSend<Hid>,
+        time: Res<Time<bevy::time::Real>>,
+        atlas: Option<Res<crate::ui_text::UiFontAtlas>>,
+        mut quads: ResMut<crate::ui_pass::UiQuads>,
+        mut cache: Local<(f32, Vec<crate::ui_pass::UiQuad>)>,
+    ) {
+        if !hid.overlay {
+            return;
+        }
+        let Some(atlas) = atlas else { return };
+        let now = time.elapsed_secs();
+        if cache.1.is_empty() || now - cache.0 >= 0.25 {
+            let (fps, gpu) = wgpu_hal::gles::frame_rate();
+            let ms = if fps > 0.0 { 1000.0 / fps } else { 0.0 };
+            let text = format!("{fps:.0} fps  {ms:.1} ms  GPU {gpu:.1} ms");
+            let mut e = atlas.lock();
+            let glyphs = crate::ui_text::layout_text_quads(
+                &mut e,
+                &text,
+                Rect::from_corners(Vec2::new(10.0, 6.0), Vec2::new(400.0, 26.0)),
+                [0.92, 0.92, 0.92, 1.0],
+                crate::ui_text::Justify {
+                    h: benilla_ui::script::JustifyH::Left,
+                    v: benilla_ui::script::JustifyV::Middle,
+                },
+                u128::MAX,
+                crate::ui_text::FontSpec {
+                    path: None,
+                    height: Some(14.0),
+                    outline: benilla_ui::script::Outline::None,
+                    monochrome: false,
+                    spacing: 0.0,
+                    shadow_x: 0.0,
+                    alpha_gradient: None,
+                    non_space_wrap: false,
+                    max_lines: 0,
+                },
+                crate::ui_text::TextSeat::Exact,
+            );
+            drop(e);
+            let bounds = glyphs.iter().map(|q| q.rect).reduce(|a, b| a.union(b)).unwrap_or(Rect::default());
+            let mut out = vec![crate::ui_pass::UiQuad {
+                rect: Rect::new(bounds.min.x - 6.0, bounds.min.y - 3.0, bounds.max.x + 6.0, bounds.max.y + 3.0),
+                z_key: u128::MAX - 1,
+                color: [0.0, 0.0, 0.0, 224.0 / 255.0],
+                ..Default::default()
+            }];
+            out.extend(glyphs);
+            *cache = (now, out);
+        }
+        quads.overlays.extend(cache.1.iter().cloned());
     }
 
     /// The key a code means on a US layout, and its text.

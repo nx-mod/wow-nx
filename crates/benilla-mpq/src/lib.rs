@@ -322,8 +322,28 @@ impl ArchiveFile {
         }
         let sector_count = self.size.div_ceil(self.sector_size);
         let mut out = Vec::with_capacity(capped(self.size, 1, self.avail));
+        // wow-nx: the sectors' whole compressed span in one read, then decoded from memory. Each read is a file
+        // system request, and on the Switch a request costs: a seek and a read per 4 KiB sector made the start's
+        // tables tens of thousands of them. Offsets out of order fall back to the sector-by-sector reads.
+        let offsets = self.offsets.as_deref().unwrap_or_default();
+        let span = match (offsets.first(), offsets.get(sector_count)) {
+            (Some(&first), Some(&last)) if last >= first && offsets[..=sector_count].is_sorted() => {
+                Some((first, (last - first) as usize))
+            }
+            _ => None,
+        };
+        let Some((first, len)) = span.filter(|&(_, len)| capped(len, 1, self.avail) == len) else {
+            for i in 0..sector_count {
+                out.extend_from_slice(&self.decode_sector(i)?);
+            }
+            return Ok(out);
+        };
+        self.file.seek(SeekFrom::Start(self.base + u64::from(first)))?;
+        let mut raw = vec![0u8; len]; // proven <= avail just above
+        self.file.read_exact(&mut raw)?;
         for i in 0..sector_count {
-            out.extend_from_slice(&self.decode_sector(i)?);
+            let (start, end) = (offsets[i] - first, offsets[i + 1] - first);
+            out.extend_from_slice(&self.inflate_sector(i, raw[start as usize..end as usize].to_vec())?);
         }
         Ok(out)
     }
@@ -332,7 +352,6 @@ impl ArchiveFile {
     /// the sector size, or the remainder for the last. One that inflates short is refused, since
     /// every later byte would shift into the gap.
     fn decode_sector(&mut self, i: usize) -> Result<Vec<u8>> {
-        let want = (self.size - i * self.sector_size).min(self.sector_size);
         let name = &self.name;
         let offsets = self.offsets.as_deref().unwrap_or_default();
         let (Some(&start), Some(&end)) = (offsets.get(i), offsets.get(i + 1)) else {
@@ -358,7 +377,17 @@ impl ArchiveFile {
             .seek(SeekFrom::Start(self.base + u64::from(start)))?;
         let mut raw = vec![0u8; comp_len]; // proven <= avail above
         self.file.read_exact(&mut raw)?;
+        self.inflate_sector(i, raw)
+    }
 
+    /// Sector `i`'s compressed bytes, decompressed to exactly its share of the file.
+    fn inflate_sector(&self, i: usize, mut raw: Vec<u8>) -> Result<Vec<u8>> {
+        let want = (self.size - i * self.sector_size).min(self.sector_size);
+        let name = &self.name;
+        let comp_len = raw.len();
+        if comp_len == 0 {
+            return Err(Error::Corrupt(format!("{name}: sector {i} is empty")));
+        }
         let out = if comp_len >= want {
             // A sector that would not shrink is stored verbatim.
             raw.truncate(want);

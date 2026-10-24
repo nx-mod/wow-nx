@@ -235,6 +235,27 @@ pub fn config_dir() -> Option<std::path::PathBuf> {
 /// What a crate on top of benilla adds to the built app ([`run_with`]).
 type Extension<'a> = Box<dyn FnOnce(&mut App) + 'a>;
 
+/// wow-nx: the start's timing marks (`switch::FinishMark`), nothing off the Switch.
+mod switch_marks {
+    #[cfg(target_os = "horizon")]
+    pub(super) fn mark(name: &'static str) -> super::switch::FinishMark {
+        super::switch::FinishMark(name)
+    }
+    #[cfg(not(target_os = "horizon"))]
+    pub(super) struct Nothing;
+    #[cfg(not(target_os = "horizon"))]
+    impl bevy::app::Plugin for Nothing {
+        fn build(&self, _app: &mut bevy::app::App) {}
+        fn is_unique(&self) -> bool {
+            false
+        }
+    }
+    #[cfg(not(target_os = "horizon"))]
+    pub(super) fn mark(_: &'static str) -> Nothing {
+        Nothing
+    }
+}
+
 /// The one body behind [`run`] and [`run_with`], not generic, so a launcher compiles none of it.
 fn launch(build: BuildId, extend: Option<Extension<'_>>) -> AppExit {
     #[cfg(target_os = "horizon")]
@@ -415,6 +436,8 @@ fn launch(build: BuildId, extend: Option<Extension<'_>>) -> AppExit {
         ..default()
     }))
     .add_plugins(benilla_world::thread_qos::ThreadQosPlugin)
+    // wow-nx: where the Switch's slow start goes, one log line per mark as `finish` reaches it.
+    .add_plugins(switch_marks::mark("default plugins"))
     // Undoes winit's forced macOS app activation for background runs; the window-side half is the
     // `Window` above.
     .add_plugins(benilla_world::bgwin::BgWinPlugin)
@@ -426,6 +449,7 @@ fn launch(build: BuildId, extend: Option<Extension<'_>>) -> AppExit {
     // The engine as one group; `world_plugins.rs` has its load-bearing ordering edges and what it
     // leaves out (`pipe_warm`).
     .add_plugins(benilla_world::world_plugins::WorldPlugins)
+    .add_plugins(switch_marks::mark("world plugins"))
     // The instruments, which the engine group does not carry; `--no-default-features` compiles them
     // all out (see `dev.rs`).
     .add_plugins(dev::DevToolsPlugin)
@@ -475,6 +499,7 @@ fn launch(build: BuildId, extend: Option<Extension<'_>>) -> AppExit {
     app.add_plugins(dev::DevProbesPlugin);
 
     #[cfg(target_os = "horizon")]
+    app.add_plugins(switch_marks::mark("game plugins"));
     app.add_plugins(switch::SwitchPlugin);
 
     // Returns the app's exit status: a failed capture sets `AppExit::error()`

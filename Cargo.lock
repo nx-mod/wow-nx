@@ -542,6 +542,7 @@ dependencies = [
  "symphonia",
  "toml",
  "wgpu",
+ "wgpu-hal",
  "windows-sys 0.59.0",
  "winit",
  "zeno",

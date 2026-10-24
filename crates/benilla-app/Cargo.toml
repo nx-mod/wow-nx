@@ -89,6 +89,9 @@ smithay-clipboard = "0.7"
 [target.'cfg(target_os = "horizon")'.dependencies]
 raw-window-handle = "0.6"
 benilla-horizon = { path = "../benilla-horizon" }
+# Our deko3d backend's hooks (the screen lock around the system keyboard, frame statistics); the version the
+# workspace patches in, features as wgpu asks for them.
+wgpu-hal = { version = "27", default-features = false }
 
 [target.'cfg(not(target_os = "horizon"))'.dependencies]
 arboard = "3"
