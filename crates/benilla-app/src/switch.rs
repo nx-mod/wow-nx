@@ -30,8 +30,11 @@ pub(crate) fn prepare() {
     unsafe extern "C" {
         /// benilla-horizon's screen.c.
         fn wownx_black_screen();
+        /// benilla-horizon's net.c: 0, or the libnx result.
+        fn wownx_network_init() -> u32;
     }
     unsafe { wownx_black_screen() };
+    NETWORK.store(unsafe { wownx_network_init() }, std::sync::atomic::Ordering::Relaxed);
     let _ = std::fs::create_dir_all("sdmc:/wow-nx");
     // A panic aborts (the target's panic strategy), and newlib's abort leaves through libnx's exit: no crash report,
     // and the message went to a stderr nothing reads. The first panic's message, place and thread go to
@@ -64,6 +67,9 @@ pub(crate) fn prepare() {
         std::env::set_var("BENILLA_HOME", "sdmc:/wow-nx/benilla-config");
     }
 }
+
+/// The socket session's result at start (benilla-horizon's net.c), logged once the logger is up.
+static NETWORK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// When the process started, for the start's timings.
 static STARTED: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
@@ -156,6 +162,10 @@ fn run(mut app: App) -> AppExit {
     let started = std::time::Instant::now();
     while app.plugins_state() == bevy::app::PluginsState::Adding {
         bevy::tasks::tick_global_task_pools_on_main_thread();
+    }
+    match NETWORK.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => info!("switch: sockets up"),
+        rc => error!("switch: socketInitialize failed: 0x{rc:x} (module {}, description {})", rc & 0x1ff, (rc >> 9) & 0x1fff),
     }
     info!("switch: plugins ready at {} ms (process {} ms)", started.elapsed().as_millis(), since_start_ms());
     app.finish();
