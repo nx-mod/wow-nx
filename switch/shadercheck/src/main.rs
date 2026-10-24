@@ -43,6 +43,14 @@ fn binding_map(module: &naga::Module) -> naga::back::glsl::BindingMap {
     binding_map
 }
 
+/// The program's registers a thread, scratch a warp (registers spilled to local memory) and code size, from the DKSH
+/// headers (deko3d's dksh.h): what decides how many warps a GPU core keeps in flight.
+fn program_cost(dksh: &[u8]) -> String {
+    let word = |at: usize| dksh.get(at..at + 4).map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()));
+    let (code, programs) = (word(12), word(16) as usize);
+    format!("{} registers, {} scratch, {code} code", word(programs + 8), word(programs + 20))
+}
+
 fn main() {
     let mut files = Vec::new();
     for a in std::env::args().skip(1) {
@@ -66,7 +74,7 @@ fn main() {
             };
             match benilla_uam::compile(stage, &glsl) {
                 Ok(dksh) => {
-                    println!("ok   {} ({stage:?}, {} bytes)", f.display(), dksh.len());
+                    println!("ok   {} ({stage:?}, {} bytes, {})", f.display(), dksh.len(), program_cost(&dksh));
                     passed += 1;
                 }
                 Err(log) => {
@@ -131,7 +139,7 @@ fn main() {
             };
             match benilla_uam::compile(stage, &glsl) {
                 Ok(dksh) => {
-                    println!("ok   {name} ({} bytes)", dksh.len());
+                    println!("ok   {name} ({} bytes, {})", dksh.len(), program_cost(&dksh));
                     passed += 1;
                 }
                 Err(log) => {

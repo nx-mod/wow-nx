@@ -22,6 +22,7 @@ pub const PUSH_CONSTANT_SLOT: u32 = 14;
 pub fn adapt_glsl(glsl: &mut String) -> (bool, bool) {
     drop_shadow_lod(glsl);
     unshadow_uncompared(glsl);
+    fold_dead_shadows(glsl);
     const FIRST: &str = "naga_vs_first_instance";
     let loose = format!("uniform uint {FIRST};");
     let first = glsl.contains(&loose);
@@ -87,6 +88,47 @@ pub fn write_glsl(
 /// have. The core forms without the level (`texture`, `textureOffset`) sample the implicit level instead: the same
 /// for shadow maps, which have one level (Bevy's do). Every `textureLod`/`textureLodOffset` on a `*ArrayShadow` or
 /// `samplerCubeShadow` loses its level argument, and the extension line goes.
+/// Bevy's PBR shader decides its shadow work at run time, from values that in this client never change, so uam keeps
+/// all of it and allots registers for it: the PBR fragment shader was 104 registers and 29 KB of code. Folded to
+/// constants, the compiler drops the dead paths (93 registers, 12.5 KB, measured with switch/shadercheck):
+/// - a light's `soft_shadow_size`, which Bevy writes as 0 unless built with `experimental_pbr_pcss` (bevy_pbr's
+///   light.rs), and this workspace is not: the PCSS search and filter go;
+/// - a light's shadows-enabled flag: benilla never enables Bevy's shadow maps, as 1.12.1 has none (its blob shadows
+///   are benilla's own), so every shadow-map fetch goes.
+fn fold_dead_shadows(glsl: &mut String) {
+    const SOFT: &str = ".soft_shadow_size;";
+    const FLAG: &str = "_LIGHT_FLAGS_SHADOWS_ENABLED_BIT";
+    if !glsl.contains(SOFT) && !glsl.contains(FLAG) {
+        return;
+    }
+    let mut out = String::with_capacity(glsl.len());
+    for line in glsl.split_inclusive('\n') {
+        let body = line.trim_end_matches('\n');
+        let trimmed = body.trim_start();
+        // `float _e91 = _group_0_binding_8_fs.data[light_id_13].soft_shadow_size;`
+        if trimmed.starts_with("float ") && trimmed.ends_with(SOFT) {
+            if let Some(eq) = body.find(" = ") {
+                out.push_str(&body[..eq]);
+                out.push_str(" = 0.0;");
+                out.push_str(&line[body.len()..]);
+                continue;
+            }
+        }
+        // `((_e136 & POINT_LIGHT_FLAGS_SHADOWS_ENABLED_BITX_naga_oil_mod_...) != 0u)`, not the constant's declaration
+        let mut rest = body.to_string();
+        if !trimmed.starts_with("const ") {
+            while let Some(at) = rest.find(FLAG) {
+                let Some(open) = rest[..at].rfind("((_e") else { break };
+                let Some(close) = rest[at..].find(") != 0u)").map(|c| at + c + ") != 0u)".len()) else { break };
+                rest.replace_range(open..close, "false");
+            }
+        }
+        out.push_str(&rest);
+        out.push_str(&line[body.len()..]);
+    }
+    *glsl = out;
+}
+
 fn drop_shadow_lod(glsl: &mut String) {
     const EXT: &str = "#extension GL_EXT_texture_shadow_lod : require\n";
     if !glsl.contains(EXT) {
