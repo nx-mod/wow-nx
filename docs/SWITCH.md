@@ -43,6 +43,19 @@ Speed, found by measuring on the console (the backend logs every 300 frames; `WO
   translated shaders would shorten it.
 - Upstream #2305 (zone events every frame) and #1865 (frame pacer) are CPU per frame; left to upstream.
 
+Play without an outside server (an idea, not started):
+
+- **Single player:** a 1.12.1 server (vmangos) embedded in the NRO, the client dialling it over loopback. A MaNGOS
+  core already simulates only the grids around a player and unloads the rest, so one player costs about a zone.
+  The work is the port: vmangos's C++ on Horizon, its MySQL world database as SQLite (or a converted subset, only
+  the current map's spawns in memory), and vmaps/mmaps loaded tile by tile.
+- **Or simpler, our own:** a purpose-built server in Rust in this workspace instead of a vmangos port: benilla's
+  protocol types (in-process messages for one player, no sockets or SRP), its DBC readers and map data, and only
+  the game logic on top, one zone first. Licence: vmangos and its world database are GPL-2.0, benilla MIT/Apache;
+  taking either's code or data makes the NRO GPL, a choice to make before starting.
+- **LAN, up to 4 players:** the same server on one Switch, listening on the network; the others dial its IP or find
+  it by a broadcast. Keeping the party in one zone keeps the host at about a zone's work.
+
 Not done on purpose: no clock changes (stock CPU/GPU), no features turned off for speed.
 
 ## Rules

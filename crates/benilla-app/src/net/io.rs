@@ -537,6 +537,8 @@ fn run(
                         benilla_protocol::LoginRefusal::LogonProof(r.code)
                     }
                 });
+                // wow-nx: the screen says only "disconnected"; the log keeps why.
+                bevy::log::warn!("net: logon to {} failed: {e:#} (dial failure: {})", req.host, dial.is_some());
                 let _ = events_tx.send(SessionEvent::LoginFailed {
                     refusal: if dial.is_some() { None } else { refusal },
                     reason: format!("{e:#}"),
