@@ -230,8 +230,16 @@ fn drive_glue_music_requests(
     mut out: NonSendMut<SoundOutput>,
     assets: Option<Res<WorldAssets>>,
     config: Res<SoundConfig>,
+    mut held: Local<Vec<GlueMusicRequest>>,
 ) {
-    for request in requests.read() {
+    // wow-nx: kept until the screen shows (crate::screen_shown), so the music starts with the picture, not over the
+    // Switch's black start; a message unread for two frames would be gone.
+    held.extend(requests.read().cloned());
+    if !crate::screen_shown() {
+        return;
+    }
+    for request in held.drain(..) {
+        let request = &request;
         match request {
             GlueMusicRequest::Play(file) => {
                 // `0x45aeb0` stops the playlist before anything else (`0x45aeb5`).

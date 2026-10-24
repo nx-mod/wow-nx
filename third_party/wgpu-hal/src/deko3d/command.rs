@@ -195,14 +195,14 @@ impl CommandEncoder {
         let e = &mut self.state;
         for &stage in stages {
             let s = stage as usize;
-            for &(t, m) in &e.sampling.textures {
+            for &(unit, t, m) in &e.sampling.textures {
                 let image = e.textures.get(t as usize).copied().flatten().unwrap_or(0);
                 let sampler = m.and_then(|m| e.samplers.get(m as usize).copied().flatten()).unwrap_or(0);
                 let h = unsafe { dkMakeTextureHandle(image, sampler) };
-                let Some(bound) = e.bound_textures[s].get_mut(t as usize) else { continue };
+                let Some(bound) = e.bound_textures[s].get_mut(unit as usize) else { continue };
                 if *bound != Some(h) {
                     *bound = Some(h);
-                    unsafe { dkCmdBufBindTextures(c, stage, t as u32, &h, 1) };
+                    unsafe { dkCmdBufBindTextures(c, stage, unit as u32, &h, 1) };
                 }
             }
             for &i in &e.sampling.images {

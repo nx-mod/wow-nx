@@ -235,6 +235,17 @@ pub fn config_dir() -> Option<std::path::PathBuf> {
 /// What a crate on top of benilla adds to the built app ([`run_with`]).
 type Extension<'a> = Box<dyn FnOnce(&mut App) + 'a>;
 
+/// wow-nx: whether frames reach the screen. On the Switch the first frames are held black while their pipelines build
+/// (the deko3d backend); what should start with the login screen (its env login, its music) waits for them.
+#[cfg(target_os = "horizon")]
+pub(crate) fn screen_shown() -> bool {
+    wgpu_hal::gles::screen_shown()
+}
+#[cfg(not(target_os = "horizon"))]
+pub(crate) fn screen_shown() -> bool {
+    true
+}
+
 /// wow-nx: the start's timing marks (`switch::FinishMark`), nothing off the Switch.
 mod switch_marks {
     #[cfg(target_os = "horizon")]

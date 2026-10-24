@@ -229,7 +229,9 @@ pub(crate) fn drive_policy(
     // The env fast path, once: `WOW_USER` and `WOW_PASS` both set auto-submit. There is no
     // default account. A driverless run exits non-zero ("login: FATAL") on a failure no resubmit
     // can change, as [`crate::run_mode::fatal_when_driverless`] decides.
-    if !attempt.intent.env_read {
+    // wow-nx: not before the screen shows (crate::screen_shown): sent during the Switch's black start it was at
+    // character select before anything showed.
+    if !attempt.intent.env_read && crate::screen_shown() {
         attempt.intent.env_read = true;
         if crate::run_mode::env_login() {
             let user = std::env::var("WOW_USER").unwrap_or_default();

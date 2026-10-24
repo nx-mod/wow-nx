@@ -87,8 +87,79 @@ pub(super) struct CompiledStage {
 /// What a pipeline's shaders read, besides buffers: per texture slot, the sampler slot it is combined with.
 #[derive(Debug, Default, Clone)]
 pub(super) struct Sampling {
-    pub(super) textures: Vec<(u8, Option<u8>)>,
+    /// Each combined texture unit the shader samples, the bound texture (by layout slot) it shows and the sampler it
+    /// pairs with. The unit is the texture's slot, or a spare one for a texture sampled with a second sampler
+    /// ([`split_shared_images`]).
+    pub(super) textures: Vec<(u8, u8, Option<u8>)>,
     pub(super) images: Vec<u8>,
+}
+
+/// The group of the bindings [`split_shared_images`] makes up; no pipeline layout has this many groups.
+const SPLIT_GROUP: u32 = 0xffff;
+/// Spare combined units are taken from the top of deko3d's 32 texture bindings down.
+const LAST_UNIT: u8 = DK_NUM_TEXTURE_BINDINGS as u8 - 1;
+
+/// GLSL pairs each texture with one sampler, so naga's GLSL writer refuses a texture WGSL samples with two ("A image
+/// was used with multiple samplers": benilla's static_gx pass). Each extra pairing gets a copy of the texture
+/// variable under a made-up binding mapped to a spare unit, and the samples that use that sampler read the copy; the
+/// unit is then bound to the same texture with the other sampler. A texture whose one expression feeds samples with
+/// different samplers is left alone (and still refused). Returns each made-up binding with the texture's own.
+fn split_shared_images(
+    module: &mut naga::Module,
+    binding_map: &mut glsl::BindingMap,
+    spare_units: &mut impl Iterator<Item = u8>,
+) -> Vec<(naga::ResourceBinding, naga::ResourceBinding)> {
+    use naga::{Expression, Handle};
+    // (function index or entry point, image expression, texture, sampler) for every sample of globals
+    let mut uses: Vec<(usize, Handle<Expression>, Handle<naga::GlobalVariable>, Handle<naga::GlobalVariable>)> = Vec::new();
+    let functions = module.functions.len();
+    for (index, f) in module.functions.iter().map(|(_, f)| f).chain(module.entry_points.iter().map(|ep| &ep.function)).enumerate() {
+        for (_, expression) in f.expressions.iter() {
+            let Expression::ImageSample { image, sampler, .. } = *expression else { continue };
+            if let (Expression::GlobalVariable(t), Expression::GlobalVariable(s)) = (&f.expressions[image], &f.expressions[sampler]) {
+                uses.push((index, image, *t, *s));
+            }
+        }
+    }
+    let mut made = Vec::new();
+    let mut textures: Vec<Handle<naga::GlobalVariable>> = uses.iter().map(|u| u.2).collect();
+    textures.sort();
+    textures.dedup();
+    for texture in textures {
+        let mut samplers: Vec<Handle<naga::GlobalVariable>> = Vec::new();
+        for u in uses.iter().filter(|u| u.2 == texture) {
+            if !samplers.contains(&u.3) {
+                samplers.push(u.3);
+            }
+        }
+        let Some(own) = module.global_variables[texture].binding else { continue };
+        for &sampler in samplers.iter().skip(1) {
+            let mine: Vec<_> = uses.iter().filter(|u| u.2 == texture && u.3 == sampler).collect();
+            // An image expression shared with a sample of another sampler cannot be pointed elsewhere.
+            if mine.iter().any(|m| uses.iter().any(|u| u.0 == m.0 && u.1 == m.1 && u.3 != sampler)) {
+                continue;
+            }
+            let Some(unit) = spare_units.next() else { break };
+            let binding = naga::ResourceBinding { group: SPLIT_GROUP, binding: made.len() as u32 };
+            let mut copy = module.global_variables[texture].clone();
+            copy.name = copy.name.map(|n| alloc::format!("{n}_split{}", made.len()));
+            copy.binding = Some(binding);
+            let copy = module.global_variables.append(copy, naga::Span::UNDEFINED);
+            binding_map.insert(binding, unit);
+            for m in mine {
+                let f = if m.0 < functions {
+                    module.functions.iter_mut().nth(m.0).map(|(_, f)| f)
+                } else {
+                    module.entry_points.get_mut(m.0 - functions).map(|ep| &mut ep.function)
+                };
+                if let Some(f) = f {
+                    f.expressions[m.1] = Expression::GlobalVariable(copy);
+                }
+            }
+            made.push((binding, own));
+        }
+    }
+    made
 }
 
 #[derive(Debug)]
@@ -271,18 +342,36 @@ impl super::Device {
             stage.constants,
         )
         .map_err(|e| crate::PipelineError::PipelineConstants(wgt_stage_flags, format!("{e}")))?;
+        let mut binding_map = layout.binding_map.clone();
+        // Spare units below those this pipeline's stages already took.
+        let taken = sampling.textures.iter().filter(|(unit, texture, _)| unit != texture).count() as u8;
+        let mut spare_units = (0..=LAST_UNIT - taken).rev();
+        let mut module = module.into_owned();
+        let splits = split_shared_images(&mut module, &mut binding_map, &mut spare_units);
+        let info = if splits.is_empty() {
+            info.into_owned()
+        } else {
+            naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+                .validate(&module)
+                .map_err(|e| crate::PipelineError::Linkage(wgt_stage_flags, format!("{e:?}")))?
+        };
         let (output, reflection, _, _) = benilla_uam::write_glsl(
             &module,
             &info,
             naga_stage,
             stage.entry_point,
-            layout.binding_map.clone(),
+            binding_map.clone(),
             stage.zero_initialize_workgroup_memory,
         )
         .map_err(|e| crate::PipelineError::Linkage(wgt_stage_flags, e))?;
         for (_, m) in reflection.texture_mapping {
             let var = &module.global_variables[m.texture];
-            let slot = layout.slot(var.binding.as_ref().unwrap());
+            let binding = var.binding.as_ref().unwrap();
+            // A copy's unit is its own; the texture it shows is the original's slot.
+            let (unit, slot) = match splits.iter().find(|(made, _)| made == binding) {
+                Some((made, own)) => (binding_map[made], layout.slot(own)),
+                None => (layout.slot(binding), layout.slot(binding)),
+            };
             let storage = matches!(module.types[var.ty].inner, naga::TypeInner::Image { class: naga::ImageClass::Storage { .. }, .. });
             if storage {
                 if !sampling.images.contains(&slot) {
@@ -291,8 +380,8 @@ impl super::Device {
                 continue;
             }
             let sampler = m.sampler.map(|s| layout.slot(module.global_variables[s].binding.as_ref().unwrap()));
-            if !sampling.textures.iter().any(|(t, _)| *t == slot) {
-                sampling.textures.push((slot, sampler));
+            if !sampling.textures.iter().any(|(u, _, _)| *u == unit) {
+                sampling.textures.push((unit, slot, sampler));
             }
         }
         Ok(output)

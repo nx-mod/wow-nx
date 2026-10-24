@@ -365,6 +365,8 @@ struct Swapchain {
     queue: DkQueue,
     format: wgt::TextureFormat,
     size: wgt::Extent3d,
+    /// The loading picture shown through the start's held frames, while they last.
+    picture: Option<StartPicture>,
 }
 
 #[derive(Debug)]
@@ -472,6 +474,11 @@ impl StartHold {
         }
         true
     }
+}
+
+/// Whether frames reach the screen yet, past the start's black hold (benilla-app holds its env login until then).
+pub fn screen_shown() -> bool {
+    START_HOLD.lock().done
 }
 
 /// Frames a second and GPU ms a frame over the last few frames, for benilla-app's overlay.
@@ -842,6 +849,9 @@ impl Surface {
                 dkQueueWaitIdle(c.queue);
                 dkSwapchainDestroy(c.dk);
                 dkMemBlockDestroy(c.memory);
+                if let Some(p) = c.picture {
+                    dkMemBlockDestroy(p.memory);
+                }
             }
         }
     }
@@ -853,9 +863,9 @@ impl Drop for Surface {
     }
 }
 
-/// Clears new swapchain images to black: until the app draws, what a present shows is whatever the memory held,
-/// which on the console was a white flash before the first frame.
-unsafe fn clear_to_black(shared: &Shared, images: &[DkImage], extent: wgt::Extent3d) {
+/// Records commands into a one-off list, runs it and waits for the GPU: for the start's few frames and set-up, never
+/// a frame's work.
+unsafe fn run_once(shared: &Shared, record: impl FnOnce(DkCmdBuf)) {
     const SIZE: u32 = DK_MEMBLOCK_ALIGNMENT;
     let Some(memory) = (unsafe { mem_block(shared.device, SIZE, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached) })
     else {
@@ -867,17 +877,7 @@ unsafe fn clear_to_black(shared: &Shared, images: &[DkImage], extent: wgt::Exten
     if !cmd.is_null() {
         unsafe {
             dkCmdBufAddMemory(cmd, memory, 0, SIZE);
-            let mut write_all = core::mem::zeroed::<DkColorWriteState>();
-            dkColorWriteStateDefaults(&mut write_all);
-            dkCmdBufBindColorWriteState(cmd, &write_all);
-            let (width, height) = (extent.width, extent.height);
-            dkCmdBufSetScissors(cmd, 0, &DkScissor { x: 0, y: 0, width, height }, 1);
-            for image in images {
-                let mut view = core::mem::zeroed::<DkImageView>();
-                dkImageViewDefaults(&mut view, image);
-                dkCmdBufBindRenderTarget(cmd, &view, ptr::null());
-                dkCmdBufClearColorFloat(cmd, 0, DkColorMask_RGBA, 0.0, 0.0, 0.0, 1.0);
-            }
+            record(cmd);
             let list = dkCmdBufFinishList(cmd);
             let mut q = shared.lock_queue();
             dkQueueSubmitCommands(shared.queue, list);
@@ -887,6 +887,100 @@ unsafe fn clear_to_black(shared: &Shared, images: &[DkImage], extent: wgt::Exten
         }
     }
     unsafe { dkMemBlockDestroy(memory) };
+}
+
+/// Fills swapchain images with the start's picture, or black without one: until the app's own frames are shown
+/// (`StartHold`), a present showed whatever the memory held, which was a white flash.
+unsafe fn fill_start(shared: &Shared, images: &[DkImage], extent: wgt::Extent3d, picture: Option<&StartPicture>) {
+    unsafe {
+        run_once(shared, |cmd| {
+            let (width, height) = (extent.width, extent.height);
+            if let Some(p) = picture {
+                let mut from = core::mem::zeroed::<DkImageView>();
+                dkImageViewDefaults(&mut from, &*p.image);
+                let source = DkImageRect { x: 0, y: 0, z: 0, width: StartPicture::WIDTH, height: StartPicture::HEIGHT, depth: 1 };
+                let whole = DkImageRect { x: 0, y: 0, z: 0, width, height, depth: 1 };
+                for image in images {
+                    let mut to = core::mem::zeroed::<DkImageView>();
+                    dkImageViewDefaults(&mut to, image);
+                    dkCmdBufBlitImage(cmd, &from, &source, &to, &whole, 0, 0);
+                }
+                return;
+            }
+            let mut write_all = core::mem::zeroed::<DkColorWriteState>();
+            dkColorWriteStateDefaults(&mut write_all);
+            dkCmdBufBindColorWriteState(cmd, &write_all);
+            dkCmdBufSetScissors(cmd, 0, &DkScissor { x: 0, y: 0, width, height }, 1);
+            for image in images {
+                let mut view = core::mem::zeroed::<DkImageView>();
+                dkImageViewDefaults(&mut view, image);
+                dkCmdBufBindRenderTarget(cmd, &view, ptr::null());
+                dkCmdBufClearColorFloat(cmd, 0, DkColorMask_RGBA, 0.0, 0.0, 0.0, 1.0);
+            }
+        })
+    }
+}
+
+/// The loading picture benilla-horizon's screen.c shows at launch (`sdmc:/wow-nx/loading.rgba`, 1280×720 RGBA, made
+/// from the client's own loading screen art), kept on the screen through the start's held frames instead of black.
+#[derive(Debug)]
+struct StartPicture {
+    image: Box<DkImage>,
+    memory: DkMemBlock,
+}
+
+impl StartPicture {
+    const WIDTH: u32 = 1280;
+    const HEIGHT: u32 = 720;
+
+    /// Reads and uploads the picture; none without the file.
+    unsafe fn load(shared: &Shared, format: DkImageFormat) -> Option<Self> {
+        unsafe extern "C" {
+            fn fopen(path: *const core::ffi::c_char, mode: *const core::ffi::c_char) -> *mut c_void;
+            fn fread(to: *mut c_void, size: usize, count: usize, file: *mut c_void) -> usize;
+            fn fclose(file: *mut c_void) -> core::ffi::c_int;
+        }
+        let bytes = (Self::WIDTH * Self::HEIGHT * 4) as usize;
+        let plain = DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached;
+        let staging = unsafe { mem_block(shared.device, align_up(bytes as u64, DK_MEMBLOCK_ALIGNMENT as u64) as u32, plain) }?;
+        let file = unsafe { fopen(c"sdmc:/wow-nx/loading.rgba".as_ptr(), c"rb".as_ptr()) };
+        let read = if file.is_null() {
+            0
+        } else {
+            let n = unsafe { fread(dkMemBlockGetCpuAddr(staging), 1, bytes, file) };
+            unsafe { fclose(file) };
+            n
+        };
+        if read != bytes {
+            unsafe { dkMemBlockDestroy(staging) };
+            return None;
+        }
+        let mut maker = unsafe { core::mem::zeroed::<DkImageLayoutMaker>() };
+        unsafe { dkImageLayoutMakerDefaults(&mut maker, shared.device) };
+        maker.flags = DkImageFlags_Usage2DEngine;
+        maker.format = format;
+        maker.dimensions = [Self::WIDTH, Self::HEIGHT, 1];
+        let mut layout = unsafe { core::mem::zeroed::<DkImageLayout>() };
+        unsafe { dkImageLayoutInitialize(&mut layout, &maker) };
+        let size = align_up(unsafe { dkImageLayoutGetSize(&layout) }, DK_MEMBLOCK_ALIGNMENT as u64) as u32;
+        let Some(memory) = (unsafe { mem_block(shared.device, size, DkMemBlockFlags_GpuCached | DkMemBlockFlags_Image) }) else {
+            unsafe { dkMemBlockDestroy(staging) };
+            return None;
+        };
+        let mut image = Box::new(unsafe { core::mem::zeroed::<DkImage>() });
+        unsafe { dkImageInitialize(&mut *image, &layout, memory, 0) };
+        unsafe {
+            run_once(shared, |cmd| {
+                let mut view = core::mem::zeroed::<DkImageView>();
+                dkImageViewDefaults(&mut view, &*image);
+                let from = DkCopyBuf { addr: dkMemBlockGetGpuAddr(staging), rowLength: 0, imageHeight: 0 };
+                let rect = DkImageRect { x: 0, y: 0, z: 0, width: Self::WIDTH, height: Self::HEIGHT, depth: 1 };
+                dkCmdBufCopyBufferToImage(cmd, &from, &view, &rect, 0);
+            });
+            dkMemBlockDestroy(staging);
+        }
+        Some(StartPicture { image, memory })
+    }
 }
 
 impl crate::Surface for Surface {
@@ -899,7 +993,8 @@ impl crate::Surface for Surface {
 
         let mut maker = unsafe { core::mem::zeroed::<DkImageLayoutMaker>() };
         unsafe { dkImageLayoutMakerDefaults(&mut maker, dk) };
-        maker.flags = DkImageFlags_UsageRender | DkImageFlags_UsagePresent | DkImageFlags_HwCompression;
+        // The 2D engine blits the start's picture in (fill_start).
+        maker.flags = DkImageFlags_UsageRender | DkImageFlags_UsagePresent | DkImageFlags_HwCompression | DkImageFlags_Usage2DEngine;
         maker.format = format;
         maker.dimensions = [config.extent.width, config.extent.height, 1];
         let mut layout = unsafe { core::mem::zeroed::<DkImageLayout>() };
@@ -917,7 +1012,8 @@ impl crate::Surface for Surface {
         for (i, image) in images.iter_mut().enumerate() {
             unsafe { dkImageInitialize(image, &layout, memory, (i as u64 * size) as u32) };
         }
-        unsafe { clear_to_black(&device.shared, &images, config.extent) };
+        let picture = if START_HOLD.lock().done { None } else { unsafe { StartPicture::load(&device.shared, format) } };
+        unsafe { fill_start(&device.shared, &images, config.extent, picture.as_ref()) };
         let pointers: Vec<*const DkImage> = images.iter().map(ptr::from_ref).collect();
         let mut sm = unsafe { core::mem::zeroed::<DkSwapchainMaker>() };
         unsafe { dkSwapchainMakerDefaults(&mut sm, dk, self.window, pointers.as_ptr(), count) };
@@ -937,6 +1033,7 @@ impl crate::Surface for Surface {
             queue: device.shared.queue,
             format: config.format,
             size: config.extent,
+            picture,
         });
         Ok(())
     }
@@ -1163,7 +1260,7 @@ impl crate::Queue for Queue {
         let screen = SCREEN.lock();
         if START_HOLD.lock().holding() {
             if let Some(image) = c.images.get(slot as usize) {
-                unsafe { clear_to_black(&c._shared, core::slice::from_ref(image), c.size) };
+                unsafe { fill_start(&c._shared, core::slice::from_ref(image), c.size, c.picture.as_ref()) };
             }
         }
         let mut q = c._shared.lock_queue();
