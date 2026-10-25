@@ -484,6 +484,7 @@ version = "0.2.0"
 dependencies = [
  "benilla-app",
  "benilla-buildstamp",
+ "benilla-pad",
 ]
 
 [[package]]
@@ -645,6 +646,18 @@ version = "0.2.0"
 dependencies = [
  "benilla-bytes",
  "flate2",
+]
+
+[[package]]
+name = "benilla-pad"
+version = "0.2.0"
+dependencies = [
+ "benilla-app",
+ "benilla-buildstamp",
+ "benilla-ui",
+ "benilla-world",
+ "bevy",
+ "include_dir",
 ]
 
 [[package]]
