@@ -1,8 +1,17 @@
 //! wow-nx: the Switch port's platform seam (docs/SWITCH.md). On Horizon, what libnx gives Rust that devkitA64's newlib
-//! does not: the C functions `std` calls (`getrandom`, `sysconf`) and the random source for the `getrandom` crate.
+//! does not: the C functions `std` calls (`getrandom`, `sysconf`), the random source for the `getrandom` crate, and an
+//! allocator that does not queue every thread on newlib's one malloc lock.
 //! Elsewhere it is empty, so a crate can depend on it for the Switch only.
 
 #![cfg_attr(not(target_os = "horizon"), allow(unused))]
+
+#[cfg(any(target_os = "horizon", test))]
+mod alloc;
+
+/// Rust's allocations on the Switch: newlib's malloc behind per-thread caches ([`alloc`]).
+#[cfg(target_os = "horizon")]
+#[global_allocator]
+static ALLOCATOR: alloc::Cached = alloc::Cached;
 
 #[cfg(target_os = "horizon")]
 mod horizon {
