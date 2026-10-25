@@ -1,8 +1,12 @@
 // wow-nx: what a failed GPU kickoff was. deko3d reports only "gpu channel kickoff failed" (dk_queue.cpp) and drops
 // libnx's result; a binary linked with -Wl,--wrap=nvGpuChannelKickoff (benilla-app's build.rs) comes through here,
 // and the first failure writes the result, the rejected GPFIFO entries and the kickoffs before it to
-// sdmc:/wow-nx/kickoff.txt. libnx already retries a kickoff the kernel answers Busy (a full ring), so whatever
-// lands here the kernel refused outright. Two kickoffs at once (the queue used from two threads) are written too.
+// sdmc:/wow-nx/kickoff.txt. libnx already retries a kickoff the kernel answers Busy; one it answers Timeout waited
+// for room in the GPU's ring and found none in time, which a loading burst can cause while the ring is still
+// draining (one world load pushed a submission of 1157 of its 2048 entries, and the next kickoff timed out; the
+// deko3d debug build, which waits for the GPU after every submission, never did). libnx keeps the entries pending
+// on a failure, so a Timeout is tried again while the channel has no error, for up to RETRY_MS; the first kickoff a
+// retry saved is written to kickoff-retry.txt. Two kickoffs at once (the queue used from two threads) are written too.
 #include <stdatomic.h>
 #include <stdio.h>
 #include <switch.h>
@@ -21,7 +25,15 @@ enum { HISTORY = 16 };
 static Kickoff history[HISTORY];
 static u32 kickoffs;
 static atomic_int inside;
-static atomic_bool reported_failure, reported_overlap;
+static atomic_bool reported_failure, reported_overlap, reported_retry;
+
+enum { RETRY_MS = 2000, RETRY_SLEEP_NS = 1000000 };
+
+// Whether the channel has reported an error (a fault or a hang): then a retry cannot help.
+static bool channel_failed(NvGpuChannel* c) {
+    NvNotification notification = {0};
+    return R_SUCCEEDED(nvGpuChannelGetErrorNotification(c, &notification)) && notification.status != 0;
+}
 
 static u64 current_thread(void) {
     u64 id = 0;
@@ -79,6 +91,21 @@ Result __wrap_nvGpuChannelKickoff(NvGpuChannel* c) {
         k.last = c->entries[c->num_entries - 1].desc;
     }
     Result rc = __real_nvGpuChannelKickoff(c);
+    const Result timeout = MAKERESULT(Module_LibnxNvidia, LibnxNvidiaError_Timeout);
+    u32 retries = 0;
+    while (rc == timeout && retries < RETRY_MS && !channel_failed(c)) {
+        svcSleepThread(RETRY_SLEEP_NS);
+        retries++;
+        rc = __real_nvGpuChannelKickoff(c);
+    }
+    if (retries && R_SUCCEEDED(rc) && !atomic_exchange(&reported_retry, true)) {
+        FILE* f = fopen("sdmc:/wow-nx/kickoff-retry.txt", "w");
+        if (f) {
+            fprintf(f, "kickoff %u timed out and went through after %u retries of 1 ms (%u entries, thread %llu)\n",
+                kickoffs, retries, k.entries, (unsigned long long)thread);
+            fclose(f);
+        }
+    }
     if (R_FAILED(rc) && !atomic_exchange(&reported_failure, true))
         report(c, rc, thread);
     else if (R_SUCCEEDED(rc) && k.entries)
