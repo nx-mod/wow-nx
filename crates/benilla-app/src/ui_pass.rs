@@ -205,41 +205,66 @@ pub(crate) struct UiQuadBatch;
 #[derive(Resource)]
 struct UiWhiteTexture(Handle<Image>);
 
-/// The quad material: a texture and the [`UiQuad`] flags as uniforms, drawn through the
-/// premultiplied-alpha pipeline (`ui_quad.wgsl`), or the multiply one for `MOD` ([`UiQuadKey`]). It
-/// holds no colour, so it is its identity key alone and a steady frame re-prepares none.
+/// The quad material: a texture and the [`UiQuad`] flags as one uniform block
+/// ([`UiQuadParams`]), drawn through the premultiplied-alpha pipeline (`ui_quad.wgsl`), or the
+/// multiply one for `MOD` ([`UiQuadKey`]). It holds no colour, so it is its identity key alone and a
+/// steady frame re-prepares none.
 #[derive(Asset, TypePath, AsBindGroup, Clone)]
 #[bind_group_data(UiQuadKey)]
+#[uniform(0, UiQuadParams)]
 pub(crate) struct UiQuadMaterial {
     /// The EGxBlend, 0 to 4 ([`UiQuad::blend`]).
-    #[uniform(0)]
     blend: u32,
     #[texture(1)]
     #[sampler(2)]
     texture: Option<Handle<Image>>,
-    #[uniform(3)]
     circular: u32,
-    #[uniform(7)]
     desaturate: u32,
-    #[uniform(8)]
     premultiplied: u32,
     /// `<= 0` disables the alpha test.
-    #[uniform(9)]
     alpha_ref: f32,
-    #[uniform(10)]
     gamma_texel: u32,
     /// The mask span in physical px (the shader compares `@builtin(position)`); `z <= x` disables.
-    #[uniform(4)]
     mask_rect: Vec4,
     #[texture(5)]
     #[sampler(6)]
     mask: Option<Handle<Image>>,
     /// The mask texel's RGB multiplies the colour ([`UiQuadMask::modulate_rgb`]).
-    #[uniform(12)]
     mask_rgb: u32,
     /// `(u_min, v_min, u_max, v_max)`; `min > max` on an axis disables that axis.
-    #[uniform(11)]
     uv_clamp: Vec4,
+}
+
+/// [`UiQuadMaterial`]'s flags as `ui_quad.wgsl` reads them, one uniform block: a batch binds one
+/// buffer, not one per flag (nine before, each its own binding to set at every batch).
+#[derive(Clone, Copy, bevy::render::render_resource::ShaderType)]
+pub(crate) struct UiQuadParams {
+    blend_mode: u32,
+    circular: u32,
+    desaturate: u32,
+    premultiplied: u32,
+    alpha_ref: f32,
+    gamma_texel: u32,
+    mask_rgb: u32,
+    mask_rect: Vec4,
+    uv_clamp: Vec4,
+}
+
+// AsBindGroup reads the block through bevy's blanket `AsBindGroupShaderType` for `&T: Into<U>`.
+impl From<&UiQuadMaterial> for UiQuadParams {
+    fn from(m: &UiQuadMaterial) -> Self {
+        Self {
+            blend_mode: m.blend,
+            circular: m.circular,
+            desaturate: m.desaturate,
+            premultiplied: m.premultiplied,
+            alpha_ref: m.alpha_ref,
+            gamma_texel: m.gamma_texel,
+            mask_rgb: m.mask_rgb,
+            mask_rect: m.mask_rect,
+            uv_clamp: m.uv_clamp,
+        }
+    }
 }
 
 /// The pipeline axis of [`UiQuadMaterial`]: `MOD` alone needs a blend state of its own, since the

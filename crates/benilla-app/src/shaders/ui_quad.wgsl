@@ -62,41 +62,47 @@ fn vertex(vertex: Vertex) -> VertexOutput {
     return out;
 }
 
-// The EGxBlend, 0 to 4 (`UiQuad::blend`).
-@group(2) @binding(0) var<uniform> blend_mode: u32;
+// The quad's flags, one uniform block (`UiQuadParams`):
+// - `blend_mode`: the EGxBlend, 0 to 4 (`UiQuad::blend`).
+// - `circular`: mask to the inscribed circle, the unit portrait's round stencil, which the reference
+//   stamps into its 64² bake.
+// - `desaturate`: `Texture:SetDesaturated(1)` binds `Shaders\Pixel\Desaturate.bls` (texture object
+//   `+0x128`): `MUL result.color.w, fragment.color.primary, texel` (a = vertexColour.a x texel.a) and
+//   `DP3 result.color.xyz, texel, c[0]` (rgb = dot(texel.rgb, LUMA)). It replaces the MODULATE, so
+//   the vertex colour's RGB has no effect, only its alpha. The dot runs on the gamma byte.
+// - `premultiplied`: set only for a booth bake (portrait, paper doll, dressing room), already
+//   premultiplied because its additive particles add light with no coverage; every other texture
+//   is straight alpha.
+// - `alpha_ref`: the alpha-test reference, <= 0 disables; only the WMO-interior minimap tiles,
+//   which the reference draws under EGxBlend 1: no blend, `glAlphaFunc(GL_GEQUAL, 224/255)`
+//   (`0x85ad20[1]`) on `texel.a × frameAlpha`. The screen mask stays out: the reference cuts it at
+//   the offscreen blit.
+// - `gamma_texel`: uploaded undecoded (`BlpVariant::MapTile`, the minimap tiles): the texel is
+//   already the gamma byte. The alpha-test arm ignores this and decodes explicitly.
+// - `mask_rgb`: the mask's stage modulates colour as well as alpha (combine preset 1, the outdoor
+//   minimap tile's stage 1, `0x4eae83`): the colour is times the mask texel's bytes.
+// - `mask_rect`: the screen-anchored alpha mask's span (the minimap's `MinimapMask.blp`) in
+//   physical px (min.xy, max.xy; z <= x disables); outside it is dropped. Sampled at level 0
+//   because the sample sits in non-uniform control flow.
+// - `uv_clamp`: the UV window this quad may sample, `(u_min, v_min, u_max, v_max)`, inset half a
+//   texel so a magnified atlas cell never filters in its neighbour; `min > max` leaves an axis
+//   unclamped.
+struct UiQuadParams {
+    blend_mode: u32,
+    circular: u32,
+    desaturate: u32,
+    premultiplied: u32,
+    alpha_ref: f32,
+    gamma_texel: u32,
+    mask_rgb: u32,
+    mask_rect: vec4<f32>,
+    uv_clamp: vec4<f32>,
+};
+@group(2) @binding(0) var<uniform> params: UiQuadParams;
 @group(2) @binding(1) var quad_texture: texture_2d<f32>;
 @group(2) @binding(2) var quad_sampler: sampler;
-// Mask to the inscribed circle: the unit portrait's round stencil, which the reference stamps into
-// its 64² bake.
-@group(2) @binding(3) var<uniform> circular: u32;
-// The screen-anchored alpha mask (the minimap's `MinimapMask.blp`): `mask_rect` is its span in
-// physical px (min.xy, max.xy; z <= x disables); outside it is dropped. Sampled at level 0 because
-// the sample sits in non-uniform control flow.
-@group(2) @binding(4) var<uniform> mask_rect: vec4<f32>;
 @group(2) @binding(5) var mask_texture: texture_2d<f32>;
 @group(2) @binding(6) var mask_sampler: sampler;
-// `Texture:SetDesaturated(1)` binds `Shaders\Pixel\Desaturate.bls` (texture object `+0x128`):
-//     MUL result.color.w   , fragment.color.primary, texel   ; a = vertexColour.a x texel.a
-//     DP3 result.color.xyz , texel, c[0]                     ; rgb = dot(texel.rgb, LUMA)
-// It replaces the MODULATE, so the vertex colour's RGB has no effect, only its alpha. The dot runs
-// on the gamma byte.
-@group(2) @binding(7) var<uniform> desaturate: u32;
-// Set only for a booth bake (portrait, paper doll, dressing room), already premultiplied because
-// its additive particles add light with no coverage; every other texture is straight alpha.
-@group(2) @binding(8) var<uniform> premultiplied: u32;
-// Alpha-test reference, <= 0 disables; only the WMO-interior minimap tiles, which the reference
-// draws under EGxBlend 1: no blend, `glAlphaFunc(GL_GEQUAL, 224/255)` (`0x85ad20[1]`) on
-// `texel.a × frameAlpha`. The screen mask stays out: the reference cuts it at the offscreen blit.
-@group(2) @binding(9) var<uniform> alpha_ref: f32;
-// Uploaded undecoded (`BlpVariant::MapTile`, the minimap tiles): the texel is already the gamma
-// byte. The alpha-test arm ignores this and decodes explicitly.
-@group(2) @binding(10) var<uniform> gamma_texel: u32;
-// The UV window this quad may sample, `(u_min, v_min, u_max, v_max)`, inset half a texel so a
-// magnified atlas cell never filters in its neighbour; `min > max` leaves an axis unclamped.
-@group(2) @binding(11) var<uniform> uv_clamp: vec4<f32>;
-// The mask's stage modulates colour as well as alpha (combine preset 1, the outdoor minimap tile's
-// stage 1, `0x4eae83`): the colour is times the mask texel's bytes.
-@group(2) @binding(12) var<uniform> mask_rgb: u32;
 
 // BT.601 luma, `Desaturate.bls`'s `c[0]` as f32 words `0x3E991687`, `0x3F1645A2`, `0x3DE978D5`.
 // Do not normalise: they sum just above 1.0 and white relies on the output clamp.
@@ -125,9 +131,9 @@ fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
 fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     // Branchless, for implicit derivatives. Sorted because `select` evaluates both arms and a
     // disabled axis must still hand `clamp` an ordered range.
-    let lo = min(uv_clamp.xy, uv_clamp.zw);
-    let hi = max(uv_clamp.xy, uv_clamp.zw);
-    let uv = select(in.uv, clamp(in.uv, lo, hi), uv_clamp.xy <= uv_clamp.zw);
+    let lo = min(params.uv_clamp.xy, params.uv_clamp.zw);
+    let hi = max(params.uv_clamp.xy, params.uv_clamp.zw);
+    let uv = select(in.uv, clamp(in.uv, lo, hi), params.uv_clamp.xy <= params.uv_clamp.zw);
     let t = textureSample(quad_texture, quad_sampler, uv);
 #ifdef VERTEX_COLORS
     let c = in.color * in.tint;
@@ -135,38 +141,38 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let c = in.tint;
 #endif
     // The tint is a client-space byte value (`<Color>`, `|cff…`), so `tint × texel` runs on bytes.
-    let texel = select(linear_to_srgb(t.rgb), t.rgb, gamma_texel != 0u);
+    let texel = select(linear_to_srgb(t.rgb), t.rgb, params.gamma_texel != 0u);
     var rgb = texel * c.rgb;
-    if desaturate != 0u {
+    if params.desaturate != 0u {
         rgb = vec3<f32>(dot(texel, LUMA));
     }
     // `m`, the masks' coverage, and `k`, the UI's (frame alpha and masks), stay apart from `t.a`:
     // `k` scales a premultiplied source's colour and alpha alike, while `t.a` weights only a
     // straight source.
     var m = 1.0;
-    if circular != 0u {
+    if params.circular != 0u {
         // A soft edge 2% of the width, like the reference's stencil at portrait size.
         m *= 1.0 - smoothstep(0.48, 0.5, distance(in.uv, vec2<f32>(0.5)));
     }
-    if mask_rect.z > mask_rect.x {
-        let muv = (in.position.xy - mask_rect.xy) / (mask_rect.zw - mask_rect.xy);
+    if params.mask_rect.z > params.mask_rect.x {
+        let muv = (in.position.xy - params.mask_rect.xy) / (params.mask_rect.zw - params.mask_rect.xy);
         let inside = f32(all(muv >= vec2<f32>(0.0)) && all(muv <= vec2<f32>(1.0)));
         let ms = textureSampleLevel(mask_texture, mask_sampler, clamp(muv, vec2<f32>(0.0), vec2<f32>(1.0)), 0.0);
         m *= ms.a * inside;
-        if mask_rgb != 0u {
+        if params.mask_rgb != 0u {
             rgb *= ms.rgb;
         }
     }
     let k = c.a * m;
     // Alpha test: returns the linear texel, not `rgb`, because it draws only into the minimap's
     // linear 256² composite, whose blit encodes.
-    if alpha_ref > 0.0 {
-        if t.a * c.a < alpha_ref {
+    if params.alpha_ref > 0.0 {
+        if t.a * c.a < params.alpha_ref {
             discard;
         }
         return vec4<f32>(srgb_to_linear(t.rgb) * c.rgb, 1.0);
     }
-    switch blend_mode {
+    switch params.blend_mode {
         // DISABLE and ALPHAKEY write the texel over the target; the masks still cut it.
         case 0u: {
             return vec4<f32>(rgb * m, m);
@@ -192,8 +198,8 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let a = t.a * k;
     // Premultiply in gamma, not by the hardware `SrcAlpha`. A booth bake takes `k` alone: `t.a`
     // again would zero its additive light over empty space.
-    let weight = select(a, k, premultiplied != 0u);
-    if blend_mode == 3u {
+    let weight = select(a, k, params.premultiplied != 0u);
+    if params.blend_mode == 3u {
         return vec4<f32>(rgb * weight, 0.0);
     }
     return vec4<f32>(rgb * weight, a);
