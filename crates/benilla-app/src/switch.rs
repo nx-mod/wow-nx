@@ -107,13 +107,49 @@ pub(crate) struct SwitchPlugin;
 impl Plugin for SwitchPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(PreUpdate, give_window_handle)
-            .add_systems(PostUpdate, pin_window)
+            .add_systems(PostUpdate, pin_window.before(bevy::camera::CameraUpdateSystems))
+            .add_systems(Last, log_ui_geometry)
             .add_systems(PreUpdate, input::read.before(bevy::input::InputSystems))
             .add_systems(Update, input::system_keyboard.after(crate::ui_script::UiInput))
             .add_systems(Update, input::fps_overlay.in_set(crate::ui_pass::UiQuadAppend))
             .init_non_send_resource::<input::Hid>()
             .set_runner(run);
     }
+}
+
+/// Every 10 s, the window and the UI's own idea of the screen: the screen root and `UIParent`'s scale and rectangle,
+/// as the stock UI reads them. (The UI drew at ~80 % of the screen, centred, after the 2026-10-25 upstream merge.)
+fn log_ui_geometry(
+    script: Option<NonSend<benilla_ui::script::UiScript>>,
+    windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
+    time: Res<Time<bevy::time::Real>>,
+    mut next: Local<f32>,
+) {
+    let now = time.elapsed_secs();
+    if now < *next {
+        return;
+    }
+    *next = now + 10.0;
+    let Ok(w) = windows.single() else { return };
+    let ui = script.and_then(|s| {
+        s.eval::<String>(
+            "local p = UIParent \
+             if not p then return string.format('screen %.0fx%.0f, no UIParent', GetScreenWidth(), GetScreenHeight()) end \
+             return string.format('screen %.1fx%.1f, UIParent scale %.3f effective %.3f, %.1fx%.1f at (%.1f, %.1f)', \
+                 GetScreenWidth(), GetScreenHeight(), p:GetScale(), p:GetEffectiveScale(), p:GetWidth() or -1, \
+                 p:GetHeight() or -1, p:GetLeft() or -1, p:GetBottom() or -1)",
+        )
+        .ok()
+    });
+    info!(
+        "switch: window {}x{} logical, {}x{} physical, scale {}; ui {}",
+        w.width(),
+        w.height(),
+        w.resolution.physical_width(),
+        w.resolution.physical_height(),
+        w.resolution.scale_factor(),
+        ui.as_deref().unwrap_or("not up")
+    );
 }
 
 /// libnx's default window, as raw-window-handle sees it (an Android NDK window: the backend takes its pointer).
@@ -150,15 +186,20 @@ fn give_window_handle(mut commands: Commands, new: Query<Entity, (With<Window>, 
 /// The screen libnx's default window has (docked, the console scales it to the TV).
 const SCREEN: (u32, u32) = (1280, 720);
 
-/// Holds every window at the screen's size, windowed, at scale 1, whatever the video settings asked.
-fn pin_window(mut windows: Query<&mut Window>) {
-    for mut w in &mut windows {
+/// Holds every window at the screen's size, windowed, at scale 1, whatever the video settings asked (1600x900 by
+/// default). A camera recomputes its projection only on a window's resize message, which winit sends elsewhere and
+/// nothing does here: without one the UI camera kept the 1600x900 the window was made at whenever it updated before
+/// the first pin, and drew the UI at 80 % about the centre while clicks landed at full size. Before the cameras
+/// update, so the first frame's are right too.
+fn pin_window(mut windows: Query<(Entity, &mut Window)>, mut resized: MessageWriter<bevy::window::WindowResized>) {
+    for (entity, mut w) in &mut windows {
         let size_ok = w.resolution.physical_width() == SCREEN.0 && w.resolution.physical_height() == SCREEN.1;
         let scale_ok = w.resolution.scale_factor() == 1.0;
         if !size_ok || !scale_ok || w.mode != bevy::window::WindowMode::Windowed {
             w.mode = bevy::window::WindowMode::Windowed;
             w.resolution.set_scale_factor_override(Some(1.0));
             w.resolution.set_physical_resolution(SCREEN.0, SCREEN.1);
+            resized.write(bevy::window::WindowResized { window: entity, width: w.width(), height: w.height() });
         }
     }
 }
@@ -312,12 +353,15 @@ mod input {
     const DOWN: u64 = 1 << 15;
     const STICK_L: u64 = 1 << 4;
     const STICK_R: u64 = 1 << 5;
-    /// The Joy-Con's buttons as bevy's gamepad buttons, by position as bevy names them: B is the bottom (South).
+    /// The Joy-Con's buttons as bevy's gamepad buttons. The face buttons go by their letters, not their places: bevy
+    /// names them by place as an Xbox pad's (South is its A), and benilla-pad gives each name its job (A confirms
+    /// and clicks, B backs out), so the Switch's A is reported as South and its B as East, X as West and Y as North.
+    /// The addon draws each letter where it sits on a Nintendo pad (its Bar.lua).
     const BUTTONS: [(u64, GamepadButton); 16] = [
-        (B, GamepadButton::South),
-        (A, GamepadButton::East),
-        (Y, GamepadButton::West),
-        (X, GamepadButton::North),
+        (A, GamepadButton::South),
+        (B, GamepadButton::East),
+        (X, GamepadButton::West),
+        (Y, GamepadButton::North),
         (L, GamepadButton::LeftTrigger),
         (R, GamepadButton::RightTrigger),
         (ZL, GamepadButton::LeftTrigger2),
