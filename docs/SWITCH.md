@@ -68,6 +68,13 @@ To test:
 - **The Joy-Con through benilla-pad** (`crates/benilla-pad`, from lucasvallejodev/benilla-gamepad): its layout,
   cursor and on-screen keyboard on the Switch.
 
+To finish:
+
+- **Nintendo button names everywhere.** The bar, hint lines, keyboard, wheels, chat and keybind screen say B/A/Y/X,
+  L/R, ZL/ZR, LS/RS and +/− under the Nintendo symbols (`P.Name`, `P.Hint` in the BenillaPad addon's Core.lua). Still
+  in Xbox names: the controller menu's descriptions (Menu.lua; a word-for-word swap would turn the article "A" into
+  "B", so they need Nintendo wording of their own), the README's tables, and any other text that names a button.
+
 Not done on purpose: no clock changes (stock CPU/GPU), no features turned off for speed.
 
 ## Rules
