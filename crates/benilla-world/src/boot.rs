@@ -52,6 +52,13 @@ pub fn tuned_default_plugins(primary_window: Window) -> PluginGroupBuilder {
                         Some("1") => 1,
                         _ => TaskPoolOptions::default().compute.max_threads,
                     },
+                    // wow-nx: std has no CPU count on Horizon, Bevy took that as one core, and the frame's systems
+                    // ran on one worker: one per core of the process (thread.c).
+                    #[cfg(target_os = "horizon")]
+                    min_threads: match std::env::var("WOW_THREADS").ok().as_deref() {
+                        Some("1") => 1,
+                        _ => horizon_cores(),
+                    },
                     ..TaskPoolOptions::default().compute
                 },
                 ..default()
@@ -95,4 +102,13 @@ pub fn tuned_default_plugins(primary_window: Window) -> PluginGroupBuilder {
             ..default()
         });
     plugins
+}
+
+/// The cores the process may run on (benilla-horizon's thread.c reads the kernel's core mask).
+#[cfg(target_os = "horizon")]
+fn horizon_cores() -> usize {
+    unsafe extern "C" {
+        fn wownx_core_count() -> u32;
+    }
+    unsafe { wownx_core_count() as usize }.max(1)
 }

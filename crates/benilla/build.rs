@@ -7,5 +7,7 @@ fn main() {
         println!("cargo:rustc-link-arg-bins=-Wl,--wrap=nvGpuChannelKickoff");
         // benilla-horizon's tls.c: fork handlers register as a no-op (rand panics when newlib refuses them).
         println!("cargo:rustc-link-arg-bins=-Wl,--wrap=pthread_atfork");
+        // thread.c: each new thread takes the next core as its ideal one.
+        println!("cargo:rustc-link-arg-bins=-Wl,--wrap=__syscall_thread_create");
     }
 }
