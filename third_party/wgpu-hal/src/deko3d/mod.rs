@@ -1014,6 +1014,12 @@ impl crate::Surface for Surface {
         }
         let picture = if START_HOLD.lock().done { None } else { unsafe { StartPicture::load(&device.shared, format) } };
         unsafe { fill_start(&device.shared, &images, config.extent, picture.as_ref()) };
+        // The launch's loading picture holds the window through a software framebuffer until here (benilla-horizon's
+        // screen.c, linked into every Switch binary of ours).
+        unsafe extern "C" {
+            fn wownx_release_start_screen();
+        }
+        unsafe { wownx_release_start_screen() };
         let pointers: Vec<*const DkImage> = images.iter().map(ptr::from_ref).collect();
         let mut sm = unsafe { core::mem::zeroed::<DkSwapchainMaker>() };
         unsafe { dkSwapchainMakerDefaults(&mut sm, dk, self.window, pointers.as_ptr(), count) };
@@ -1246,6 +1252,11 @@ impl crate::Queue for Queue {
             q.idle();
             if unsafe { dkQueueIsInErrorState(queue) } {
                 log::error!("deko3d: the GPU faulted in submission {n} ({} command buffers)", command_buffers.len());
+                // What it ran: each buffer's passes and, with WOWNX_GPU_PIPELINES=1, the pipelines inside them.
+                for (i, cb) in command_buffers.iter().enumerate() {
+                    let labels: Vec<&str> = cb.passes.iter().map(|p| p.label.as_str()).collect();
+                    log::error!("deko3d:   command buffer {i}: {} lists, spans {labels:?}", cb.lists.len());
+                }
             }
         }
         fence.state.lock().in_flight.push((fence_value, dk));
