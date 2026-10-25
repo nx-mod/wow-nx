@@ -28,7 +28,7 @@ use crate::items::Items;
 use crate::net::{FieldChanged, NetCommands, ObjectStore, SelfPlayer};
 use crate::spell::Cooldowns;
 
-use super::{PlayerActions, Spells};
+use super::{ActionSlots, PlayerActions, Spells};
 use crate::query_cache::Ask;
 use crate::spell::usable;
 
@@ -292,6 +292,12 @@ fn range_answers(
     (has_range, in_range)
 }
 
+/// Whether the world entry's usable refresh found a slot's pair changed (`0x4e4f90` →
+/// `0x4e5c00`): its `ACTIONBAR_UPDATE_USABLE` (`0x4e5c53`), which the enter cascade signals after
+/// the minimap's set-up and before `UPDATE_BONUS_ACTIONBAR` (`0x490979`), and takes.
+#[derive(Resource, Default)]
+pub(crate) struct EnterUsable(pub(crate) bool);
+
 /// The events one pass of [`feed_action_state`] raised, which [`fire_action_events`] signals.
 #[derive(Resource, Default)]
 pub(crate) struct ActionEvents {
@@ -320,6 +326,8 @@ pub(crate) struct ActionStates<'w, 's> {
     targeting: crate::spell::cast_target::CastTargeting<'w, 's>,
     pet_bar: Option<Res<'w, crate::ui_pet::PetBar>>,
     actions: Res<'w, PlayerActions>,
+    /// The slots as the calls so far left them.
+    slots: Res<'w, ActionSlots>,
     spells: Option<Res<'w, Spells>>,
     // Macro bindings, spell mods, the control flag and the skill lines. The range compare reads
     // the caster and the target through the targeting's context.
@@ -436,19 +444,16 @@ impl ActionStates<'_, '_> {
         bag_updates: u64,
         arrived: bool,
         owed: &mut ActionEvents,
+        enter_usable: &mut bool,
     ) {
         let (memory, new_vm) = self.memory.vm.get_reset(script);
         let cooldowns = &mut *self.cooldowns;
-        let (items, commands, spells) = (&*self.items, &*self.commands, &self.spells);
+        let (items, spells) = (&*self.items, &self.spells);
         let now = Instant::now();
         cooldowns.prune(now);
-        // The callback `0x6e2f70` that the bag getter's and the bag and inventory tooltips'
-        // queries asked, each a lookup with it (`0x6e2f0d`); then every awaited record that
-        // answered, whose flush is this frame's.
-        for entry in script.take_cooldown_record_asks() {
-            let _ = items.template(entry, 0, Ask::Event(commands));
-            cooldowns.await_item_record(entry);
-        }
+        // Every record the callback `0x6e2f70` awaits that answered, whose flush is this frame's:
+        // the bag getter's and the bag and inventory tooltips' queries asked it inside their calls
+        // (`0x6e2f0d`, [`benilla_ui::script::RecordAsk::CooldownItem`]).
         cooldowns.answer_awaited_records(items, spells.as_deref().map(|s| &s.catalog), now);
         let gen_changed = memory.last_generation != Some(cooldowns.generation);
         memory.last_generation = Some(cooldowns.generation);
@@ -518,7 +523,13 @@ impl ActionStates<'_, '_> {
         };
         let (usable_changed, activated) = self.pass(script, pass);
         owed.cooldowns |= gen_changed;
-        owed.usable_changed |= usable_changed;
+        // A pass that ran the world entry's refresh owes its pair change to the enter cascade,
+        // which signals it inside itself (`0x490979` → `0x4e4f90` → `0x4e5c00`).
+        if entered || new_vm {
+            *enter_usable |= usable_changed;
+        } else {
+            owed.usable_changed |= usable_changed;
+        }
         owed.refresh |= refresh;
         owed.activated.extend(activated);
         owed.bags |= bags;
@@ -545,6 +556,7 @@ impl ActionStates<'_, '_> {
             targeting,
             pet_bar,
             actions,
+            slots,
             spells,
             cast_state,
             self_q,
@@ -595,7 +607,7 @@ impl ActionStates<'_, '_> {
         });
 
         let mut fresh: HashMap<u32, ActionState> = HashMap::new();
-        for (&slot, button) in &actions.buttons {
+        for (&slot, button) in &slots.buttons {
             let action = u32::from(slot) + 1;
             let mut st = ActionState::default();
             let (kind, id) = match resolve_through_macro(button.kind, button.action, bound) {
@@ -784,7 +796,7 @@ impl ActionStates<'_, '_> {
 
         // The usable cache: the slots this frame wrote store their pairs silently, then a refresh
         // compares them all.
-        let words: HashMap<u32, SlotWord> = actions
+        let words: HashMap<u32, SlotWord> = slots
             .buttons
             .iter()
             .map(|(&slot, b)| {
@@ -865,11 +877,13 @@ pub(super) fn feed_action_state(
         ActionStates<'static, 'static>,
         Option<Res<'static, crate::item_lane::ItemLane>>,
     )>,
-    // The usable refresh's field-watch callers, the enter cascade and the events owed.
-    (mut edges, mut entries, mut owed): (
+    // The usable refresh's field-watch callers, the enter cascade and the events owed, the
+    // cascade's own apart.
+    (mut edges, mut entries, mut owed, mut enter_usable): (
         MessageReader<FieldChanged>,
         MessageReader<crate::net::WorldEnterCascadeMessage>,
         ResMut<ActionEvents>,
+        ResMut<EnterUsable>,
     ),
     // The active player's creation, whose arrival (`0x5dea50`) writes every slot (`0x5deafc`) and
     // empties the reactive list (`0x5dea86`); a reload reaches neither.
@@ -894,6 +908,7 @@ pub(super) fn feed_action_state(
             bag_updates,
             arrived,
             &mut owed,
+            &mut enter_usable.0,
         );
     })
 }

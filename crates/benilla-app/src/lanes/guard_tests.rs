@@ -10,7 +10,16 @@ use bevy::ecs::component::ComponentId;
 use bevy::prelude::*;
 
 use crate::game_plugins::schedule_tests::SyncPoints;
-use crate::game_plugins::schedule_tests::{census, headless_client, type_names_available};
+use crate::game_plugins::schedule_tests::{census, type_names_available};
+
+/// The whole client headless ([`crate::game_plugins::schedule_tests::headless_client`]), with
+/// every handler's and every lane firing's declared access read.
+fn headless_client() -> App {
+    let mut app = crate::game_plugins::schedule_tests::headless_client();
+    crate::net::handlers::measure(app.world_mut());
+    super::measure(app.world_mut());
+    app
+}
 
 /// What a row names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,9 +81,10 @@ const NOT_YET_ON_A_LANE: &[(Row, &str, &str)] = &[
         "the wire's error texts",
     ),
     (
-        Row::Queue,
+        Row::HostHeld,
         "::minimap::ping::MinimapPing",
-        "the minimap pings",
+        "the members' minimap pings, which `drive_minimap_ping` fires; our own `PingLocation`, \
+         acting in its call, holds the ping in the host",
     ),
     (
         Row::Queue,
@@ -89,6 +99,18 @@ const NOT_YET_ON_A_LANE: &[(Row, &str, &str)] = &[
     (Row::Queue, "::ui_bank::BankErrors", "the bank errors"),
     (
         Row::Queue,
+        "::player::view_subject::FarSight",
+        "the far-sight machine a handler's Lua runs through the host's buff cancel; every feed \
+         that lends the host reads it, and none fires from it",
+    ),
+    (
+        Row::HostHeld,
+        "::ui_action::ActionSlots",
+        "the action slots, which `feed_actions` resolves; a handler's Lua writes them in its \
+         call, through the host's bar verbs",
+    ),
+    (
+        Row::Queue,
         "::ui_dialog_verbs::InstanceBoot",
         "the instance boot",
     ),
@@ -98,15 +120,10 @@ const NOT_YET_ON_A_LANE: &[(Row, &str, &str)] = &[
         "the meeting stone",
     ),
     (
-        Row::Queue,
-        "::ui_dialog_verbs::PetUnlearnState",
-        "the pet unlearn confirm",
-    ),
-    (
         Row::HostHeld,
-        "::ui_guild::GuildState",
-        "the guild state, which `feed_guild` fires from; the guild verbs, acting in their calls, \
-         read it in the host",
+        "::ui_dialog_verbs::PetUnlearnState",
+        "the pet unlearn confirm, which `feed_dialog_verbs` fires; `ConfirmPetUnlearn`, acting in \
+         its call, reads it in the host",
     ),
     (
         Row::HostHeld,
@@ -141,6 +158,13 @@ const NOT_YET_ON_A_LANE: &[(Row, &str, &str)] = &[
         "::ui_logout::LogoutState",
         "the logout state, which `feed_logout` fires from; the session verbs, acting in their \
          calls, hold it in the host",
+    ),
+    (
+        Row::Queue,
+        "::ui_guild::GuildState",
+        "the guild state, which `feed_guild` fires from; the guild verbs, acting in their calls, \
+         read it in the host, and `GetGuildInfo` leaves its waiters there through `&self`, which \
+         the query response's handler spends onto the notice lane",
     ),
     (
         Row::Queue,
@@ -281,11 +305,6 @@ const NOT_YET_ON_A_LANE: &[(Row, &str, &str)] = &[
     ),
     (
         Row::HostHeld,
-        "::ui_dialog_verbs::AreaSpiritHealer",
-        "the area spirit healer, whose `in_range` the time packet's handler fills and `feed_dialog_verbs` fires `AREA_SPIRIT_HEALER_IN_RANGE` from in system order; `AcceptAreaSpiritHeal`'s scan, acting in its call, holds it in the host",
-    ),
-    (
-        Row::HostHeld,
         "::ui_dialog_verbs::BattlefieldQueue",
         "the battleground queue slots, which `feed_dialog_verbs` and `feed_battlefield_score` fire from; the port, leave and positions verbs, acting in their calls, read them in the host",
     ),
@@ -379,6 +398,9 @@ const HOST_HELD_UNREAD: &[&str] = &[
     "::target::Selection",
     "::ui_action::PlayerActions",
     "::ui_auction::AuctionOpen",
+    // Read, and quiet: `feed_dialog_verbs` pushes the deadline the time packet stores and fires
+    // nothing off it, as the packet's `AREA_SPIRIT_HEALER_IN_RANGE` goes on the notice lane.
+    "::ui_dialog_verbs::AreaSpiritHealer",
     "::ui_loot::AutoLootByte",
     "::ui_loot::LootLatch",
     "::ui_merchant::MerchantOpen",
@@ -461,6 +483,8 @@ const READS_FRAME_FINAL: &[(&str, &[&str])] = &[
     ("::ui_instance::feed_instance", &["ui_instance::InstanceState"]),
     ("::ui_billing::poll_play_time", &["net::SessionBilling"]),
     ("::ui_logout::feed_logout", &["ui_logout::LogoutState"]),
+    // The engine's follow transitions, which a `FollowUnit` a handler's listener makes arms.
+    ("::ui_follow::feed_follow", &["player::follow::FollowState", "ui_follow::FollowFeed"]),
     ("::ui_social::feed::feed_social", &["names::NameCache", "ui_social::SocialState"]),
     ("::ui_guild::feed::feed_guild", &["net::ObjectStore", "ui_guild::GuildLocal",
         "ui_guild::GuildState"]),
@@ -476,20 +500,20 @@ const READS_FRAME_FINAL: &[(&str, &[&str])] = &[
         "net::motion::modes::UnitMoveModes", "net::motion::remote::RemoteMotion",
         "net::reputations::Reputations", "spell::mods::SpellModifiers",
         "ui_action::PlayerActions"]),
+    // The ammo getters' hits fire after the push that carries their record, whenever it runs.
     ("::ui_char::feed_char", &["items::Countdowns", "items::Items", "names::NameCache",
-        "net::GuidIndex", "net::ObjectStore"]),
+        "net::GuidIndex", "net::ObjectStore", "ui_char::AmmoRecordHits"]),
     ("::ui_char::feed_skills", &["net::ObjectStore"]),
     ("::ui_reputation::feed_reputation", &["net::ObjectStore", "net::reputations::Reputations"]),
     ("::ui_inspect::feed_inspect", &["items::Items", "names::NameCache", "net::GuidIndex",
-        "net::ObjectStore", "net::SelfGuid", "target::Selection", "ui_party::GroupState"]),
+        "net::ObjectStore", "net::SelfGuid"]),
     ("::ui_honor::feed_honor", &["net::ObjectStore", "target::Selection", "ui_honor::InspectHonor",
-        "ui_party::GroupState"]),
-    ("::ui_dressup::feed_dressup", &["items::Items", "net::ObjectStore", "ui_action::PlayerActions",
-        "ui_guild::GuildState"]),
+        "ui_inspect::InspectTarget", "ui_party::GroupState"]),
     ("::ui_action::recount::recount_item_actions", &["items::Countdowns", "items::Items",
         "net::GuidIndex", "net::ObjectStore"]),
     ("::ui_action::feed::feed_actions", &["items::Countdowns", "items::Items", "net::GuidIndex",
-        "net::ObjectStore", "ui_action::PlayerActions", "ui_action::errors::MountErrors",
+        "net::ObjectStore", "ui_action::ActionSlots", "ui_action::PlayerActions",
+        "ui_action::errors::MountErrors",
         "ui_action::errors::PetTameFailures", "ui_action::errors::UiErrorTexts"]),
     ("::ui_action::state::feed_action_state", &["Transform",
         "creature_anim::sheath::CommittedSheath", "items::Countdowns", "items::Items",
@@ -497,8 +521,8 @@ const READS_FRAME_FINAL: &[(&str, &[&str])] = &[
         "net::UnitSpeeds", "net::game_time::ServerTime", "net::motion::modes::UnitMoveModes",
         "net::motion::remote::RemoteMotion", "net::reputations::Reputations",
         "player::state::StandPending", "spell::cooldowns::Cooldowns", "spell::mods::SpellModifiers",
-        "target::Selection", "ui_action::PlayerActions", "ui_action::state::ActionStateMemory",
-        "ui_pet::PetBar"]),
+        "target::Selection", "ui_action::ActionSlots", "ui_action::PlayerActions",
+        "ui_action::state::ActionStateMemory", "ui_pet::PetBar"]),
     // The ranged-slot item scales a ranged spell's range, read as the frame left it (#2217).
     ("::spell::targeting::feed_targeting_to_vm", &["items::Items", "names::NameCache",
         "net::GuidIndex", "net::ObjectStore", "net::UnitSpeeds", "net::motion::modes::UnitMoveModes",
@@ -521,8 +545,11 @@ const READS_FRAME_FINAL: &[(&str, &[&str])] = &[
     ("::ui_spellbook::feed_spellbook", &["items::Countdowns", "items::Items", "net::GuidIndex",
         "net::ObjectStore", "spell::cooldowns::Cooldowns", "ui_action::PlayerActions",
         "ui_spellbook::LearnedInTab"]),
-    ("::ui_macro::rebind_macro_spells", &["ui_action::PlayerActions"]),
-    ("::ui_macro::load_macros", &["ui_action::PlayerActions"]),
+    // The pet book's sorts, which each pet spell list counts and the derivation follows
+    // (`0x4bdae0`): the frame's lists derive once, after the last.
+    ("::ui_macro::rebind_macro_spells", &["ui_action::ActionSlots", "ui_action::PlayerActions",
+        "ui_pet::PetBar"]),
+    ("::ui_macro::load_macros", &["ui_action::ActionSlots"]),
     ("::ui_talent::feed_talents", &["net::ObjectStore", "ui_action::PlayerActions"]),
     ("::ui_talent_wipe::feed_talent_wipe", &["ui_talent_wipe::TalentWipeState"]),
     ("::ui_shapeshift::feed_shapeshift_bar", &["items::Countdowns", "items::Items",
@@ -553,8 +580,8 @@ const READS_FRAME_FINAL: &[(&str, &[&str])] = &[
         "ui_petition::PetitionRecords"]),
     ("::ui_items::feed::feed_item_stats", &["items::Items", "net::HomeBind", "net::ObjectStore",
         "spell::mods::SpellModifiers"]),
-    ("::ui_items::feed::feed_item_sets", &["items::Items", "net::ObjectStore",
-        "spell::mods::SpellModifiers"]),
+    ("::ui_items::feed::feed_item_sets", &["item_names::ItemNames", "items::Items",
+        "net::ObjectStore", "spell::mods::SpellModifiers"]),
     ("::ui_items::feed::ask_item_build_lookups", &["items::Countdowns", "names::NameCache",
         "net::GuidIndex", "net::ObjectStore", "ui_petition::PetitionRecords"]),
     ("::ui_items::feed::feed_player_req", &["net::ObjectStore", "net::Proficiencies",
@@ -597,14 +624,16 @@ const READS_FRAME_FINAL: &[(&str, &[&str])] = &[
         "net::SelfGuid", "net::reputations::Reputations", "ui_taxi::TaxiState",
         "ui_taxi::routing::TaxiRouteCache"]),
     ("::ui_taxi::feed_on_taxi", &["net::ObjectStore"]),
+    // The getters' item callbacks, kept inside their calls, are spent as the frame left them.
     ("::ui_tradeskill::feed_trade_skill", &["items::Countdowns", "items::Items", "net::GuidIndex",
         "net::ObjectStore", "spell::cooldowns::Cooldowns", "ui_action::PlayerActions",
-        "ui_tradeskill::TradeSkillOpen"]),
+        "ui_tradeskill::TradeSkillItemWaits", "ui_tradeskill::TradeSkillOpen"]),
     // Beast Training reads the pet off its bar and its family off the creature record as the frame
     // left them (#2217).
     ("::ui_craft::feed_craft", &["items::Countdowns", "items::Items", "names::NameCache",
         "net::GuidIndex", "net::ObjectStore", "spell::mods::SpellModifiers",
-        "ui_action::PlayerActions", "ui_craft::CraftOpen", "ui_pet::PetBar"]),
+        "ui_action::PlayerActions", "ui_craft::CraftItemWaits", "ui_craft::CraftOpen",
+        "ui_pet::PetBar"]),
     ("::ui_loot::feed_loot", &["items::Countdowns", "items::Items", "names::NameCache",
         "net::GuidIndex", "net::ObjectStore", "ui_loot::AutoLootByte", "ui_loot::LootLatch",
         "ui_loot::LootState", "ui_party::GroupState"]),
@@ -631,9 +660,14 @@ const READS_FRAME_FINAL: &[(&str, &[&str])] = &[
 /// other sinks (the message sounds and the unit edits, which raise no event) are not queues here.
 const FILLED_THROUGH_A_READ: &[&str] = &[
     "::ui_action::errors::UiErrorKeys",
+    // The far-sight machine the call host's buff cancel runs (`0x6e70ad`).
+    "::player::view_subject::FarSight",
     "::tutorial::Tutorials",
     "::ui_session::latch::LatchCloses",
     "::ui_logout::SessionPosts",
+    // The guild cache's waiters, which `GetGuildInfo` leaves inside its call through `&self`
+    // (`0x4c93d2`).
+    "::ui_guild::GuildState",
 ];
 
 /// Every other resource a handler reads and does not write: state, tables and caches it
@@ -644,6 +678,8 @@ const FILLED_THROUGH_A_READ: &[&str] = &[
 /// check here unseen.
 const READ_ONLY_TO_HANDLERS: &[&str] = &[
     "::ui_chat::edit::ChannelState",
+    // The console's registry, which a `ConsoleExec` a listener makes reads.
+    "::console::ConsoleCommands",
     // The creature families the cast send's pet learn rung reads (`0x60c7c0`).
     "::ui_pet_stats::PetFamilyTables",
     "::AreaTableRes",
@@ -652,6 +688,8 @@ const READ_ONLY_TO_HANDLERS: &[&str] = &[
     "::SpellVisuals",
     "::Creatures",
     "::ItemDisplays",
+    // `ItemClass.dbc`, whose names the host's `GetItemInfo` reads.
+    "::ItemClasses",
     "::GameObjectTemplates",
     "::Enchants",
     "::Items",
@@ -674,6 +712,13 @@ const READ_ONLY_TO_HANDLERS: &[&str] = &[
     "::OwnControlLost",
     "::Player",
     "::player::state::StandPending",
+    // The page cache the host's page turns read.
+    "::ui_item_text::PageTexts",
+    // The streamed terrain the host's minimap ground cast traces.
+    "::terrain_stream::TerrainStreamer",
+    "::Assets<benilla_assets::adt::AdtTile>",
+    // The pet trainer's latch, which the host's `ConfirmPetUnlearn` reads.
+    "::ui_dialog_verbs::PetUnlearnState",
     "::BarUnitOutdoors",
     "::PlayerOutdoors",
     "::EmoteSounds",
@@ -698,7 +743,6 @@ const READ_ONLY_TO_HANDLERS: &[&str] = &[
     "::CombatLogRanges",
     "::LogPeriodicSpells",
     "::GuildMemberNotify",
-    "::ui_guild::GuildState",
     "::PetitionRecords",
     "::ui_petition::PetitionState",
     "::ItemSubClasses",
@@ -737,7 +781,7 @@ const READ_ONLY_TO_HANDLERS: &[&str] = &[
 ];
 
 /// Every lane's queue, by type: what a handler fills there fires in the packets' order.
-fn lane_types() -> [TypeId; 13] {
+fn lane_types() -> [TypeId; 14] {
     [
         TypeId::of::<crate::ui_items::feed::BagView>(),
         // The views lane: what each packet changed in the stores.
@@ -757,12 +801,14 @@ fn lane_types() -> [TypeId; 13] {
         TypeId::of::<crate::ui_tradeskill::ListRebuilds>(),
         // The deaths lane: the signals each death's legs parked, stamped under its health edge.
         TypeId::of::<crate::target::Deaths>(),
+        // The item-text lane: the page-text packets' reads, stamped at their packets.
+        TypeId::of::<crate::ui_item_text::ItemTextLane>(),
     ]
 }
 
 /// [`lane_types`] by the lane that drains each: a queue is stripped only from its own lane's row,
 /// so another lane's read of the same type shows as the state it is.
-fn lane_queue_owners() -> [(&'static str, TypeId); 13] {
+fn lane_queue_owners() -> [(&'static str, TypeId); 14] {
     [
         ("bag view", TypeId::of::<crate::ui_items::feed::BagView>()),
         ("unit views", TypeId::of::<crate::ui_unit::views::ViewLog>()),
@@ -786,6 +832,10 @@ fn lane_queue_owners() -> [(&'static str, TypeId); 13] {
             TypeId::of::<crate::ui_tradeskill::ListRebuilds>(),
         ),
         ("deaths", TypeId::of::<crate::target::Deaths>()),
+        (
+            "item text",
+            TypeId::of::<crate::ui_item_text::ItemTextLane>(),
+        ),
     ]
 }
 
@@ -813,7 +863,7 @@ fn handler_queues(
 ) -> Vec<ComponentId> {
     let handlers = world.resource::<crate::net::handlers::NetHandlers>();
     let mut out = BTreeSet::new();
-    for (_, access) in &handlers.accesses {
+    for (_, access) in handlers.accesses() {
         let access = access.combined_access();
         out.extend(access.resource_writes().filter(|id| !caches.contains(id)));
         out.extend(
@@ -841,7 +891,7 @@ fn filled_apart_from_the_host(app: &mut App) -> std::collections::HashSet<Compon
     let host_writes: Vec<ComponentId> = host.resource_writes().collect();
     let handlers = app.world().resource::<crate::net::handlers::NetHandlers>();
     handlers
-        .accesses
+        .accesses()
         .iter()
         .map(|(_, a)| a.combined_access())
         .filter(|a| !host_writes.iter().all(|&id| a.has_resource_write(id)))
@@ -890,7 +940,7 @@ fn every_resource_a_handler_reads_is_a_known_queue_or_read_only() {
         .map(|t| world.components().get_resource_id(t))
         .collect();
     let mut reads = BTreeSet::new();
-    for (_, access) in &handlers.accesses {
+    for (_, access) in handlers.accesses() {
         let access = access.combined_access();
         for id in access.resource_reads() {
             if !access.has_resource_write(id) && Some(id) != vm && !lanes.contains(&Some(id)) {
@@ -944,6 +994,7 @@ fn the_drain_runs_after_the_feeds_and_before_the_tick() {
             "deaths",
             "equip errors",
             "field notices",
+            "item text",
             "item watchers",
             "list rebuilds",
             "loot",
@@ -1333,7 +1384,7 @@ fn the_systems_unordered_against_the_drain_meet_it_only_on_a_pure_cache() {
     use bevy::ecs::query::{Access, AccessConflicts};
     let mut app = headless_client();
     let mut drain = Access::new();
-    for a in &app.world().resource::<super::Lanes>().1 {
+    for a in app.world().resource::<super::Lanes>().accesses() {
         drain.extend(a.combined_access());
     }
     {
@@ -1480,7 +1531,7 @@ fn every_view_push_of_what_a_handler_writes_is_listed() {
         let handlers = app.world().resource::<crate::net::handlers::NetHandlers>();
         let mut components = BTreeSet::new();
         let mut resources = BTreeSet::new();
-        for (_, access) in &handlers.accesses {
+        for (_, access) in handlers.accesses() {
             let access = access.combined_access();
             if let Ok(kinds) = access.try_iter_component_access() {
                 components.extend(kinds.filter_map(|k| match k {
@@ -1626,13 +1677,25 @@ const LANE_READS_FRAME_FINAL: &[(&str, &[&str])] = &[
     ("loot", &["items::Countdowns", "items::Items", "names::NameCache", "net::GuidIndex",
         "net::ObjectStore", "ui_loot::AutoLootByte", "ui_loot::LootLatch",
         "ui_loot::LootMoveStart", "ui_party::GroupState"]),
+    // The reader's open reads the object, its records and the text caches as the frame left them,
+    // past the answers still on its lane; its register closes whichever latched window holds the
+    // latch, reading that window's state as the frame left it.
+    ("item text", &["go_templates::GameObjectTemplates", "items::Countdowns", "items::Items",
+        "net::GuidIndex", "net::ObjectStore", "ui_auction::AuctionOpen", "ui_bank::BankOpen",
+        "ui_gossip::GossipState", "ui_item_text::ItemTextOpen", "ui_item_text::PageTexts",
+        "ui_mail::MailOpen", "ui_merchant::MerchantOpen", "ui_petition::GuildRegistrarState",
+        "ui_quest::QuestGiver", "ui_session::latch::InteractLatch", "ui_stable::StableOpen",
+        "ui_tabard::TabardOpen", "ui_taxi::TaxiState", "ui_trade::TradeSession",
+        "ui_trainer::TrainerOpen"]),
     ("chat", &["go_templates::GameObjectTemplates", "items::Items", "names::NameCache",
         "net::GuidIndex", "net::ObjectStore", "net::SelfGuid", "ui_chat::edit::ChannelState",
         "world_state::WorldStates"]),
 ];
 
 /// Every lane firing's read of what a handler writes is listed in [`LANE_READS_FRAME_FINAL`],
-/// found as [`every_view_push_of_what_a_handler_writes_is_listed`] finds a feed's.
+/// found as [`every_view_push_of_what_a_handler_writes_is_listed`] finds a feed's; an exclusive
+/// firing, which shows Bevy no access, by the reads it declares ([`super::LaneReads`]), and every
+/// exclusive firing declares them.
 #[test]
 fn every_lane_reads_of_what_a_handler_writes_is_listed() {
     use bevy::ecs::query::{ComponentAccessKind, FilteredAccess};
@@ -1641,7 +1704,7 @@ fn every_lane_reads_of_what_a_handler_writes_is_listed() {
         let handlers = app.world().resource::<crate::net::handlers::NetHandlers>();
         let mut components = BTreeSet::new();
         let mut resources = BTreeSet::new();
-        for (_, access) in &handlers.accesses {
+        for (_, access) in handlers.accesses() {
             let access = access.combined_access();
             if let Ok(kinds) = access.try_iter_component_access() {
                 components.extend(kinds.filter_map(|k| match k {
@@ -1681,9 +1744,29 @@ fn every_lane_reads_of_what_a_handler_writes_is_listed() {
         .collect();
     let lanes = world.resource::<super::Lanes>();
     let mut found: Vec<(&str, BTreeSet<String>)> = Vec::new();
-    for (lane, access) in lanes.names().into_iter().zip(&lanes.1) {
+    let mut undeclared = Vec::new();
+    let firings = lanes
+        .names()
+        .into_iter()
+        .zip(lanes.accesses())
+        .zip(lanes.exclusive_reads());
+    for ((lane, access), (exclusive, declared)) in firings {
+        // An exclusive firing shows Bevy no access: the access its declared reads measure stands
+        // in ([`super::measure`]).
+        match (exclusive, declared) {
+            (true, false) => {
+                undeclared.push(format!("{lane:?} is exclusive and declares no reads"));
+                continue;
+            }
+            (false, true) => undeclared.push(format!(
+                "{lane:?} declares reads, but its firing is not exclusive"
+            )),
+            _ => {}
+        }
         let mut own: Vec<&FilteredAccess> = access.filtered_accesses().iter().collect();
-        for h in &host {
+        // A firing that lends the host shows the host's access beside its own; an exclusive
+        // firing's declared reads are its own alone.
+        for h in host.iter().filter(|_| !exclusive) {
             if let Some(i) = own.iter().position(|o| *o == h) {
                 own.remove(i);
             }
@@ -1707,6 +1790,7 @@ fn every_lane_reads_of_what_a_handler_writes_is_listed() {
         });
         found.push((lane, inputs));
     }
+    assert!(undeclared.is_empty(), "{}", undeclared.join("\n"));
     let wrong: Vec<String> = found
         .iter()
         .filter(|(lane, inputs)| {

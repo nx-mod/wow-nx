@@ -33,6 +33,7 @@ fn feed_inputs(app: &mut App) {
 /// The feed's two halves, around the unit snapshots as the plugin orders them.
 fn add_action_feed(app: &mut App) {
     app.init_resource::<ActionEvents>()
+        .init_resource::<EnterUsable>()
         .init_resource::<super::ActionStateMemory>()
         .add_systems(
             Update,
@@ -166,9 +167,9 @@ fn the_feed_pushes_a_bare_macro_as_usable() {
 
     let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = App::new();
-    let mut actions = PlayerActions::default();
+    let mut slots = crate::ui_action::ActionSlots::default();
     for (slot, index) in [(0u8, 1u32), (1, 2), (2, 3)] {
-        actions.buttons.insert(
+        slots.buttons.insert(
             slot,
             ActionButton {
                 slot,
@@ -181,7 +182,8 @@ fn the_feed_pushes_a_bare_macro_as_usable() {
     let mut bound = MacroBoundSpells::default();
     bound.0.insert(1, BoundSpell::None.into());
     bound.0.insert(2, BoundSpell::Unresolved.into());
-    app.insert_resource(actions)
+    app.insert_resource(PlayerActions::default())
+        .insert_resource(slots)
         .insert_resource(bound)
         .init_resource::<Cooldowns>()
         .init_resource::<crate::spell::SpellModifiers>()
@@ -244,8 +246,8 @@ fn a_ranged_button_pads_its_range_by_the_selected_target_alone() {
     let verdict = |distance: f32| {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut app = App::new();
-        let mut actions = PlayerActions::default();
-        actions.buttons.insert(
+        let mut slots = crate::ui_action::ActionSlots::default();
+        slots.buttons.insert(
             0,
             ActionButton {
                 slot: 0,
@@ -265,7 +267,8 @@ fn a_ranged_button_pads_its_range_by_the_selected_target_alone() {
             max: 35.0,
             flags: 0,
         };
-        app.insert_resource(actions)
+        app.insert_resource(PlayerActions::default())
+            .insert_resource(slots)
             .insert_resource(crate::ui_macro::MacroBoundSpells::default())
             .insert_resource(Spells {
                 catalog: benilla_formats::SpellCatalog::from_displays(
@@ -364,8 +367,8 @@ fn a_melee_button_reaches_the_moving_bonus_while_both_units_run() {
     let verdict = |caster_runs: bool, mob_runs: bool, distance: f32| {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut app = App::new();
-        let mut actions = PlayerActions::default();
-        actions.buttons.insert(
+        let mut slots = crate::ui_action::ActionSlots::default();
+        slots.buttons.insert(
             0,
             ActionButton {
                 slot: 0,
@@ -378,7 +381,8 @@ fn a_melee_button_reaches_the_moving_bonus_while_both_units_run() {
             max: 5.0,
             flags: 1,
         };
-        app.insert_resource(actions)
+        app.insert_resource(PlayerActions::default())
+            .insert_resource(slots)
             .insert_resource(crate::ui_macro::MacroBoundSpells::default())
             .insert_resource(Spells {
                 catalog: benilla_formats::SpellCatalog::from_displays(
@@ -501,8 +505,8 @@ fn food_on_the_bar_greys_while_the_player_is_in_combat() {
     let lit = |in_combat: bool| {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut app = App::new();
-        let mut actions = PlayerActions::default();
-        actions.buttons.insert(
+        let mut slots = crate::ui_action::ActionSlots::default();
+        slots.buttons.insert(
             0,
             ActionButton {
                 slot: 0,
@@ -527,7 +531,8 @@ fn food_on_the_bar_greys_while_the_player_is_in_combat() {
             attributes: 0x1800_0100,
             ..Default::default()
         };
-        app.insert_resource(actions)
+        app.insert_resource(PlayerActions::default())
+            .insert_resource(slots)
             .insert_resource(crate::ui_macro::MacroBoundSpells::default())
             .insert_resource(Spells {
                 catalog: benilla_formats::SpellCatalog::from_displays(
@@ -621,8 +626,8 @@ fn an_item_slot_is_held_by_its_stored_count_not_the_bags() {
     let lit = |stored: u32, in_pack: bool| {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut app = App::new();
-        let mut actions = PlayerActions::default();
-        actions.buttons.insert(
+        let mut slots = crate::ui_action::ActionSlots::default();
+        slots.buttons.insert(
             0,
             ActionButton {
                 slot: 0,
@@ -632,7 +637,8 @@ fn an_item_slot_is_held_by_its_stored_count_not_the_bags() {
         );
         let mut items = Items::default();
         items.insert_template(ITEM, Some(crate::items::test_template("Rough Arrow")));
-        app.insert_resource(actions)
+        app.insert_resource(PlayerActions::default())
+            .insert_resource(slots)
             .insert_resource(crate::ui_macro::MacroBoundSpells::default())
             .insert_resource(Spells::empty_for_tests())
             .init_resource::<Cooldowns>()
@@ -707,8 +713,8 @@ fn a_broken_worn_weapon_draws_no_equipped_border() {
     let equipped = |seat_field: u16, durability: u32| {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut app = App::new();
-        let mut actions = PlayerActions::default();
-        actions.buttons.insert(
+        let mut slots = crate::ui_action::ActionSlots::default();
+        slots.buttons.insert(
             0,
             ActionButton {
                 slot: 0,
@@ -718,7 +724,8 @@ fn a_broken_worn_weapon_draws_no_equipped_border() {
         );
         let mut items = Items::default();
         items.insert_template(SWORD, Some(crate::items::test_template("Sword")));
-        app.insert_resource(actions)
+        app.insert_resource(PlayerActions::default())
+            .insert_resource(slots)
             .insert_resource(crate::ui_macro::MacroBoundSpells::default())
             .insert_resource(Spells::empty_for_tests())
             .add_message::<crate::net::WorldEnterCascadeMessage>()
@@ -884,19 +891,20 @@ fn lost_control_greys_the_bar_but_the_immunity_spell() {
 
     let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = App::new();
-    let mut actions = PlayerActions::default();
+    let mut slots = crate::ui_action::ActionSlots::default();
     for (slot, action, kind) in [
         (0u8, FIREBALL, ACTION_KIND_SPELL),
         (1, WILL, ACTION_KIND_SPELL),
         (2, 1, ACTION_KIND_MACRO),
     ] {
-        actions
+        slots
             .buttons
             .insert(slot, ActionButton { slot, action, kind });
     }
     let mut bound = crate::ui_macro::MacroBoundSpells::default();
     bound.0.insert(1, crate::ui_macro::BoundSpell::None.into());
-    app.insert_resource(actions)
+    app.insert_resource(PlayerActions::default())
+        .insert_resource(slots)
         .insert_resource(bound)
         .insert_resource(Spells {
             catalog: benilla_formats::SpellCatalog::from_displays(
@@ -1012,8 +1020,8 @@ fn a_held_action_polls_answer_their_own_now() {
     };
     let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = App::new();
-    let mut actions = PlayerActions::default();
-    actions.buttons.insert(
+    let mut slots = crate::ui_action::ActionSlots::default();
+    slots.buttons.insert(
         0,
         ActionButton {
             slot: 0,
@@ -1021,7 +1029,8 @@ fn a_held_action_polls_answer_their_own_now() {
             kind: ACTION_KIND_SPELL,
         },
     );
-    app.insert_resource(actions)
+    app.insert_resource(PlayerActions::default())
+        .insert_resource(slots)
         .insert_resource(crate::ui_macro::MacroBoundSpells::default())
         .insert_resource(Spells {
             catalog: benilla_formats::SpellCatalog::from_displays(
@@ -1091,13 +1100,14 @@ fn feed_app(buttons: &[(u8, u32, u8)], spells: Spells, x: f32) -> App {
     use benilla_protocol::ObjectFields;
     let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = App::new();
-    let mut actions = PlayerActions::default();
+    let mut slots = crate::ui_action::ActionSlots::default();
     for &(slot, action, kind) in buttons {
-        actions
+        slots
             .buttons
             .insert(slot, ActionButton { slot, action, kind });
     }
-    app.insert_resource(actions)
+    app.insert_resource(PlayerActions::default())
+        .insert_resource(slots)
         .insert_resource(spells)
         .init_resource::<crate::ui_macro::MacroBoundSpells>()
         .init_resource::<Cooldowns>()
@@ -1821,7 +1831,7 @@ fn a_record_landing_after_its_slot_was_cleared_still_flushes() {
         .apply_wire_item_cooldown(HEARTHSTONE, 8690, Instant::now());
     frame(&mut app);
     app.world_mut()
-        .resource_mut::<PlayerActions>()
+        .resource_mut::<ActionSlots>()
         .buttons
         .clear();
     assert!(
@@ -1864,10 +1874,24 @@ fn a_bag_query_on_a_missing_record_flushes_when_the_record_lands() {
         .resource_mut::<Cooldowns>()
         .apply_wire_item_cooldown(HEARTHSTONE, 8690, Instant::now());
     frame(&mut app);
-    app.world()
-        .non_send_resource::<UiScript>()
-        .run("GetContainerItemCooldown(0, 1)")
-        .unwrap();
+    let entries = {
+        let mut s = app.world_mut().non_send_resource_mut::<UiScript>();
+        s.keep_calls();
+        s.run("GetContainerItemCooldown(0, 1)").unwrap();
+        s.take_cooldown_record_asks()
+    };
+    // The lookup the host makes inside the call ([`Cooldowns::ask_item_record`]).
+    app.world_mut()
+        .resource_scope(|world, mut cooldowns: Mut<Cooldowns>| {
+            for entry in entries {
+                cooldowns.ask_item_record(
+                    world.resource::<Items>(),
+                    world.resource::<crate::net::NetCommands>(),
+                    entry,
+                    0,
+                );
+            }
+        });
     assert!(frame(&mut app).is_empty(), "asked, and waiting");
     app.world_mut()
         .resource_mut::<Items>()
@@ -1989,7 +2013,7 @@ fn placing_or_clearing_a_slot_stores_its_pair_with_no_usable_event() {
     );
     assert!(frame(&mut app).is_empty(), "the bar as it stands at load");
     app.world_mut()
-        .resource_mut::<PlayerActions>()
+        .resource_mut::<ActionSlots>()
         .buttons
         .insert(
             1,
@@ -2014,7 +2038,7 @@ fn placing_or_clearing_a_slot_stores_its_pair_with_no_usable_event() {
         "a refresh finds the placed pair stored"
     );
     app.world_mut()
-        .resource_mut::<PlayerActions>()
+        .resource_mut::<ActionSlots>()
         .buttons
         .remove(&1);
     assert!(frame(&mut app).is_empty(), "a cleared slot");
@@ -2022,10 +2046,11 @@ fn placing_or_clearing_a_slot_stores_its_pair_with_no_usable_event() {
 
 /// `0x4e5c00` signals `ACTIONBAR_UPDATE_USABLE` alone for its callers other than `0x4b31c0`: a
 /// reload's world entry against the cache the last VM left (`0x4e4f90`; the cache is zeroed only
-/// by `InitializeGame`, `0x4e4f50`), each `BAG_UPDATE` (`0x4f9374`) and `EditMacro` (`0x4f132e`).
-/// A pair that changed with no refresh signals nothing. Our player's arrival writes every slot
-/// before its enter cascade refreshes (`0x5deafc`, `0x5deb60`), so it signals nothing; a reload
-/// writes none (`0x495664` reaches no `0x5dea50`).
+/// by `InitializeGame`, `0x4e4f50`), whose event the enter cascade signals inside itself
+/// (`0x490979`), each `BAG_UPDATE` (`0x4f9374`) and `EditMacro` (`0x4f132e`). A pair that changed
+/// with no refresh signals nothing. Our player's arrival writes every slot before its enter
+/// cascade refreshes (`0x5deafc`, `0x5deb60`), so it signals nothing; a reload writes none
+/// (`0x495664` reaches no `0x5dea50`).
 #[test]
 fn the_cache_refreshes_alone_at_a_reload_a_bag_update_and_a_macro_edit() {
     const FROSTBOLT: u32 = 116;
@@ -2052,9 +2077,10 @@ fn the_cache_refreshes_alone_at_a_reload_a_bag_update_and_a_macro_edit() {
     app.world_mut()
         .write_message(crate::net::WorldEnterCascadeMessage);
     record(&mut app, &USABLE);
-    assert_eq!(
-        frame(&mut app),
-        ["ACTIONBAR_UPDATE_USABLE"],
+    take_enter_usable(&mut app);
+    assert!(frame(&mut app).is_empty(), "the cascade signals it");
+    assert!(
+        take_enter_usable(&mut app),
         "a reload's world entry finds the pair the last VM's cache held changed"
     );
 
@@ -2082,11 +2108,18 @@ fn the_cache_refreshes_alone_at_a_reload_a_bag_update_and_a_macro_edit() {
 
     set_mana_quietly(&mut app, 500);
     assert!(frame(&mut app).is_empty());
+    take_enter_usable(&mut app);
     arrive(&mut app, 500);
+    assert!(frame(&mut app).is_empty());
     assert!(
-        frame(&mut app).is_empty(),
+        !take_enter_usable(&mut app),
         "our player's arrival stores every slot ahead of its refresh"
     );
+}
+
+/// Whether the world entry's refresh owes the cascade its `ACTIONBAR_UPDATE_USABLE`, taken.
+fn take_enter_usable(app: &mut App) -> bool {
+    std::mem::take(&mut app.world_mut().resource_mut::<EnterUsable>().0)
 }
 
 /// Our player created anew with `mana`, and the enter cascade its arrival runs.
@@ -2140,10 +2173,11 @@ fn an_arrival_skips_a_spell_the_player_does_not_know() {
     frame(&mut app);
     set_mana_quietly(&mut app, 100);
     assert!(frame(&mut app).is_empty(), "no caller, no event");
+    take_enter_usable(&mut app);
     arrive(&mut app, 100);
-    assert_eq!(
-        frame(&mut app),
-        ["ACTIONBAR_UPDATE_USABLE"],
+    assert!(frame(&mut app).is_empty(), "the cascade signals it");
+    assert!(
+        take_enter_usable(&mut app),
         "the unknown spell's slot kept its pair"
     );
 
@@ -2154,7 +2188,8 @@ fn an_arrival_skips_a_spell_the_player_does_not_know() {
     set_mana_quietly(&mut app, 500);
     assert!(frame(&mut app).is_empty());
     arrive(&mut app, 500);
-    assert!(frame(&mut app).is_empty(), "both known: both stored");
+    assert!(frame(&mut app).is_empty());
+    assert!(!take_enter_usable(&mut app), "both known: both stored");
 }
 
 /// A macro bound to a spell out of the pet's book (`[rec+0x568] != 0`, `0x4e5a50`) is read through
@@ -2266,6 +2301,7 @@ fn the_feed_signals_no_auto_repeat_edge_of_its_own() {
     let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = App::new();
     app.insert_resource(PlayerActions::default())
+        .init_resource::<crate::ui_action::ActionSlots>()
         .insert_resource(crate::ui_macro::MacroBoundSpells::default())
         .init_resource::<Cooldowns>()
         .init_resource::<crate::spell::SpellModifiers>()

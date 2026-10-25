@@ -56,7 +56,8 @@ alsa = { path = "third_party/alsa-0.9" }
 # wow-nx: libc with devkitA64's types for the Switch (third_party/libc/WOW-NX.md): the same 0.2.186 as the lock, with
 # changes only under target_os = "horizon" on aarch64.
 libc = { path = "third_party/libc" }
-# wow-nx: wgpu-hal 27 with a deko3d backend standing in for GLES on Horizon (docs/SWITCH-RENDER.md); unchanged elsewhere.
+# wow-nx: wgpu-hal 27 with a deko3d backend standing in for GLES on Horizon (docs/SWITCH-RENDER.md), and upstream's
+# Vulkan presentation-stall patch (third_party/wgpu-hal/BENILLA.md).
 wgpu-hal = { path = "third_party/wgpu-hal" }
 # wow-nx: wgpu and wgpu-core as upstream, except that their GL backend is built on Horizon too.
 wgpu = { path = "third_party/wgpu" }
@@ -72,6 +73,11 @@ opt-level = 3
 # units: at 16 units the dependencies cost +1.2 cpu_ms at the leg pin, at one nothing, and a cold
 # build is no slower.
 codegen-units = 1
+
+# The movie decoder at opt-level 3 in dev as well: at 1, decoding the 1024-wide intro takes its
+# install test 29 s, at 3 under 6 s.
+[profile.dev.package.benilla-movie]
+opt-level = 3
 
 # Our crates at opt-level 1: Bevy's generic hot paths monomorphize into them, and at opt-level 0
 # Stormwind drops from a pinned 60 fps to ~45.

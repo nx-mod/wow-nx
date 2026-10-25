@@ -345,6 +345,11 @@ pub const CMSG_GAMEOBJECT_QUERY: u16 = 0x005E; // 94
 /// Ask for a quest's template; answered by [`SMSG_QUEST_QUERY_RESPONSE`].
 pub const CMSG_QUEST_QUERY: u16 = 0x005C; // 92
 pub const CMSG_ITEM_QUERY_SINGLE: u16 = 0x0056; // 86
+/// Ask for an item's name alone, the item-name store's query (`0x559fe0`); answered by
+/// [`SMSG_ITEM_NAME_QUERY_RESPONSE`].
+pub const CMSG_ITEM_NAME_QUERY: u16 = 0x02C4; // 708
+/// Answers `CMSG_ITEM_NAME_QUERY`; vmangos sends nothing for an unknown item.
+pub const SMSG_ITEM_NAME_QUERY_RESPONSE: u16 = 0x02C5; // 709
 pub const CMSG_USE_ITEM: u16 = 0x00AB; // 171
 /// Open an openable item (a clam, a lockbox, a gift) by bag position; the loot that answers names
 /// the item's own guid (`HandleOpenItemOpcode`).
@@ -361,6 +366,9 @@ pub const SMSG_GAMEOBJECT_CUSTOM_ANIM: u16 = 0x00B3; // 179
 /// The client arms substate 12 (AnimationData 157) and the object outlives its
 /// `SMSG_DESTROY_OBJECT` for that play.
 pub const SMSG_GAMEOBJECT_DESPAWN_ANIM: u16 = 0x0215; // 533
+/// A used GameObject's page: a bare `u64` guid (vmangos `GameObject.cpp:1549-1554`). The client
+/// opens the item-text reader on the object (`0x5f88c0` → `0x4e32e0`).
+pub const SMSG_GAMEOBJECT_PAGETEXT: u16 = 0x01DF; // 479
 /// We walked into an area trigger: its `AreaTrigger.dbc` id (reference `0x5e2110`).
 pub const CMSG_AREATRIGGER: u16 = 0x00B4; // 180
 /// An area trigger's refusal (level, ghost, faction), shown like `SMSG_NOTIFICATION` (`0x4945b0`).
@@ -460,6 +468,9 @@ pub const CMSG_MOVE_NOT_ACTIVE_MOVER: u16 = 0x02D1; // 721
 /// body (`MiscHandler.cpp:1138-1155`). Sending 0 moves visibility home while the camera stays on
 /// the object, so it must be deliberate; the server expects no reply.
 pub const CMSG_FAR_SIGHT: u16 = 0x027A; // 634
+/// End far sight now: empty body, the view back on the player (`0x5e43f8`). vmangos never sends
+/// it; it clears `PLAYER_FARSIGHT` instead.
+pub const SMSG_CLEAR_FAR_SIGHT_IMMEDIATE: u16 = 0x020D; // 525
 /// Stop auto-repeat: empty body, sent from the local cancel (`0x6ea080`), so on every cancel.
 pub const CMSG_CANCEL_AUTO_REPEAT_SPELL: u16 = 0x026D; // 621
 

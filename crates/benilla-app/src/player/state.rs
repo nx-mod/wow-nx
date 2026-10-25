@@ -375,6 +375,16 @@ pub(crate) struct Player {
     /// before the streamer swaps maps. Set at every snap, cleared once the destination is resident;
     /// while set, the streamer judges no release and pushes [`Player::settle_deadline`] on.
     pub(crate) world_stale: bool,
+    /// The snap moved the body the camera follows more than 30 yards, which the reference answers
+    /// by reloading the destination before the frame goes on (`0x617e90` calls `0x630bd0` for
+    /// `d² > 900`): the frame is held until the settle hold ends ([`Self::holds_the_frame`]).
+    pub(crate) world_reload: bool,
+    /// How many far reloads the body's snaps have asked for ([`Self::world_reload`]'s marks), which
+    /// the stream's focus carries so it re-arms its load on each.
+    pub(crate) reloads: u32,
+    /// When the reload hold gives up (`Time::elapsed_secs`): the stall budget from its snap, never
+    /// extended, as the reference's wait-all ends once every read has, failed or not (`0x443d30`).
+    pub(crate) reload_ceiling: f32,
     /// The camera pitch the login seize seats: the saved pose's `cameraPitch` when
     /// [`super::camera_saved`] restored one, else the stock opening pitch.
     pub(super) login_pitch: Option<f32>,
@@ -513,6 +523,10 @@ pub(super) struct PlayerRide {
     /// The transport's yaw at the snapshot: the carry turns `face_yaw` by its per-frame delta, and
     /// the wire's local orientation is `face_yaw − boat_yaw`.
     pub(super) boat_yaw: f32,
+    /// The transport has been placed since the ride began. A ride seated from our own create
+    /// (`0x618b30`) can name a transport whose path is not built yet; the carry holds it until
+    /// the transport ticks, where it drops a ride whose transport has gone.
+    pub(super) placed: bool,
 }
 
 /// A knockback aimed at our mover (`SMSG_MOVE_KNOCK_BACK`), latched until the mover flies it. The
@@ -531,6 +545,21 @@ pub(super) struct PendingKnockback {
 
 impl Player {
     /// A player whose last streamed movement word is `flags`, for the gates that read it.
+    /// Riding `entity`, placed on its deck at its origin, for other modules' tests.
+    #[cfg(test)]
+    pub(crate) fn riding_for_test(entity: Entity, guid: u64) -> Self {
+        Self {
+            ride: Some(PlayerRide {
+                entity,
+                guid,
+                local_pos: Vec3::ZERO,
+                boat_yaw: 0.0,
+                placed: true,
+            }),
+            ..Self::default()
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn with_move_flags(flags: u32) -> Self {
         Self {
@@ -578,8 +607,15 @@ impl Player {
     /// [`SETTLE_TIMEOUT`] fired first, which the `sett` trace records.
     pub(crate) fn end_settle(&mut self, resident: bool, now: f32) {
         self.settling = false;
+        self.world_reload = false;
         let waited = now - self.settle_since;
         super::move_trace::settle(resident, waited, self.pos);
+    }
+
+    /// The window keeps its last presented frame: a reloading snap's settle hold is up, as the
+    /// reference's reload holds its frame until the destination is in (`0x694920`).
+    pub(crate) fn holds_the_frame(&self) -> bool {
+        self.active && self.settling && self.world_reload
     }
 
     /// The movement flags as last streamed; the water foam tests `& 0xf` (translating) and `& 0x30`

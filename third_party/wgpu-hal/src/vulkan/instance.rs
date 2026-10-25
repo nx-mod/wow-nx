@@ -1031,6 +1031,16 @@ impl Drop for super::Surface {
     }
 }
 
+// BENILLA: a presentation stall past the caller's timeout is waited out, up to this budget
+// (`third_party/wgpu-hal/BENILLA.md`).
+const STALL_BUDGET: core::time::Duration = core::time::Duration::from_secs(30);
+
+// BENILLA: whether a `VK_TIMEOUT` is retried: the caller asked to wait (a zero timeout is a poll,
+// which answers at once by design) and the stall is still inside the budget.
+fn retry_stall(stall_start: std::time::Instant, timeout_ns: u64) -> bool {
+    timeout_ns != 0 && stall_start.elapsed() < STALL_BUDGET
+}
+
 impl crate::Surface for super::Surface {
     type A = super::Api;
 
@@ -1064,6 +1074,9 @@ impl crate::Surface for super::Surface {
         timeout: Option<core::time::Duration>,
         fence: &super::Fence,
     ) -> Result<Option<crate::AcquiredSurfaceTexture<super::Api>>, crate::SurfaceError> {
+        // BENILLA: when this acquire began, for the stall budget.
+        let stall_start = std::time::Instant::now();
+
         let mut swapchain = self.swapchain.write();
         let swapchain = swapchain.as_mut().unwrap();
 
@@ -1104,39 +1117,74 @@ impl crate::Surface for super::Surface {
         // thus waited for `locked_swapchain_semaphores.acquire`, wait for all
         // of them to finish, thus ensuring that it's okay to pass `acquire` to
         // `vkAcquireNextImageKHR` again.
-        swapchain.device.wait_for_fence(
+        //
+        // BENILLA: `Ok(false)` is a timeout, which upstream drops and acquires with a semaphore
+        // the GPU may still hold. The wait is issued again inside the stall budget; past it the
+        // acquire goes on as upstream's does.
+        while !swapchain.device.wait_for_fence(
             fence,
             acquire_semaphore_guard.previously_used_submission_index,
             timeout_ns,
-        )?;
+        )? {
+            if !retry_stall(stall_start, timeout_ns) {
+                break;
+            }
+            log::error!(
+                "waiting for the previous submission timed out after {:?} of a stalled GPU; \
+                 waiting again",
+                stall_start.elapsed()
+            );
+        }
 
         // will block if no image is available
-        let (index, suboptimal) = match unsafe {
-            profiling::scope!("vkAcquireNextImageKHR");
-            swapchain.functor.acquire_next_image(
-                swapchain.raw,
-                timeout_ns,
-                acquire_semaphore_guard.acquire,
-                swapchain.fence,
-            )
-        } {
-            // We treat `VK_SUBOPTIMAL_KHR` as `VK_SUCCESS` on Android.
-            // See the comment in `Queue::present`.
-            #[cfg(target_os = "android")]
-            Ok((index, _)) => (index, false),
-            #[cfg(not(target_os = "android"))]
-            Ok(pair) => pair,
-            Err(error) => {
-                return match error {
-                    vk::Result::TIMEOUT => Ok(None),
-                    vk::Result::NOT_READY | vk::Result::ERROR_OUT_OF_DATE_KHR => {
-                        Err(crate::SurfaceError::Outdated)
+        //
+        // BENILLA: a `VK_TIMEOUT` retries the acquire inside the stall budget. A call that did not
+        // acquire an image leaves the semaphore and fence unaffected (spec, vkAcquireNextImageKHR),
+        // so the same pair is legal to pass again.
+        let (index, suboptimal) = loop {
+            match unsafe {
+                profiling::scope!("vkAcquireNextImageKHR");
+                swapchain.functor.acquire_next_image(
+                    swapchain.raw,
+                    timeout_ns,
+                    acquire_semaphore_guard.acquire,
+                    swapchain.fence,
+                )
+            } {
+                // We treat `VK_SUBOPTIMAL_KHR` as `VK_SUCCESS` on Android.
+                // See the comment in `Queue::present`.
+                #[cfg(target_os = "android")]
+                Ok((index, _)) => break (index, false),
+                #[cfg(not(target_os = "android"))]
+                Ok(pair) => break pair,
+                Err(vk::Result::TIMEOUT) if retry_stall(stall_start, timeout_ns) => {
+                    log::error!(
+                        "vkAcquireNextImageKHR timed out after {:?} of a stalled presentation \
+                         engine; waiting again",
+                        stall_start.elapsed()
+                    );
+                }
+                Err(error) => {
+                    // BENILLA: the raw result, before it is mapped to a coarser error.
+                    if !matches!(
+                        error,
+                        vk::Result::NOT_READY
+                            | vk::Result::ERROR_OUT_OF_DATE_KHR
+                            | vk::Result::ERROR_SURFACE_LOST_KHR
+                    ) {
+                        log::error!("vkAcquireNextImageKHR returned {error:?}");
                     }
-                    vk::Result::ERROR_SURFACE_LOST_KHR => Err(crate::SurfaceError::Lost),
-                    // We don't use VK_EXT_full_screen_exclusive
-                    // VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT
-                    other => Err(super::map_host_device_oom_and_lost_err(other).into()),
-                };
+                    return match error {
+                        vk::Result::TIMEOUT => Ok(None),
+                        vk::Result::NOT_READY | vk::Result::ERROR_OUT_OF_DATE_KHR => {
+                            Err(crate::SurfaceError::Outdated)
+                        }
+                        vk::Result::ERROR_SURFACE_LOST_KHR => Err(crate::SurfaceError::Lost),
+                        // We don't use VK_EXT_full_screen_exclusive
+                        // VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT
+                        other => Err(super::map_host_device_oom_and_lost_err(other).into()),
+                    };
+                }
             }
         };
 
@@ -1150,12 +1198,32 @@ impl crate::Surface for super::Surface {
         // On other platforms, this wait may serve to slightly decrease frame
         // latency, depending on how the platform implements waiting within
         // acquire.
+        //
+        // BENILLA: the image is already acquired and this fence will signal, so a `VK_TIMEOUT`
+        // waits again inside the stall budget; upstream maps it to `DeviceError::Unexpected`, which
+        // wgpu-core treats as a lost device.
         unsafe {
-            swapchain
-                .device
-                .raw
-                .wait_for_fences(&[swapchain.fence], false, timeout_ns)
-                .map_err(super::map_host_device_oom_and_lost_err)?;
+            loop {
+                match swapchain
+                    .device
+                    .raw
+                    .wait_for_fences(&[swapchain.fence], false, timeout_ns)
+                {
+                    Ok(()) => break,
+                    Err(vk::Result::TIMEOUT) if retry_stall(stall_start, timeout_ns) => {
+                        log::error!(
+                            "vkWaitForFences on the acquired image timed out after {:?} of a \
+                             stalled presentation engine; waiting again",
+                            stall_start.elapsed()
+                        );
+                    }
+                    Err(error) => {
+                        // BENILLA: the raw result, before it becomes `DeviceError::Unexpected`.
+                        log::error!("vkWaitForFences on the acquired image returned {error:?}");
+                        return Err(super::map_host_device_oom_and_lost_err(error).into());
+                    }
+                }
+            }
 
             swapchain
                 .device

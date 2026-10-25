@@ -95,9 +95,12 @@ pub(super) fn feed_guild(
         // Our guild id and rank come from our own descriptor, mirrored only while the avatar is
         // streamed: the frames between logout despawn and teardown must not read as leaving the
         // guild. Their `PLAYER_GUILD_UPDATE` is the descriptor watchers' (`crate::field_watch`),
-        // fired after this push.
+        // fired after this push. Written only on a change, so a quiet frame leaves it unchanged.
         if let Some(store) = self_q.iter().next() {
-            guild.mirror_self(store.0.player_guild_id(), store.0.player_guild_rank());
+            let (id, rank) = (store.0.player_guild_id(), store.0.player_guild_rank());
+            if !guild.mirrors(id, rank) {
+                guild.mirror_self(id, rank);
+            }
         }
 
         // `GUILD_INVITE_REQUEST` shows the popup. There is no hide edge: nothing in the 1.12 client
@@ -169,20 +172,17 @@ pub(super) fn feed_guild(
     }
 }
 
-/// Ask the guilds `GetGuildInfo` missed, each with its waiter (`0x4c93d2`): the getter's lookup,
-/// which the getter cannot send from inside the VM.
-pub(super) fn ask_missed_guilds(
-    mut vm: VmWith<ResMut<'static, GuildState>>,
+/// The guilds `GetGuildInfo` missed that a harness's VM kept, each asked with its waiter as the
+/// host asks it inside the call (`0x4c93d2`).
+#[cfg(test)]
+pub(super) fn ask_kept_guilds(
+    mut script: NonSendMut<UiScript>,
+    guild: Res<GuildState>,
     commands: Res<NetCommands>,
 ) {
-    vm.turn(|script, mut guild| {
-        let Some(script) = script else {
-            return;
-        };
-        for (guild_id, guid) in script.take_guild_info_asks() {
-            guild.wait_for_info(guild_id, guid, &commands);
-        }
-    });
+    for (guild_id, guid) in script.take_guild_info_asks() {
+        guild.wait_for_info(guild_id, guid, &commands);
+    }
 }
 
 /// `SMSG_GUILD_INFO`'s chat lines, `GUILD_NAME_TEMPLATE` then `GUILD_INFO_TEMPLATE` (`0x5e6fb0`,

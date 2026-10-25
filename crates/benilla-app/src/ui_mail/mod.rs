@@ -11,6 +11,7 @@
 //! re-asks the server.
 
 use benilla_protocol::messages::{mail_error, mail_message_type, MailListEntry};
+use benilla_ui::script::ItemRead;
 use bevy::prelude::*;
 use std::collections::HashMap;
 
@@ -102,7 +103,7 @@ pub(crate) struct MailResult {
 /// The mailbox session: the open mailbox's guid, the inbox rows as the wire sent them, the
 /// letter-body cache and the result queues. A close forgets the guid and the queues and keeps the
 /// rows, as the reference's close does (`0x4acd71`); the world-enter init (`0x4acb10`) and a
-/// disconnect clear everything.
+/// disconnect clear everything but the bodies.
 #[derive(Resource, Default)]
 pub(crate) struct MailOpen {
     pub(crate) mailbox: Option<u64>,
@@ -174,13 +175,15 @@ impl MailOpen {
         self.show_requested = false;
     }
 
-    /// The world-enter init (`0x4acb10`) and a disconnect: no mailbox and no rows.
+    /// The world-enter init (`0x4acb10`) and a disconnect: no mailbox and no rows. The bodies
+    /// stay: the item-text store is saved (`0x554eb0`), and neither the init nor the world entry
+    /// (`0x555811`) clears it.
     pub(crate) fn clear_session(&mut self) {
         self.clear();
         self.results.clear();
         self.mails.clear();
         self.auction_subjects.clear();
-        self.bodies.clear();
+        self.bodies.clear_pending();
         self.request_resolved = false;
         self.list_results = 0;
     }
@@ -385,20 +388,22 @@ fn resolve_row(
     let (item_id, item_roll, item_count, item_name, item_texture, item_quality) = match &entry.item
     {
         Some(att) => {
-            let template = items.template(att.entry, 0, ask);
-            let name = template.map(|t| rolls.name(&t.name, att.random_prop_id));
-            let quality = template.map(|t| t.quality);
-            let display_id = template.map(|t| t.display_info_id).unwrap_or(0);
-            let texture = icons
-                .and_then(|i| i.catalog.get(display_id))
-                .and_then(|d| d.icon.clone());
+            // The row's lookup, whose miss asks; then what `GetInboxItem` reads of the record as
+            // it runs, read the same way.
+            let _ = items.template(att.entry, 0, ask);
+            let roll = benilla_ui::script::ItemRoll {
+                property: att.random_prop_id,
+                ..Default::default()
+            };
+            let live =
+                crate::ui_items::live::LiveItem::record(att.entry, roll, items, icons, rolls);
             (
                 att.entry,
                 att.random_prop_id,
                 u32::from(att.count),
-                name,
-                texture,
-                quality,
+                live.name(),
+                live.texture(),
+                live.quality(),
             )
         }
         None => (0, 0, 0, None, None, None),
@@ -1185,7 +1190,7 @@ mod tests {
     }
 
     /// A close forgets the mailbox and keeps the rows (`0x4acd71`); the world-enter init and a
-    /// disconnect clear them (`0x4acb10`).
+    /// disconnect clear them (`0x4acb10`), and keep the saved item-text store.
     #[test]
     fn a_close_keeps_the_rows_and_the_session_end_clears_them() {
         let mut m = MailOpen::default();
@@ -1198,7 +1203,7 @@ mod tests {
         assert!(!m.bodies.is_empty());
         m.clear_session();
         assert!(m.mails.is_empty());
-        assert!(m.bodies.is_empty());
+        assert!(!m.bodies.is_empty());
     }
 
     /// No GlobalStrings in a unit test: every key misses.

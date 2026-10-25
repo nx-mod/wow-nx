@@ -52,11 +52,14 @@ pub(crate) fn open_pet_trainer(open: Option<&TrainerOpen>) -> Option<u64> {
         .filter(|_| open.trainer_type == TRAINER_TYPE_PET)
 }
 
-/// `TalkToTrainer` (`0x5df680`) on `trainer`: the window closed through the close core
-/// (`0x5df6bb` → `0x4d7440` with a zero guid), then `CMSG_TRAINER_LIST` for it (`0x5df6fc`). The
-/// asked guid it remembers (`0xc4d788`), which the list's open tests (`0x5dcc85`), has no cell
-/// here: every list opens.
+/// `TalkToTrainer` (`0x5df680`) on `trainer`: the asked guid stored (`0x5df69f`, `0x5df6a8`), the
+/// window closed through the close core (`0x5df6bb` → `0x4d7440` with a zero guid), then
+/// `CMSG_TRAINER_LIST` for it (`0x5df6fc`). Its callers are `SetPetGuid`'s refresh (`0x4bc8b2`),
+/// `OpenTrainer` (`0x4d8d3c`) and the NPC click (`0x5f0385`).
 pub(crate) fn talk_to_trainer(world: &mut World, trainer: u64) {
+    if let Some(mut open) = world.get_resource_mut::<TrainerOpen>() {
+        open.asked = trainer;
+    }
     close_core(world);
     if let Some(net) = world.get_resource::<NetCommands>() {
         let _ = net.0.send(ClientCommand::TrainerList { trainer });
@@ -87,6 +90,9 @@ pub(crate) struct TrainerOpen {
     /// cache's callbacks `0x4d9140` and `0x4d9db0`, which outlive the window and run `0x4d7d40`
     /// when their record lands (`0x4d914a`, `0x4d9dba`), on whatever trainer is open then.
     pub(crate) item_waits: Vec<u32>,
+    /// The trainer `TalkToTrainer` last asked for its list (`0xc4d788`), which a list's open tests
+    /// (`0x5dcc85`): written by every ask, never cleared, 0 before the first.
+    pub(crate) asked: u64,
 }
 
 impl TrainerOpen {
@@ -159,6 +165,21 @@ impl TrainerOpen {
             self.trigger_re_derive();
         }
     }
+}
+
+/// A trainer getter's product lookup with its callback, inside its call
+/// ([`benilla_ui::script::ItemCallback::Trainer`]): the item cache asks a miss, a refused entry
+/// again, and the window keeps one callback per call (`0x4d907e`, `0x4d9cef`), whose landing is a
+/// trigger of the pass ([`TrainerOpen::item_answers`]).
+pub(crate) fn ask_item_record(
+    items: &Items,
+    commands: &NetCommands,
+    open: &mut TrainerOpen,
+    entry: u32,
+    owner: u64,
+) {
+    let _ = items.template(entry, owner, Ask::Event(commands));
+    open.item_waits.push(entry);
 }
 
 /// `SMSG_TRAINER_BUY_FAILED` codes, queued for the feed to log.
@@ -445,6 +466,35 @@ pub(crate) struct ReEvalInputs<'w, 's> {
     edges: MessageReader<'w, 's, FieldChanged>,
 }
 
+/// The pet a pet-learn row re-evaluates against: the unit the player's `UNIT_FIELD_SUMMON` names
+/// (`0x4d7f2d`, looked up with mask 8 at `0x4d7f49`), `None` when none is held (`0x4d7f5a`), at its
+/// own level (`0x4d7f99`). `KnowsSpell` (`0x60c740`) reads a unit's book only as the pet bar's
+/// unit (`0x60c77a`-`0x60c790`), so another summon knows nothing.
+fn pet_view<'a>(
+    summon: Option<u64>,
+    store_of: impl Fn(u64) -> Option<&'a ObjectStore>,
+    bar: &benilla_protocol::messages::PetSpells,
+) -> Option<reeval::PetView> {
+    /// `TYPEMASK_UNIT`, the lookup's mask.
+    const TYPEMASK_UNIT: u32 = 0x8;
+    let guid = summon?;
+    let store = store_of(guid)
+        .filter(|store| store.0.object_type_mask().unwrap_or(0) & TYPEMASK_UNIT != 0)?;
+    let known = if guid == bar.pet_guid {
+        bar.spells
+            .iter()
+            .filter(|e| e.is_spell())
+            .map(|e| e.action())
+            .collect()
+    } else {
+        BTreeSet::new()
+    };
+    Some(reeval::PetView {
+        level: store.0.unit_level().unwrap_or(0),
+        known,
+    })
+}
+
 /// The resources a service description's `$`-tokens read beside the caster's descriptor: the
 /// spell-modifier tables and the bind point `$z` names, the same two reads the item and spell
 /// tooltip feeds make.
@@ -499,8 +549,8 @@ pub(crate) fn feed_trainer(
         let Some(skill_lines) = skill_lines.as_deref() else {
             return;
         };
-        // The getters' item callbacks, kept by their calls; a record that answered one is a trigger.
-        open.item_waits.extend(script.take_trainer_item_waits());
+        // The getters' item callbacks, kept inside their calls
+        // ([`benilla_ui::script::ItemCallback::Trainer`]); a record that answered one is a trigger.
         open.item_answers(&items);
         // The per-list reset goes in before the snapshot, so `TRAINER_SHOW` finds it; the stock
         // window re-applies its saved filter only on its own `ADDON_LOADED`.
@@ -544,9 +594,8 @@ pub(crate) fn feed_trainer(
             0
         };
         let forced = passes > 0;
-        // The stock window calls `GetTrainerServiceIcon` and `GetTrainerServiceDescription`, which
-        // look the product up with a callback (`0x4d9096`, `0x4d9d07`), at `TRAINER_SHOW` and
-        // `TRAINER_UPDATE`: a list, a re-derive, or a window this VM has not shown.
+        // The stock window reads `UnitName("npc")` at `TRAINER_SHOW` and `TRAINER_UPDATE`: a list,
+        // a re-derive, or a window this VM has not shown.
         let ask = Ask::at(last.is_none() || listed || forced, &commands);
         if forced {
             let player = reeval::PlayerView {
@@ -572,21 +621,17 @@ pub(crate) fn feed_trainer(
                             .collect()
                     })
                     .unwrap_or_default(),
-                pet: (re_eval.pet_bar.spells.pet_guid != 0)
-                    .then(|| re_eval.index.0.get(&re_eval.pet_bar.spells.pet_guid))
-                    .flatten()
-                    .and_then(|&e| re_eval.stores.get(e).ok())
-                    .map(|store| reeval::PetView {
-                        level: store.0.unit_level().unwrap_or(0),
-                        known: re_eval
-                            .pet_bar
-                            .spells
-                            .spells
-                            .iter()
-                            .filter(|e| e.is_spell())
-                            .map(|e| e.action())
-                            .collect(),
-                    }),
+                pet: pet_view(
+                    self_player.and_then(|(_, store)| store.0.unit_summon()),
+                    |guid| {
+                        re_eval
+                            .index
+                            .0
+                            .get(&guid)
+                            .and_then(|&e| re_eval.stores.get(e).ok())
+                    },
+                    &re_eval.pet_bar.spells,
+                ),
             };
             let TrainerOpen {
                 services,
@@ -728,7 +773,9 @@ pub(crate) fn feed_trainer(
                 },
                 icons.as_deref(),
                 &items,
-                ask,
+                // A product is asked by the icon and description getters' calls alone, inside
+                // them (`0x4d9096`, `0x4d9d07`): the list and its passes look no item up.
+                Ask::Read,
                 &ServiceText {
                     player: &ctx,
                     pet: &pet_ctx,
@@ -849,7 +896,8 @@ pub(crate) fn close_core(world: &mut World) {
 }
 
 /// `SMSG_TRAINER_LIST`'s open, `0x4d7440(trainer)`: the open trainer's own list re-lists in place
-/// (`0x4d7459`); any other registers on the latch (`0x4d74ce`), then the cell (`0x4d74d5`).
+/// (`0x4d7459`); a zero guid is the close core (`0x4d7461`), after which the list builds on the
+/// zero cell; any other registers on the latch (`0x4d74ce`), then the cell (`0x4d74d5`).
 pub(crate) fn open_trainer(
     world: &mut World,
     trainer: u64,
@@ -857,7 +905,9 @@ pub(crate) fn open_trainer(
     services: Vec<TrainerSpell>,
     greeting: String,
 ) {
-    if world.resource::<TrainerOpen>().trainer != Some(trainer) {
+    if trainer == 0 {
+        close_core(world);
+    } else if world.resource::<TrainerOpen>().trainer != Some(trainer) {
         crate::ui_session::register(world, trainer);
     }
     world
@@ -892,10 +942,13 @@ impl TrainerSteps<'_, '_> {
     }
 
     /// The rest of `TalkToTrainer` on the player's own guid (`0x5df680`) after its close
-    /// (`0x5df6bb`): `CMSG_TRAINER_LIST` (`0x5df6fc`), which the server answers with nothing for
-    /// a player.
+    /// (`0x5df6bb`): the asked guid (`0x5df69f`), then `CMSG_TRAINER_LIST` (`0x5df6fc`), which the
+    /// server answers with nothing for a player.
     pub(crate) fn ask_own_list(&mut self, trainer: u64) {
         debug!("ui_trainer: OpenTrainer asks for the player's own list");
+        if let Some(open) = self.open.as_deref_mut() {
+            open.asked = trainer;
+        }
         let _ = self.net.0.send(ClientCommand::TrainerList { trainer });
     }
 

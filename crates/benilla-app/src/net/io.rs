@@ -410,23 +410,56 @@ fn publish(
 /// nothing, leaving the screen on its connecting dialog for good. Here both queries re-dial on
 /// any failure, with a full logon from the cycle's credentials, because benilla's logon has no
 /// reconnect exchange and a connect that can never complete is a dead end, not a behaviour; the
-/// new session key serves the next world dial as the reconnect's would.
+/// new session key serves the next world dial as the reconnect's would. A PIN account's re-dial
+/// presses the PIN the logon proved on its new challenge's grid, as the reconnect asks for none.
+/// A PIN a re-dial's proof has refused (a TOTP code moves on, vmangos `AuthSocket.cpp:720`) is
+/// forgotten and the logon dials no more, so every query fails from then on: each refusal is a
+/// wrong password to the server (`:856`), and the list asks every 5 s.
 fn query(
     logon: &mut benilla_protocol::Logon,
     req: &LoginRequest,
     events_tx: &Sender<SessionEvent>,
 ) -> bool {
     let mut ok = logon.refresh_realms(REALM_REFRESH_TIMEOUT);
-    if !ok {
-        match benilla_protocol::logon(&req.host, &req.user, &req.pass, req.locale) {
+    if !ok && logon.can_redial() {
+        let kept = logon.pin().map(<[u8]>::to_vec);
+        let mut press = |grid: &[u8; 10]| {
+            redial_digits(kept.as_deref(), crate::run_mode::EnvPin::process())
+                .and_then(|digits| benilla_protocol::auth::pin::positions(grid, &digits))
+                .ok_or_else(|| anyhow!("the re-dial has no PIN to press"))
+        };
+        // A hidden re-dial for the realm list: no logon on the screen to tell the states to.
+        match benilla_protocol::logon_with_pin(
+            &req.host,
+            &req.user,
+            &req.pass,
+            req.locale,
+            &mut press,
+            &mut |_| {},
+        ) {
             Ok(fresh) => {
                 *logon = fresh;
                 ok = true;
             }
-            Err(e) => bevy::log::warn!("net: realm list re-dial failed: {e:#}"),
+            Err(e) => {
+                bevy::log::warn!("net: realm list re-dial failed: {e:#}");
+                if logon.pin().is_some() && e.downcast_ref::<AuthReject>().is_some() {
+                    logon.forget_pin();
+                }
+            }
         }
     }
     publish(events_tx, &logon.realms, !ok)
+}
+
+/// The PIN digits a re-dial's prompt is answered with: the environment's, derived from the clock
+/// as the prompt arrives (a TOTP code moves on every 30 s, so one kept from the first logon is
+/// stale after a long park), else the digits the logon proved.
+fn redial_digits(kept: Option<&[u8]>, env: &crate::run_mode::EnvPin) -> Option<Vec<u8>> {
+    match env.digits_now() {
+        Ok(Some(digits)) => Some(digits),
+        _ => kept.map(<[u8]>::to_vec),
+    }
 }
 
 /// The pre-logon park: waits for credentials. With no realmd link, a realm list query fails at
@@ -482,10 +515,62 @@ fn logon_park(
                     Some(LogonAnswer::Enter(realm, generation))
                 }
                 Ok(ParkRequest::Realm(RealmRequest::Close)) => Some(LogonAnswer::Close),
-                // No world session here to leave, and no character screen to ask.
-                Ok(ParkRequest::Realm(RealmRequest::Leave) | ParkRequest::Char(_)) => None,
+                // No world session here to leave, no character screen to ask and no keypad.
+                Ok(ParkRequest::Realm(RealmRequest::Leave | RealmRequest::Pin { .. })
+                    | ParkRequest::Char(_)) => None,
             },
             recv(login_rx) -> msg => Some(msg.map_or(LogonAnswer::Exit, LogonAnswer::Login)),
+        };
+        if let Some(answer) = answer {
+            return answer;
+        }
+    }
+}
+
+/// PIN prompts made this process, each numbered from 1, so keys are only ever proved on the grid
+/// they were pressed on.
+static PIN_PROMPTS: AtomicU64 = AtomicU64::new(0);
+
+/// The keypad's answer of no keys: no screen stood to show it ([`RealmRequest::Pin`]).
+#[derive(Debug)]
+struct NoPinEntry;
+
+impl std::fmt::Display for NoPinEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the account asks for a PIN and no screen can enter it")
+    }
+}
+
+impl std::error::Error for NoPinEntry {}
+
+/// The logon at the keypad (logon state 7, `0x5b1cd7`): waits for the keys `PINEntered` hands on
+/// for this `prompt` (`0x5ab5a0` → `0x5b3120`); keys for another prompt are dropped. No keys
+/// ([`NoPinEntry`]), a Cancel (`0x5b3320`, its close behind a moved generation: one an older
+/// attempt left is stale), the app's exit and a new login each end the wait with an error, the new
+/// login handed back to supersede the attempt; anything else asked meanwhile is dropped, as no
+/// screen asks it there.
+fn keypad(
+    parks: &Parks,
+    prompt: u64,
+    canceled: &dyn Fn() -> bool,
+) -> (Result<Vec<u8>>, Option<LoginRequest>) {
+    let Parks {
+        login_rx, park_rx, ..
+    } = parks;
+    loop {
+        // No `break` or `continue` inside the `select!` arms (`login_park`).
+        let answer = crossbeam_channel::select! {
+            recv(park_rx) -> msg => match msg {
+                Err(_) => Some((Err(anyhow!("the app is gone")), None)),
+                Ok(ParkRequest::Realm(RealmRequest::Pin { prompt: p, keys })) if p == prompt => {
+                    Some((keys.map(|k| k.positions).ok_or_else(|| NoPinEntry.into()), None))
+                }
+                Ok(ParkRequest::Realm(RealmRequest::Close)) if canceled() => {
+                    Some((Err(anyhow!("the PIN entry was cancelled")), None))
+                }
+                Ok(_) => None,
+            },
+            recv(login_rx) -> msg => Some((Err(anyhow!("a new login superseded the PIN entry")), msg.ok())),
         };
         if let Some(answer) = answer {
             return answer;
@@ -517,9 +602,32 @@ fn run(
             let _ = events_tx.send(SessionEvent::LoginStage { stage: s });
         };
 
-        // Logon: the dial and the SRP6 exchange against realmd.
+        // Logon: the dial and the SRP6 exchange against realmd, waiting at the keypad when the
+        // challenge asks for a PIN.
         stage(LoginStage::Connecting);
-        let mut logon = match benilla_protocol::logon(&req.host, &req.user, &req.pass, req.locale) {
+        let mut superseded = None;
+        let logon = benilla_protocol::logon_with_pin(
+            &req.host,
+            &req.user,
+            &req.pass,
+            req.locale,
+            &mut |grid| {
+                let prompt = PIN_PROMPTS.fetch_add(1, Ordering::SeqCst) + 1;
+                stage(LoginStage::Pin {
+                    grid: *grid,
+                    prompt,
+                });
+                let (answer, next) = keypad(parks, prompt, &canceled);
+                superseded = next;
+                answer
+            },
+            &mut |s| stage(s),
+        );
+        if let Some(next) = superseded {
+            req = next;
+            continue 'logon;
+        }
+        let mut logon = match logon {
             Ok(l) => l,
             Err(e) => {
                 if canceled() {
@@ -527,16 +635,22 @@ fn run(
                 }
                 // A dial that never opened a socket, the one failure the screen can advise on.
                 let dial = e.downcast_ref::<benilla_protocol::DialFailure>().cloned();
-                // A server refusal carries its auth result byte for the `AUTH_*` string; a
-                // transport failure carries none.
-                let refusal = e.downcast_ref::<AuthReject>().map(|r| match r.reply {
-                    benilla_protocol::LogonReply::Challenge => {
-                        benilla_protocol::LoginRefusal::Logon(r.code)
-                    }
-                    benilla_protocol::LogonReply::Proof => {
-                        benilla_protocol::LoginRefusal::LogonProof(r.code)
-                    }
-                });
+                // A server refusal carries its auth result byte for the `AUTH_*` string, and a PIN
+                // no screen could enter is the client's own; a transport failure carries none.
+                let refusal = e
+                    .downcast_ref::<AuthReject>()
+                    .map(|r| match r.reply {
+                        benilla_protocol::LogonReply::Challenge => {
+                            benilla_protocol::LoginRefusal::Logon(r.code)
+                        }
+                        benilla_protocol::LogonReply::Proof => {
+                            benilla_protocol::LoginRefusal::LogonProof(r.code)
+                        }
+                    })
+                    .or_else(|| {
+                        e.downcast_ref::<NoPinEntry>()
+                            .map(|_| benilla_protocol::LoginRefusal::NoPinEntry)
+                    });
                 // wow-nx: the screen says only "disconnected"; the log keeps why.
                 bevy::log::warn!("net: logon to {} failed: {e:#} (dial failure: {})", req.host, dial.is_some());
                 let _ = events_tx.send(SessionEvent::LoginFailed {
@@ -768,6 +882,8 @@ fn world(
                         }
                         // `ConnectToRealm` with the world up drops it first (`0x46b22b`).
                         Ok(ParkRequest::Realm(RealmRequest::Leave)) => Parked::Leave,
+                        // No logon waits at a keypad here.
+                        Ok(ParkRequest::Realm(RealmRequest::Pin { .. })) => Parked::StayPut,
                         Ok(ParkRequest::Char(CharRequest::Enter(guid))) => Parked::Play(guid),
                         // Select's Back: drop the parked session, return to the login park.
                         Ok(ParkRequest::Char(CharRequest::Abandon)) => Parked::Repark,
@@ -952,6 +1068,18 @@ enum StreamEnd {
     Back(&'static str),
 }
 
+/// A packet's events in the order the app hears them. A saved store's answer sends its bytes
+/// ([`SessionEvent::SavedAnswer`]) ahead of its decoded record, so a store never holds a record
+/// whose bytes are still on the way.
+pub(crate) fn inbound(opcode: u16, events: Vec<SessionEvent>, body: Vec<u8>) -> Vec<SessionEvent> {
+    if !crate::wdb::is_saved_answer(opcode) {
+        return events;
+    }
+    std::iter::once(SessionEvent::SavedAnswer { opcode, body })
+        .chain(events)
+        .collect()
+}
+
 /// The world stream: every packet off the socket into [`SessionEvent`]s until a logout or a refused
 /// character login ends the world session, the socket fails or the app exits.
 fn stream(
@@ -991,7 +1119,7 @@ fn stream(
                         &wire_trace::in_line(opcode, events.len(), &body),
                     );
                 }
-                for ev in events {
+                for ev in inbound(opcode, events, body) {
                     // The pong bypass: the reference's `OnData` (`0x537b10`) hands `SMSG_PONG` to
                     // `HandlePong` (`0x537d60`) inline, not onto the game thread's queue, so it is
                     // timed and consumed here.
@@ -1329,6 +1457,9 @@ pub(super) fn writer_loop(
                         w.pet_name_query(pet_number, guid)
                     }
                     ClientCommand::ItemQuery { entry, guid } => w.item_query(entry, guid),
+                    ClientCommand::ItemNameQuery { entry, guid } => {
+                        w.item_name_query(entry, guid)
+                    }
                     ClientCommand::UseItem {
                         bag_index,
                         slot,

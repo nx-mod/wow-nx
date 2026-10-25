@@ -171,15 +171,16 @@ pub(crate) struct UiPassState {
     pub(crate) derives_before: u64,
 }
 
-/// The player-UI feed phase, after [`WorldStage::Net`] and ungated (`UnitFeed` is the gated
-/// sub-phase): every push this frame's tick must see, as in the reference's frame, where packet
-/// dispatch precedes every `FrameScript_SignalEvent` and both precede `OnUpdate`. Every VM holder
-/// in `Update` is in this set or `.after(UiInput)`, as `game_plugins::schedule_tests` checks.
+/// The player-UI feed phase, after [`WorldStage::Net`] and the input pass and ungated (`UnitFeed`
+/// is the gated sub-phase): every push this frame's tick must see, as in the reference's tick,
+/// where the packets (category 6, `0x420d55`) follow the window input and precede the frame pass's
+/// `OnUpdate`. Every VM holder in `Update` is in [`UiInput`], in this set or `.after(UiTick)`, as
+/// `game_plugins::schedule_tests` checks.
 #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct UiFeed;
 
 /// The drains of what the pass's Lua asked for (a send, a window's verb, a save, a sound), after
-/// the input pass and after every later host they are free to follow: the reference applies each
+/// the tick and after every later host they are free to follow: the reference applies each
 /// inside its call, so an ask is drained the frame it is made, wherever in the pass its Lua ran.
 #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct UiDrain;
@@ -188,10 +189,19 @@ pub(crate) struct UiDrain;
 #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct UiPaint;
 
-/// The player-UI input pass (tick, hit-test, handlers), before [`WorldStage::Input`] so its
-/// [`PlayerUiHover`] reaches `PointerOverUi` before `player::control` reads it.
+/// The player-UI input pass (hit test, handlers, then the bindings): the frame's window input
+/// records, which the reference runs ahead of its packets (`0x423920` at `0x420d23`), so ahead of
+/// [`UiFeed`]; and before [`WorldStage::Input`], so its [`PlayerUiHover`] reaches `PointerOverUi`
+/// before `player::control` reads it. It follows the net drain, as the pass's start does
+/// ([`crate::vm_pass::VmPass::Start`]).
 #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct UiInput;
+
+/// The tick: the `OnUpdate` walk of the frame pass (category 0x11 at `0x420d6a`, `0x764330` →
+/// `0x765650`), after the input pass and the feeds, so a handler reads this frame's input and
+/// packets applied.
+#[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct UiTick;
 
 /// The frame's atomic (`Instant`, `GetTime`) pair, the one base for mapping a store `Instant` onto
 /// `GetTime`: `anchor`'s steps are the VM clock's deltas, so a mapped start is stable frame to
@@ -298,17 +308,14 @@ pub(crate) fn on_cvar(ev: On<crate::cvars::CvarChanged>, mut scale: ResMut<UiSca
 /// `/reload` queue, which the world alone honours. It prints nothing in any state: the handler
 /// sets the flag `[0xb41d8c]` and calls `CGGameUI::Reload` (`0x491380`), neither of which writes
 /// a line, so a run with no interface to reload is silent too.
-fn console_reload_ui(world: &mut World, _args: &str) -> Vec<String> {
-    if let Some(mut rebuild) = world.get_resource_mut::<glue::GlueRebuild>() {
+fn console_reload_ui(steps: &mut crate::console::ConsoleSteps, _args: &str) -> Vec<String> {
+    if let Some(rebuild) = steps.glue_rebuild.as_deref_mut() {
         rebuild.request();
     }
-    crate::script_calls::with_hosted_vm(world, |script| {
-        if let Some(Err(e)) =
-            script.map(|s| s.session_call(benilla_ui::script::SessionRequest::ReloadUi))
-        {
-            debug!("console: reloadUI with no interface to reload: {e}");
-        }
-    });
+    // `CGGameUI::Reload`'s flag `0xb4b3f4`, which the session's `ReloadUI()` sets too.
+    if let Some(reload) = steps.reload.as_deref_mut() {
+        reload.0 = true;
+    }
     Vec::new()
 }
 
@@ -317,7 +324,7 @@ impl Plugin for UiScriptPlugin {
         use crate::console::ConsoleCommandApp;
         app.add_observer(on_cvar);
         // Category 1 with no help (`0x402ba6`-`0x402bb4`).
-        app.console_command(
+        app.console_command_in_call(
             "reloadUI",
             crate::console::GRAPHICS,
             None,
@@ -392,33 +399,33 @@ impl Plugin for UiScriptPlugin {
                 PreUpdate,
                 (
                     run_pending_reload,
-                    // The glue's `ConsoleExec` lines the last frame left and its top's size
-                    // callback, then the rebuild either asked for. The callback reads the
-                    // `gxResolution` the screen shows this frame.
-                    (
-                        glue::drain_glue_console,
-                        glue::watch_glue_aspect.after(crate::video::show_screen_size),
-                    )
-                        .chain()
+                    // The glue top's size callback, then the rebuild it or a `reloadUI` asked
+                    // for. The callback reads the `gxResolution` the screen shows this frame.
+                    glue::watch_glue_aspect
+                        .after(crate::video::show_screen_size)
                         .run_if(glue::glue_ui_up),
                     glue::run_pending_glue_rebuild,
                     lifecycle::run_pending_entry_load,
                 )
                     .chain(),
             )
-            // The UI phases in order: feeds after the net drain, the tick and the input pass, then
-            // the paint; the drains of what the Lua asked after the input pass, and after every
-            // later host the VM pass can put them behind, before the paint (`crate::vm_pass`).
+            // The UI phases in the reference's tick order (`core/loop`, "What one tick runs"): the
+            // window input records (`0x423920` at `0x420d23`), then the feeds of the packets
+            // (category 6, `0x420d55`), then the tick, the frame pass's `OnUpdate` walk (category
+            // 0x11, `0x420d6a`), and the paint; the drains of what the Lua asked after the tick,
+            // and after every later host the VM pass can put them behind, before the paint
+            // (`crate::vm_pass`).
             .configure_sets(
                 Update,
                 (
-                    UiFeed.after(WorldStage::Net),
-                    UiInput.before(WorldStage::Input),
+                    UiInput.after(WorldStage::Net),
+                    UiFeed,
+                    UiTick.before(WorldStage::Input),
                     UiPaint,
                 )
                     .chain(),
             )
-            .configure_sets(Update, UiDrain.after(UiInput))
+            .configure_sets(Update, UiDrain.after(UiTick))
             // `GetFramerate()`'s ring, a static of the client's that no reload or logout
             // resets: the feed hands a new VM its rate before the tick, and each world frame's
             // step joins the ring after its paint, standing for `CGWorldFrame::OnRender`
@@ -432,26 +439,35 @@ impl Plugin for UiScriptPlugin {
                     .after(WorldStage::Present)
                     .run_if(in_state(crate::client_state::ClientState::InWorld)),
             )
-            // The input pass hit-tests the rects the tick just resolved, and runs in-world only or
-            // on the stock glue screens.
+            // The input pass hit-tests the rects the last frame's paint resolved, as the reference's
+            // records meet the rects its last frame pass drained (`0x7656ba`, `0x765799`), and runs
+            // in-world only or on the stock glue screens.
             .init_resource::<UiPassState>()
             .add_systems(
                 Update,
                 (
-                    extract::tick_script,
                     input::feed_ui_input.run_if(
                         in_state(crate::client_state::ClientState::InWorld).or(glue::glue_ui_up),
                     ),
                     input::feed_ui_wheel.run_if(
                         in_state(crate::client_state::ClientState::InWorld).or(glue::glue_ui_up),
                     ),
-                    // Off the walk that just ran, for the pick and the arbiter after the pass.
-                    crate::vplates::seed_plate_hover,
                 )
                     .chain()
                     .in_set(UiInput)
                     // So a key a focused box consumed never also fires a binding.
                     .before(crate::bindings::BindingSet),
+            )
+            .add_systems(
+                Update,
+                (
+                    extract::tick_script,
+                    // After the input pass's hover walk and the pump's leaves and re-pick, for the
+                    // pick after the pass.
+                    crate::vplates::seed_plate_hover,
+                )
+                    .chain()
+                    .in_set(UiTick),
             )
             // After the plate driver seats this frame's nameplates, and before the append lane
             // fills the widget slot this pass parks.
@@ -856,6 +872,8 @@ mod cinematic_tests;
 mod glue_input_tests;
 #[cfg(test)]
 mod key_walk_tests;
+#[cfg(test)]
+mod tick_order_tests;
 
 #[cfg(test)]
 mod cast_tests;

@@ -11,7 +11,7 @@ use crate::net::{ClientCommand, NetCommands};
 
 use crate::spell::{cast_target, CastLadder};
 
-use super::{attack_actor_refusal, PlayerActions, UiErrorKeys, SPELL_ATTACK};
+use super::{attack_actor_refusal, ActionSlots, UiErrorKeys, SPELL_ATTACK};
 use crate::query_cache::Ask;
 
 /// What clicking an item action does, and to which copy.
@@ -235,7 +235,8 @@ pub(crate) fn drain_click_casts(
 /// What a `UseAction` press reads and writes.
 #[derive(bevy::ecs::system::SystemParam)]
 pub(crate) struct ActionPress<'w, 's> {
-    actions: Res<'w, PlayerActions>,
+    /// The slots as the calls before the press left them.
+    slots: Res<'w, ActionSlots>,
     targeting: cast_target::CastTargeting<'w, 's>,
     // The by-key error line. Not a `CastLadder` field: Bevy panics, at runtime and not in unit
     // tests, on a resource reachable twice from one system.
@@ -266,7 +267,7 @@ pub(crate) fn use_action(
     press: benilla_ui::script::ActionUse,
 ) -> UseOutcome {
     let ActionPress {
-        actions,
+        slots,
         targeting,
         ui_errors,
         ladder,
@@ -279,7 +280,7 @@ pub(crate) fn use_action(
         Ok(s) => s,
         Err(_) => return UseOutcome::Done,
     };
-    match actions.buttons.get(&slot) {
+    match slots.buttons.get(&slot) {
         Some(b) if b.kind == ACTION_KIND_SPELL && b.action == SPELL_ATTACK => {
             // `UseAction` casts Attack through TryCast, so its dead rung comes first: "You are
             // dead", where the binding, which skips TryCast, reads "Can't attack while dead."
@@ -465,41 +466,66 @@ pub(crate) fn use_action(
     UseOutcome::Done
 }
 
-/// Applies the queued `PickupAction`/`PlaceAction` writes (packed 0 clears) to the store, which
-/// the VM already mirrors, marks it dirty for the feed and sends each as `CMSG_SET_ACTION_BUTTON`.
-pub(crate) fn drain_action_sets(
-    mut vm: crate::script_calls::VmWith<ResMut<'static, PlayerActions>>,
-    commands: Res<NetCommands>,
-) {
-    vm.turn(|script, mut actions| {
-        let Some(script) = script else {
+/// The action bar's sends inside their calls ([`benilla_ui::script::ActionBarCall`]): the
+/// toggles' packet, and each slot write sent and stored.
+#[derive(bevy::ecs::system::SystemParam)]
+pub(crate) struct ActionBarSteps<'w> {
+    /// Absent in a harness without the action store, which sends without storing.
+    slots: Option<ResMut<'w, ActionSlots>>,
+    net: Res<'w, NetCommands>,
+}
+
+impl ActionBarSteps<'_> {
+    /// The slots as the writes so far left them; empty in a harness without the store.
+    pub(crate) fn buttons(&self) -> impl Iterator<Item = &ActionButton> {
+        self.slots.iter().flat_map(|s| s.buttons.values())
+    }
+
+    /// `call` inside its verb.
+    pub(crate) fn apply(&mut self, call: benilla_ui::script::ActionBarCall) {
+        use benilla_ui::script::ActionBarCall;
+        match call {
+            // `0x4e771d`: one packet per call, with no change test.
+            ActionBarCall::Toggles(toggles) => {
+                let _ = self
+                    .net
+                    .0
+                    .send(ClientCommand::SetActionBarToggles { toggles });
+            }
+            ActionBarCall::Set { id, packed } => self.set(id, packed),
+        }
+    }
+
+    /// The slot write `0x4e58e0` for the 1-based `lua_id` (`packed == 0` clears), which the VM
+    /// already mirrors: `CMSG_SET_ACTION_BUTTON` sent, ahead of the `ACTIONBAR_SLOT_CHANGED` the
+    /// VM signals after it, and the slot stored (`0x4e590a`), marking the bar for the feed.
+    pub(crate) fn set(&mut self, lua_id: u32, packed: u32) {
+        let Ok(slot) = u8::try_from(lua_id.saturating_sub(1)) else {
+            debug!("ui_action: set_action_button lua id {lua_id} out of range — ignored");
             return;
         };
-        for (lua_id, packed) in script.take_action_sets() {
-            let Ok(slot) = u8::try_from(lua_id.saturating_sub(1)) else {
-                debug!("ui_action: set_action_button lua id {lua_id} out of range — ignored");
-                continue;
-            };
-            if packed == 0 {
-                actions.buttons.remove(&slot);
-            } else {
-                actions.buttons.insert(
-                    slot,
-                    ActionButton {
-                        slot,
-                        action: packed & 0x00FF_FFFF,
-                        kind: (packed >> 24) as u8,
-                    },
-                );
-            }
-            actions.dirty = true;
-            debug!(
+        debug!(
             "ui_action: set_action_button lua {lua_id} (wire slot {slot}) packed {packed:#010x}"
         );
-            let _ = commands.0.send(ClientCommand::SetActionButton {
-                button: slot,
-                packed,
-            });
+        let _ = self.net.0.send(ClientCommand::SetActionButton {
+            button: slot,
+            packed,
+        });
+        let Some(slots) = self.slots.as_deref_mut() else {
+            return;
+        };
+        if packed == 0 {
+            slots.buttons.remove(&slot);
+        } else {
+            slots.buttons.insert(
+                slot,
+                ActionButton {
+                    slot,
+                    action: packed & 0x00FF_FFFF,
+                    kind: (packed >> 24) as u8,
+                },
+            );
         }
-    })
+        slots.dirty = true;
+    }
 }

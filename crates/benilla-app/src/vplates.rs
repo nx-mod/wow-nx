@@ -3,9 +3,12 @@
 //! projection, seat, basis); the widgets live in [`benilla_ui::script::nameplate`].
 //!
 //! - Toggles: the `[0xc4da34]` bitmask, bit 0 enemy and bit 3 friendly, both off at boot.
-//! - Gate: never the own unit or a `NOT_SELECTABLE` one; enemy or friendly by `CanAttack` from the
-//!   player (`0x606980`), and a player subject must also pass `CanCooperate` (equal faction-group
-//!   masks); 20 yd; no occlusion; a unit not projected into view loses its plate (`0x60f600`).
+//! - Gate (`0x60f600`): never the camera's unit (`camera+0x88`, `0x60f68c`) or a `NOT_SELECTABLE`
+//!   one; only a unit the last render drew (`0x6704c0` at `0x60f649`, [`SceneDrawn`]); enemy or
+//!   friendly by `CanAttack` from the active player (`0x606980`), and a player subject must also
+//!   pass `CanCooperate` (equal faction-group masks); no friendly totem (`0x60f757`); 20 yd from
+//!   the camera's unit (`0x60f7b8`), and none at all when the camera's object is no unit
+//!   (`0x60f77c`); a unit not projected into view loses its plate.
 //! - Anchor: the overhead head point (`0x608640`) plus 2/3 yd (`[0x80abfc]`), projected every
 //!   frame (`0x483ee0`), the plate's top centre on it (`0x509ec0`), sized in gx units of the
 //!   screen diagonal (`0x41ad10`), outside uiScale. Deviation: the basis is damped past
@@ -28,9 +31,9 @@ use benilla_ui::script::{
     unit_is_grey, PlateGeometry, PlateState, PLATE_BIT_ENEMY, PLATE_BIT_FRIEND,
 };
 
-use crate::entities::{overhead_anchor, BoneAttach, OverheadFallback};
+use crate::entities::{overhead_anchor, BoneAttach, OverheadFallback, SceneDrawn};
 use crate::names::NameCache;
-use crate::net::{Guid, NetEntity, ObjectStore, SelfPlayer};
+use crate::net::{Embodied, Guid, NetEntity, ObjectStore, SelfPlayer};
 use crate::query_cache::Ask;
 use crate::target::{Hovered, Selection, TargetUpdate};
 use benilla_world::view::WorldCamera;
@@ -39,7 +42,7 @@ use benilla_world::view::WorldCamera;
 pub(crate) mod border;
 
 /// The two script bits of `[0xc4da34]`, bit `0x1` enemy plates and bit `0x8` friendly: engine
-/// state, written only by the four plate verbs ([`apply_plate_verbs`]) and cleared at every world
+/// state, written only by the four plate verbs inside their calls ([`PlateSteps`]) and cleared at every world
 /// entry ([`clear_at_world_entry`]). Nothing persists it: FrameXML replays its own
 /// `NAMEPLATES_ON`/`FRIENDNAMEPLATES_ON` saved variables through the verbs
 /// (`UIOptionsFrame.lua:768-780`, `UIParent.lua:234`, `:367`).
@@ -75,7 +78,8 @@ pub(crate) struct VPlates(pub(crate) EntityHashSet);
 #[derive(Resource, Default)]
 pub(crate) struct PlateHover(pub(crate) Option<Entity>);
 
-/// Read [`PlateHover`] off the walk that just ran, at the end of the UI input pass.
+/// Read [`PlateHover`] after the tick: off the input pass's hover walk and the leaves and re-pick
+/// of the pump (`0x765650` → `0x7660d0`).
 pub(crate) fn seed_plate_hover(
     script: Option<NonSend<benilla_ui::script::UiScript>>,
     guids: Option<Res<crate::net::GuidIndex>>,
@@ -117,8 +121,10 @@ const SKULL_SIZE: f32 = 0.01;
 const RAID_ICON_SIZE: f32 = 0.02;
 /// `[0x80abfc]`.
 const PLATE_LIFT: f32 = 2.0 / 3.0;
-/// 20 yd, hardcoded in the reference.
+/// 20 yd squared, `[0xc4d988]` (set from `0x5fa130`).
 const MAX_DIST_SQ: f32 = 20.0 * 20.0;
+/// `CreatureType.dbc` id 11, Totem: a friendly one gets no plate (`0x60f757` `cmp eax,0xb`).
+const CREATURE_TYPE_TOTEM: u32 = 11;
 /// Deviation: the reference dims non-target plates to `0x7F`; raised because that fades them too
 /// far to read.
 const DIM_ALPHA: u8 = 178;
@@ -214,20 +220,21 @@ pub(crate) fn text_px(h: f32, basis: f32) -> f32 {
     (h * basis).round().min(32.0)
 }
 
-/// Every frame: fold the plate verbs' writes into the bits, in the order the VM made them.
-pub(crate) fn apply_plate_verbs(
-    mut hosted_vm: crate::script_calls::HostedVm,
-    mut mode: ResMut<VPlateMode>,
-) {
-    hosted_vm.run(|script| {
-        let Some(script) = script else {
+/// The plate verbs inside their calls ([`benilla_ui::script::ScriptCall::Nameplates`]): each
+/// setter (`0x6054f0`, `0x605510`) writes its bit of the live dword before the verb returns.
+#[derive(SystemParam)]
+pub(crate) struct PlateSteps<'w> {
+    /// Absent in a harness without the plates.
+    mode: Option<ResMut<'w, VPlateMode>>,
+}
+
+impl PlateSteps<'_> {
+    /// `write` inside its verb.
+    pub(crate) fn apply(&mut self, write: benilla_ui::script::PlateBitWrite) {
+        let Some(mode) = self.mode.as_deref_mut() else {
             return;
         };
-        let writes = script.take_nameplate_bit_writes();
-        if writes.is_empty() {
-            return;
-        }
-        let now = VPlateMode::from_bits(writes.apply(mode.bits()));
+        let now = VPlateMode::from_bits(write.apply(mode.bits()));
         if *mode != now {
             info!(
                 "nameplates: enemy {}, friendly {}",
@@ -236,7 +243,21 @@ pub(crate) fn apply_plate_verbs(
             );
             *mode = now;
         }
-    })
+    }
+}
+
+/// The plate writes a harness's VM kept, applied as the host applies them, for a test that runs
+/// the verbs on a VM with no host.
+#[cfg(test)]
+pub(crate) fn apply_kept_plate_calls(
+    mut script: NonSendMut<benilla_ui::script::UiScript>,
+    mut steps: PlateSteps,
+) {
+    for call in script.take_script_calls() {
+        if let benilla_ui::script::ScriptCall::Nameplates(write) = call {
+            steps.apply(write);
+        }
+    }
 }
 
 /// The world-entry clear of both script bits (`0x60394b`, `0x603952`, in `0x6033c0`), which the
@@ -244,9 +265,6 @@ pub(crate) fn apply_plate_verbs(
 /// whose `UI_Init` fires `VARIABLES_LOADED` at `0x4900b2`): the load's replay is cleared, and
 /// the one at `PLAYER_ENTERING_WORLD` decides. A `ReloadUI()` never reaches it.
 pub(crate) fn clear_at_world_entry(world: &mut World) {
-    if let Some(mut script) = world.get_non_send_resource_mut::<benilla_ui::script::UiScript>() {
-        let _ = script.take_nameplate_bit_writes();
-    }
     if let Some(mut mode) = world.get_resource_mut::<VPlateMode>() {
         *mode = VPlateMode::default();
     }
@@ -307,9 +325,14 @@ struct PlateWorld<'w, 's> {
             &'static Transform,
             Option<&'static ObjectStore>,
         ),
-        Without<SelfPlayer>,
     >,
-    self_q: Query<'w, 's, (&'static Transform, Option<&'static ObjectStore>), With<SelfPlayer>>,
+    self_q: Query<'w, 's, Option<&'static ObjectStore>, With<SelfPlayer>>,
+    // The body we control: the camera's unit (`0x4818f0`, its `+0x88`) unless far sight moved the
+    // camera onto another object ([`crate::player::ViewSubject`]).
+    centre: Query<'w, 's, (Entity, &'static Transform), With<Embodied>>,
+    view: Res<'w, crate::player::ViewSubject>,
+    // Whether the last render drew each unit (`0x6704c0`).
+    drawn: SceneDrawn<'w, 's>,
     relations: crate::target::RelationWorld<'w, 's>,
     selection: Res<'w, Selection>,
     // With `selection`, the highlight's pair: the watcher's globals `[0xb4e2c8]`/`[0xb4e2d8]`.
@@ -318,6 +341,8 @@ struct PlateWorld<'w, 's> {
     window: Query<'w, 's, &'static Window, With<bevy::window::PrimaryWindow>>,
     // The pending ground-target cast, for the plate's hit-test veto (`0x7cba30`).
     targeting: Res<'w, crate::spell::SpellTargeting>,
+    /// The script bits, which a plate's `OnShow` may move inside its call.
+    mode: Res<'w, VPlateMode>,
 }
 
 /// Every frame: gate the units, seat each plate and hand the result to the widget layer as
@@ -325,11 +350,11 @@ struct PlateWorld<'w, 's> {
 #[allow(clippy::type_complexity)] // one Bevy system's full input set
 fn drive_vplates(
     mut vm: crate::script_calls::VmWith<PlateWorld<'static, 'static>>,
-    mode: Res<VPlateMode>,
     mut plates: ResMut<VPlates>,
     mut plate_clicks: ResMut<PlateClicks>,
     rig: Res<crate::player::CameraControl>,
     names: Res<NameCache>,
+    spells: Option<Res<crate::ui_action::Spells>>,
     anchor_q: (
         Query<&BoneAttach>,
         Query<&benilla_world::rig_anim::RigPose>,
@@ -350,11 +375,29 @@ fn drive_vplates(
         bucket.clear();
         // Every early return retires the plates first, or the widgets stay on screen; the reference
         // hides each live plate and returns it to the pool (`0x608a10`).
+        let mode = *world.mode;
         if !mode.enemies && !mode.friends {
             return PlateStep::Retire;
         }
-        let (Ok((cam, cam_pose)), Ok((self_tf, self_store))) =
-            (world.camera.single(), world.self_q.single())
+        // The camera's object (`[cam+0x88]`), resolved with the unit mask alone (`0x60f677`): the
+        // far-sight object while the camera follows one (`0x5ee483`, `0x5ee4ae`, whatever its
+        // type), else our body. No camera unit (`0x60f685`), or an object that is no unit, a Far
+        // Sight dynamic object, fails every unit at `0x60f77c`.
+        let centre = match world.view.remote {
+            Some(remote) => world
+                .units
+                .get(remote.entity)
+                .ok()
+                .filter(|(_, net, ..)| matches!(net.kind, EntityKind::Unit | EntityKind::Player))
+                .map(|(e, _, _, tf, _)| (e, tf.translation)),
+            None => world
+                .centre
+                .single()
+                .ok()
+                .map(|(e, tf)| (e, tf.translation)),
+        };
+        let (Ok((cam, cam_pose)), Ok(self_store), Some((centre, centre_pos))) =
+            (world.camera.single(), world.self_q.single(), centre)
         else {
             return PlateStep::Retire;
         };
@@ -387,6 +430,13 @@ fn drive_vplates(
         let clicked = script.take_nameplate_clicks();
         let my_level = self_store.and_then(|s| s.0.unit_level()).unwrap_or(1);
         let (rel, me) = (world.relations.get(), world.relations.me());
+        let types = crate::creature_type::CreatureTypeSources {
+            names: Some(&names),
+            forms: spells.as_deref().map(|s| &s.forms),
+            words: None,
+        };
+        // `GetUnitName`'s miss (`0x609324`): the `UNKNOWNOBJECT` text, read once a frame.
+        let unknown = script.unknown_object_text();
 
         let (pw, ph) = (gx(PLATE_W), gx(PLATE_H));
         let scale = window.map_or(1.0, |w| w.scale_factor());
@@ -401,7 +451,9 @@ fn drive_vplates(
         let sort_pt = Vec2::new(0.4 * diag, viewport.y - 0.3 * diag);
         let mut cands = Vec::new();
         for (entity, net, guid, tf, store) in &world.units {
-            if !matches!(net.kind, EntityKind::Unit | EntityKind::Player) {
+            // The camera's own unit (`0x60f68c`); our body is a candidate while we are attached to
+            // another unit.
+            if !matches!(net.kind, EntityKind::Unit | EntityKind::Player) || entity == centre {
                 continue;
             }
             // `NOT_SELECTABLE` (flags bit 25) never gets a plate, re-tested every tick (`0x60f622`,
@@ -420,7 +472,13 @@ fn drive_vplates(
             if store.is_some_and(|s| s.0.unit_is_ghost_visual()) {
                 continue;
             }
-            if (tf.translation - self_tf.translation).length_squared() > MAX_DIST_SQ {
+            // The unit's scene node, drawn in the last render (`0x60f63b`-`0x60f650`): culled by
+            // the frustum, or with no model yet, it has no plate.
+            if !world.drawn.unit(entity) {
+                continue;
+            }
+            // Measured from the camera's unit (`0x60f780`-`0x60f7b8`).
+            if (tf.translation - centre_pos).length_squared() > MAX_DIST_SQ {
                 continue;
             }
             // A CREATEDBY owner, no SUMMONEDBY owner and flags bit 9 (`0x200`): no plate in either
@@ -451,6 +509,11 @@ fn drive_vplates(
             // Only on the hostile side, a dead-looking unit has no plate (`0x60f733`): a feigning
             // hunter's plate hides from enemies and stays for friends.
             if !friendly && store.is_some_and(|s| s.0.unit_reads_dead()) {
+                continue;
+            }
+            // Only on the friendly side, a totem has no plate (`0x60f750`-`0x60f75a`, the type
+            // `0x605570` resolves); an enemy totem keeps its plate.
+            if friendly && store.is_some_and(|s| types.of(s) == CREATURE_TYPE_TOTEM) {
                 continue;
             }
             // Behind the camera or outside the viewport there is no plate: `0x60f600` destroys it
@@ -580,11 +643,11 @@ fn drive_vplates(
                     .unwrap_or(1)
                     .max(1) as f32,
                 bar_colour: [tint[0], tint[1], tint[2]],
-                // Read, never asked: this runs every frame; the unit's create asks.
+                // Read, never asked: this runs every frame; the unit's create asks. A miss is
+                // `GetUnitName`'s `UNKNOWNOBJECT` (`0x609324`), as the bind sets it (`0x7cb70c`).
                 name: names
                     .resolve_unit(guid.0, store, Ask::Read)
-                    .map(str::to_owned)
-                    .unwrap_or_default(),
+                    .map_or_else(|| unknown.clone(), str::to_owned),
                 // The skull (`0x7cbb40`): rank 3 through `gated_rank` (so a charmed boss shows its
                 // level), or a hostile 10 or more levels up that is not grey (`0x5f0700`, vacuous
                 // there but transcribed). A unit with no level yet shows neither.
@@ -679,20 +742,16 @@ impl Plugin for VPlatesPlugin {
             .init_resource::<PlateClicks>()
             .add_systems(
                 Update,
-                (
-                    // A drain of the verbs the tick ran (a binding body, `UpdateNameplates`).
-                    apply_plate_verbs.in_set(crate::ui_script::UiDrain),
-                    // After the targeting chain, itself after `WorldStage::Input`, so this projects
-                    // through this frame's camera; `ui_script::extract::paint_script` runs after
-                    // it, so the plates paint the same frame.
-                    drive_vplates.after(TargetUpdate),
-                )
-                    .chain()
-                    .in_set(VPlateSet),
+                // After the targeting chain, itself after `WorldStage::Input`, so this projects
+                // through this frame's camera; `ui_script::extract::paint_script` runs after it,
+                // so the plates paint the same frame.
+                drive_vplates.after(TargetUpdate).in_set(VPlateSet),
             );
     }
 }
 
+#[cfg(test)]
+mod gate_tests;
 #[cfg(test)]
 mod unheld_tests;
 
@@ -753,12 +812,15 @@ mod tests {
         assert_eq!(text_px(NAME_H, 10_000.0), 32.0, "atlas-cell cap, raw law");
     }
 
-    /// An app with the drain and a bare VM: the four verbs are all it needs.
+    /// An app with a bare VM whose plate calls apply as the host applies them: the four verbs
+    /// are all it needs.
     fn verb_app() -> App {
         let mut app = App::new();
-        app.add_systems(Update, apply_plate_verbs)
+        let mut script = benilla_ui::script::UiScript::new().unwrap();
+        script.keep_calls();
+        app.add_systems(Update, apply_kept_plate_calls)
             .init_resource::<VPlateMode>()
-            .insert_non_send_resource(benilla_ui::script::UiScript::new().unwrap());
+            .insert_non_send_resource(script);
         app
     }
 
@@ -808,13 +870,9 @@ mod tests {
         let mut app = verb_app();
         run(&mut app, "ShowNameplates() ShowFriendNameplates()");
         assert_eq!(mode(&app), (true, true));
-        // The load's replay, not yet drained when the entry clears.
-        app.world()
-            .non_send_resource::<benilla_ui::script::UiScript>()
-            .run("ShowNameplates()")
-            .unwrap();
+        // The load's replay, applied in its call before the entry clears.
+        run(&mut app, "ShowNameplates()");
         clear_at_world_entry(app.world_mut());
-        app.update();
         assert_eq!(mode(&app), (false, false), "both clear after the entry");
         run(&mut app, "ShowFriendNameplates()");
         assert_eq!(

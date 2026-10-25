@@ -24,7 +24,6 @@ use crate::entities::EntitiesPlugin;
 use crate::fishing_line::FishingLinePlugin;
 use crate::footprints::FootprintsPlugin;
 use crate::loading_screen::LoadingScreenPlugin;
-use crate::name_persist::NamePersistPlugin;
 use crate::net::NetPlugin;
 use crate::player::PlayerPlugin;
 use crate::portrait::PortraitPlugin;
@@ -232,7 +231,8 @@ impl PluginGroup for GamePlugins {
             .add(UiTradePlugin)
             .add(UiItemTextPlugin)
             .add(UiSavedPlugin)
-            .add(NamePersistPlugin)
+            .add(crate::item_names::ItemNamesPlugin)
+            .add(crate::wdb::WdbPlugin)
             .add(UiStablePlugin)
             .add(TabardUiPlugin)
             .add(UiTrainerPlugin)
@@ -272,7 +272,45 @@ pub(crate) mod schedule_tests {
     /// [`headless_client`] with `more` added before it finishes, as the binary adds its
     /// instruments and probes.
     pub(crate) fn headless_client_with(more: impl FnOnce(&mut App)) -> App {
+        let mut app = finished_client(more);
+        app.cleanup();
+        app
+    }
+
+    /// The whole client's world, for a fixture that drives it by hand (a one-shot system, a call
+    /// with the host lent, a schedule of its own) and never runs the app: every plugin built and
+    /// finished, every resource in place, every schedule but `Main` and `Update`, and the pass
+    /// never ordered, whose system census is most of what [`headless_client`] costs. With no
+    /// `Main`, `app.update()` panics, and with no `Update` and no [`crate::vm_pass::PassOrder`] so
+    /// does a run or a read of the pass, so a test that comes to need them moves to
+    /// [`headless_client`]. Every other schedule is the client's own, its unit-edit flushes
+    /// included.
+    pub(crate) fn headless_client_unrun() -> App {
+        let mut app = finished_client(|_| {});
+        let unrun = |app: &mut App| {
+            let mut schedules = app.world_mut().resource_mut::<Schedules>();
+            schedules.remove(Main);
+            schedules.remove(Update);
+        };
+        unrun(&mut app);
+        app.cleanup();
+        // A plugin's cleanup may add to `Update` again.
+        unrun(&mut app);
+        app.world_mut()
+            .remove_resource::<crate::vm_pass::PassOrder>();
+        app
+    }
+
+    /// Every plugin of the client built and finished, `more` among them; none cleaned up.
+    fn finished_client(more: impl FnOnce(&mut App)) -> App {
         let mut app = App::new();
+        // The tonemapping tables are the render world's alone, and there is none: in place
+        // already, they are not decoded (`TonemappingPlugin` builds them only when absent).
+        app.insert_resource(bevy::core_pipeline::tonemapping::TonemappingLuts {
+            blender_filmic: default(),
+            agx: default(),
+            tony_mc_mapface: default(),
+        });
         app.add_plugins(
             benilla_world::boot::tuned_default_plugins(Window::default())
                 .disable::<bevy::winit::WinitPlugin>()
@@ -298,7 +336,6 @@ pub(crate) mod schedule_tests {
         });
         more(&mut app);
         app.finish();
-        app.cleanup();
         app
     }
 
@@ -700,6 +737,15 @@ pub(crate) mod schedule_tests {
             })
     }
 
+    /// A test client opens no audio device: one stream per test process, one process per test,
+    /// floods the system audio server and crackles every sound on the machine.
+    #[test]
+    fn a_test_client_opens_no_audio_device() {
+        let app = headless_client_unrun();
+        let output = app.world().non_send_resource::<crate::sound::SoundOutput>();
+        assert!(output.mixer.is_none());
+    }
+
     /// The glue booth has one feeder, in any schedule: the glue VM's, which reads the stock
     /// screens' models off the VM. Beside it only the booth's own create instrument writes
     /// `GluePreview`.
@@ -939,9 +985,8 @@ pub(crate) mod schedule_tests {
     ///   against the 80 world systems no declared order places against it, which bevy lists with
     ///   no component. What they meet of the drain's (its lanes' firings, the VM with the call host,
     ///   and the unit edits it applies in place: every component a change writes, the cast events,
-    ///   the precast tail's loot release) is the name cache alone, a pure cache, which the
-    ///   persisted-name load writes; `lanes::guard_tests` checks that it stays so, and that no
-    ///   exclusive system is among them. Commands a firing defers, which the drain applies after
+    ///   the precast tail's loot release) is the name cache alone, a pure cache;
+    ///   `lanes::guard_tests` checks that it stays so, and that no exclusive system is among them. Commands a firing defers, which the drain applies after
     ///   it, are outside that model;
     /// - the minimap's draw (`minimap::emit_minimap`), which reads `QuestGiver`'s dialog statuses,
     ///   against `ui_panes::feed_character_panes`, which lends the call host, whose quest verbs
@@ -950,7 +995,7 @@ pub(crate) mod schedule_tests {
     /// Raising the ceiling is a claim that a new undeclared order is acceptable: make it with the
     /// reason read off the dump, or declare the order (`.after`, a set, a `chain`). A resource
     /// that commutes by construction belongs in [`Classes`].
-    const UPDATE_ACTIONABLE_CEILING: usize = 1_780;
+    const UPDATE_ACTIONABLE_CEILING: usize = 1_749;
     const UPDATE_ACTIONABLE_SLACK: usize = 40;
 
     fn ratchet(what: &str, n: usize, ceiling: usize, slack: usize) {
@@ -1732,11 +1777,12 @@ pub(crate) mod schedule_tests {
         );
     }
 
-    /// The VM ticks once a frame (`extract::tick_script`, in `UiInput`): a push the tick must
-    /// see rides `UiFeed`, chained after the net drain and before the tick; a drain of what it
-    /// produced is `.after(UiInput)`. Read off the built graph. Fails a holder with no path to or
-    /// from the tick, one before the tick outside `UiFeed` and not argued in
-    /// [`OUTSIDE_THE_FEED_PHASE`], a `UiFeed` member the graph does not place between the drain
+    /// The VM ticks once a frame (`extract::tick_script`, in `UiTick`): the window input rides
+    /// `UiInput` and a push the tick must see rides `UiFeed`, both chained after the net drain
+    /// and before the tick, the input first; a drain of what the tick produced is
+    /// `.after(UiTick)`. Read off the built graph. Fails a holder with no path to or from the
+    /// tick, one before the tick outside both phases and not argued in
+    /// [`OUTSIDE_THE_FEED_PHASE`], a member of either the graph does not place between the drain
     /// and the tick, and a stale row.
     #[test]
     fn every_vm_holder_in_update_declares_its_side_of_the_tick() {
@@ -1780,7 +1826,7 @@ pub(crate) mod schedule_tests {
         let after_drain = reach(drain, &succ);
         let mut holders: Vec<SystemKey> = c.holds_vm.iter().copied().collect();
         holders.sort_by(|a, b| c.name(*a).cmp(c.name(*b)));
-        let (mut feed, mut post, mut argued) = (0, 0, 0);
+        let (mut input, mut feed, mut post, mut argued) = (0, 0, 0, 0);
         let mut offenders = Vec::new();
         let mut stale = Vec::new();
         for k in &holders {
@@ -1788,11 +1834,20 @@ pub(crate) mod schedule_tests {
                 continue;
             }
             let s = &c.systems[k];
+            let in_input = s.sets.iter().any(|set| set == "UiInput");
             let in_feed = s.sets.iter().any(|set| set == "UiFeed");
             let row = OUTSIDE_THE_FEED_PHASE
                 .iter()
                 .find(|(suffix, _)| s.name.ends_with(suffix));
-            if in_feed {
+            if in_input {
+                input += 1;
+                if !(after_drain.contains(k) && before_tick.contains(k)) {
+                    offenders.push(format!(
+                        "{}: in `UiInput`, but the graph does not place it after the net drain and before the tick",
+                        s.name
+                    ));
+                }
+            } else if in_feed {
                 feed += 1;
                 if !(after_drain.contains(k) && before_tick.contains(k)) {
                     offenders.push(format!(
@@ -1808,7 +1863,7 @@ pub(crate) mod schedule_tests {
                     continue;
                 }
                 offenders.push(format!(
-                    "{}: ordered before the tick but not in `UiFeed` — it may run before this frame's packets land; `.in_set(UiFeed)`",
+                    "{}: ordered before the tick but in neither `UiInput` nor `UiFeed` — it may run before this frame's packets land; `.in_set(UiFeed)`",
                     s.name
                 ));
             } else {
@@ -1823,7 +1878,9 @@ pub(crate) mod schedule_tests {
                 stale.push(format!(
                     "{}: argued in OUTSIDE_THE_FEED_PHASE but the graph places it {} — drop the row",
                     s.name,
-                    if in_feed {
+                    if in_input {
+                        "in the input pass"
+                    } else if in_feed {
                         "in the feed phase"
                     } else {
                         "after the tick"
@@ -1839,13 +1896,13 @@ pub(crate) mod schedule_tests {
             }
         }
         eprintln!(
-            "VM holders in Update: {} — the tick, {feed} in the feed phase, {post} after the tick, {argued} argued outside the phase",
+            "VM holders in Update: {} — the tick, {input} in the input pass, {feed} in the feed phase, {post} after the tick, {argued} argued outside the phase",
             holders.len()
         );
         assert!(
             offenders.is_empty(),
             "these systems hold the VM in `Update` without declaring their side of the tick \
-             (`UiFeed` before it, or `.in_set(crate::ui_script::UiDrain)`):\n  {}",
+             (`UiInput` or `UiFeed` before it, or `.in_set(crate::ui_script::UiDrain)`):\n  {}",
             offenders.join("\n  ")
         );
         assert!(stale.is_empty(), "stale rows:\n  {}", stale.join("\n  "));
@@ -1904,6 +1961,9 @@ pub(crate) mod schedule_tests {
          "`reset_on_world_enter` runs before it at each world-enter cascade, clears the session and re-sends `BattlefieldStatusRequest`"),
         ("ui_binder.rs", "feed_binder", Because::PlayerRoundTrip,
          "`SMSG_BINDER_CONFIRM` only answers the innkeeper's gossip line"),
+        ("ui_char.rs", "feed_char", Because::FilledByVm,
+         "its take is the ammo getters' hits, which only a getter's call leaves, and a frameless VM \
+          calls none; the doll's own pushes ride `VmMemo`s"),
         ("ui_chat/feed.rs", "played_time_bridge", Because::FilledByVm,
          "the answer it takes follows `RequestTimePlayed()`, Lua's own ask, which a frameless VM \
           never makes"),
@@ -1957,8 +2017,6 @@ pub(crate) mod schedule_tests {
          "`MSG_TALENT_WIPE_CONFIRM` answers the trainer's gossip option"),
         ("ui_taxi/mod.rs", "feed_taxi", Because::PlayerRoundTrip,
          "both packets follow talking to a flight master"),
-        ("ui_trade/mod.rs", "feed_trade", Because::Deliberate,
-         "its take is `named_lines_asked`, how many held lines have been asked: taken before the interface is up the lines' names are still asked, to the server and not the VM, and the lines stay held until they show"),
         ("ui_tradeskill.rs", "fire_list_rebuilds", Because::Deliberate,
          "a lane's firing, run only by the drain: `drop_list_rebuilds`, gated on the interface being down, empties the lane the frame its items land, so none fires into a later VM"),
         ("ui_trainer/mod.rs", "feed_trainer", Because::PlayerRoundTrip,

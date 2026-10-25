@@ -9,11 +9,12 @@
 //! nothing here signals: a change of the gear, as of the level, is the unit-field bridge's
 //! ([`crate::field_watch`]), fired per token on a values block.
 
+use benilla_ui::script::ItemRead;
 use std::collections::{HashMap, HashSet};
 
 use bevy::prelude::*;
 
-use benilla_ui::script::{InvSlotView, InventorySlots};
+use benilla_ui::script::{InspectCall, InvSlotView, InventorySlots, UiScript};
 
 use crate::entities::ItemDisplays;
 use crate::items::Items;
@@ -122,32 +123,25 @@ fn inspect_slot_view(
     // `+0x424`, names the suffix only: its stat lines would sit in enchant slots 2-6, which 1.12
     // servers leave empty.
     let roll = store.0.player_visible_item_properties(slot0);
-    // By entry alone (guid 0), as the reference's item cache asks: there is no item object.
-    let t = items.template(entry, 0, Ask::Read);
-    let (name, quality, display) = match t {
-        Some(t) => (
-            Some(rolls.name(&t.name, roll)),
-            t.quality,
-            t.display_info_id,
-        ),
-        None => (None, 0, 0),
-    };
     // The link names the permanent enchant, the block's `+0xc`, and the suffix at `+0x28`
     // (`0x4c8d5c`-`0x4c8d74` → `0x52adb0`).
-    let perm = store.0.player_visible_item_enchant(slot0, 0).unwrap_or(0);
-    let link = name
-        .as_ref()
-        .map(|n| crate::ui_items::item_link_full(entry, perm, roll, 0, n, quality));
+    let roll = benilla_ui::script::ItemRoll {
+        enchant: store.0.player_visible_item_enchant(slot0, 0).unwrap_or(0),
+        property: roll,
+        suffix_factor: 0,
+    };
+    // By entry alone (guid 0), as the reference's item cache asks: there is no item object. What
+    // the getters read of it as they run, read here the same way.
+    let live = crate::ui_items::live::LiveItem::record(entry, roll, items, icons, rolls);
     Some(InvSlotView {
         item_id: entry,
-        icon: icons
-            .and_then(|i| i.catalog.get(display))
-            .and_then(|d| d.icon.clone()),
+        icon: live.texture(),
         count: 1,
-        quality: quality as i32,
-        inventory_type: t.map(|t| t.inventory_type),
-        name,
-        link,
+        quality: live.quality().map_or(0, |q| q as i32),
+        inventory_type: live.cached().then(|| live.inventory_type()),
+        name: live.name(),
+        link: live.link(),
+        roll,
         creator,
         creator_guid,
         // `0x5da2c0` reads an item object's `ITEM_FIELD_FLAGS`, which inspected gear lacks, so the
@@ -212,43 +206,78 @@ impl VisibleItemTables<'_> {
     }
 }
 
+/// The inspect verbs inside their calls ([`benilla_ui::script::InspectCall`]).
+#[derive(bevy::ecs::system::SystemParam)]
+pub(crate) struct InspectSteps<'w, 's> {
+    /// Absent in a harness without the inspect window.
+    target: Option<ResMut<'w, InspectTarget>>,
+    selection: Res<'w, crate::target::Selection>,
+    tokens: crate::ui_unit::UnitTokens<'w, 's>,
+    net: Res<'w, NetCommands>,
+}
+
+impl InspectSteps<'_, '_> {
+    /// `call` inside its verb.
+    pub(crate) fn apply(&mut self, script: &mut UiScript, call: InspectCall) {
+        match call {
+            // `0x48a36a`: the token through the unit resolver `0x515970`, any unit; then
+            // `0x5decc0`, for a nonzero guid (`0x5deccf`), `CMSG_INSPECT` and the token latched as
+            // the inspect target (`0x5ded10`, `0x5ded1c`).
+            InspectCall::Notify(token) => {
+                let Some(guid) = self.tokens.guid(&token, &self.selection) else {
+                    debug!("inspect: {token:?} names nobody — nothing sent");
+                    return;
+                };
+                debug!("inspect: {token:?} -> {guid:#x}; sending CMSG_INSPECT");
+                let _ = self.net.0.send(ClientCommand::Inspect { target: guid });
+                if let Some(target) = self.target.as_deref_mut() {
+                    target.token = Some(token);
+                }
+            }
+            // `ClearInspectPlayer()`, from `InspectFrame_OnHide`.
+            InspectCall::Clear => {
+                if let Some(target) = self.target.as_deref_mut() {
+                    target.token = None;
+                }
+            }
+            // `RequestInspectHonorData()` asks about the inspected token's guid now
+            // (`0x4c8112`), so a re-target before the Honor tab opens asks about the new player,
+            // and latches its query in flight after the send (`0x4c811b`). With no target it
+            // returns before both (`0x4c80c2`), and the pane asks again from its next `OnShow`.
+            InspectCall::Honor => match self.inspected() {
+                Some(guid) => {
+                    debug!("honor: inspect-honor request -> {guid:#x}");
+                    let _ = self
+                        .net
+                        .0
+                        .send(ClientCommand::InspectHonorStats { target: guid });
+                    script.latch_inspect_honor_ask();
+                }
+                None => debug!("honor: inspect-honor request with no resolvable target — not sent"),
+            },
+        }
+    }
+
+    /// The guid the inspect target's token names now.
+    fn inspected(&self) -> Option<u64> {
+        let token = self.target.as_deref()?.token.as_deref()?;
+        self.tokens.guid(token, &self.selection)
+    }
+}
+
 pub(crate) fn feed_inspect(
-    // What the host also reaches, read before the VM runs with the host lent.
-    mut hosted: ParamSet<(Res<crate::target::Selection>, crate::script_calls::HostedVm)>,
-    mut target: ResMut<InspectTarget>,
+    mut hosted_vm: crate::script_calls::HostedVm,
     mut feed: ResMut<InspectFeedState>,
     tables: VisibleItemTables,
-    commands: Res<NetCommands>,
     index: Res<GuidIndex>,
     stores: Query<Ref<ObjectStore>>,
-    group: Res<crate::ui_party::GroupState>,
     me: Res<crate::net::SelfGuid>,
 ) {
-    let p = hosted.p0();
-    let selection = *p;
-    hosted.p1().run(|script| {
+    hosted_vm.run(|script| {
         let Some(script) = script else {
             return;
         };
         let memo = feed.vm.get(script);
-
-        // `NotifyInspect(unit)`: send `CMSG_INSPECT` for the unit's guid and latch its token.
-        for token in script.take_inspect_notifies() {
-            match crate::ui_unit::player_token_guid(&token, &selection, &group) {
-                Some(guid) => {
-                    debug!("inspect: {token:?} -> {guid:#x}; sending CMSG_INSPECT");
-                    let _ = commands.0.send(ClientCommand::Inspect { target: guid });
-                    target.token = Some(token);
-                }
-                None => {
-                    debug!("inspect: {token:?} did not resolve to a player guid — nothing sent");
-                }
-            }
-        }
-        // `ClearInspectPlayer()`, from `InspectFrame_OnHide`.
-        if script.take_inspect_clear() {
-            target.token = None;
-        }
 
         let tables_moved = tables.moved(&mut memo.templates, &mut memo.names);
         // Every player a token can name, but the active one, whose own items the getters read.
@@ -334,6 +363,7 @@ mod tests {
                 .insert(guid, e);
         }
         let mut script = UiScript::new().unwrap();
+        script.keep_calls();
         script.set_unit_guids(&benilla_ui::script::UnitGuids {
             target: guids[0],
             party: [guids[1], 0, 0, 0],
@@ -379,10 +409,23 @@ mod tests {
                 .filter(|c| matches!(c, ClientCommand::ItemQuery { entry: 955, .. }))
                 .count()
         };
-        app.world_mut()
-            .non_send_resource_mut::<UiScript>()
-            .run(r#"NotifyInspect("target")"#)
-            .unwrap();
+        let notified = {
+            let mut script = app.world_mut().non_send_resource_mut::<UiScript>();
+            script.run(r#"NotifyInspect("target")"#).unwrap();
+            script.take_inspect_notifies()
+        };
+        // The call as the host applies it.
+        let mut steps = bevy::ecs::system::SystemState::<InspectSteps>::new(app.world_mut());
+        for token in notified {
+            steps
+                .get_mut(app.world_mut())
+                .apply(&mut UiScript::new().unwrap(), InspectCall::Notify(token));
+        }
+        assert!(
+            rx.try_iter()
+                .any(|c| matches!(c, ClientCommand::Inspect { target: MATE })),
+            "the inspect went out"
+        );
         for _ in 0..10 {
             app.update();
         }

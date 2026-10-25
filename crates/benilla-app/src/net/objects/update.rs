@@ -150,6 +150,8 @@ enum Body {
         xp_awarded: bool,
         /// A unit's resolved records, which its slot 3 compares (`0x5fbe28`).
         display: Option<HeldDisplay>,
+        /// A transport's clock, which reactivation leaves (`0x464530` constructs nothing).
+        anchor: Option<crate::transport::TransportAnchor>,
     },
     /// An item or a container, with its countdown cells.
     Item {
@@ -290,20 +292,30 @@ fn on_object_create(In(ev): In<SessionEvent>, mut sc: Scene) {
             }),
         ) => {
             let moved = write_fields(&mut store, fields.clone());
-            let (pose, modes, xp_awarded, display) = match body {
+            let (pose, modes, xp_awarded, display, kept_anchor) = match body {
                 Body::World {
                     pose,
                     modes,
                     xp_awarded,
                     display,
+                    anchor,
                     ..
-                } => (Some(pose), modes, xp_awarded, display),
-                Body::Item { .. } => (None, None, false, None),
+                } => (Some(pose), modes, xp_awarded, display, anchor),
+                Body::Item { .. } => (None, None, false, None, None),
             };
             // Only a unit takes the block's movement (`0x46638c`); any other type keeps its pose.
             let unit = matches!(kind, EntityKind::Unit | EntityKind::Player);
             let kept_pose = pose.filter(|_| !unit);
-            let e = object_create(&mut sc, block, &fields, Landing::New { store, kept_pose });
+            let e = object_create(
+                &mut sc,
+                block,
+                &fields,
+                Landing::New {
+                    store,
+                    kept_pose,
+                    kept_anchor,
+                },
+            );
             if let Some(modes) = modes {
                 sc.commands.entity(e).insert(modes);
             }
@@ -328,6 +340,7 @@ fn on_object_create(In(ev): In<SessionEvent>, mut sc: Scene) {
                 Landing::New {
                     store,
                     kept_pose: None,
+                    kept_anchor: None,
                 },
             );
             if matches!(kind, EntityKind::Unit | EntityKind::Player) {
@@ -453,11 +466,9 @@ fn write_logged(
 
 /// A held object leaving the live table: the store it takes, logged for any unit, as one a token
 /// names now or named earlier in the frame (the target's target before it changed) reads it in
-/// the frame's earlier listeners.
+/// the frame's earlier listeners, and for any item, as a weapon the active player wore earlier in
+/// the frame reads to the stat getters there.
 fn log_destroy(sc: &mut Scene, guid: u64) {
-    if guid::is_item(guid) {
-        return;
-    }
     let Some(&e) = sc.index.0.get(&guid) else {
         return;
     };
@@ -618,6 +629,7 @@ fn respawn(sc: &mut Scene, guid: u64, body: Body, store: ObjectFields, pose: Opt
             rider,
             xp_awarded,
             display,
+            anchor,
         } => {
             let mut entity = sc.commands.spawn((
                 Guid(guid),
@@ -646,6 +658,9 @@ fn respawn(sc: &mut Scene, guid: u64, body: Body, store: ObjectFields, pose: Opt
             }
             if let Some(display) = display {
                 entity.insert(display);
+            }
+            if let Some(anchor) = anchor {
+                entity.insert(anchor);
             }
             let e = entity.id();
             sc.index.0.insert(guid, e);
@@ -845,6 +860,7 @@ fn release(sc: &mut Scene, guid: u64) {
                     }),
                     xp_awarded: sc.xp_awarded.contains(e),
                     display: sc.held_displays.get(e).ok().copied(),
+                    anchor: sc.anchors.get(e).ok().copied(),
                 }
             };
             Some(Kept { fields, body })

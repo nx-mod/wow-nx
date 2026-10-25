@@ -675,7 +675,7 @@ fn resolve_row(
         base_name: template.map(|t| t.name.clone()),
         high_bidder: bid.high_bidder,
         // The names are read, never asked: `GetAuctionItemInfo` asks what it misses
-        // ([`UiScript::take_auction_name_asks`]), and the seller sort reads the cache alone
+        // ([`benilla_ui::script::RecordAsk::AuctionName`]), and the seller sort reads the cache alone
         // (`0x4cdbda`).
         owner: names
             .resolve_player(entry.owner_guid, Ask::Read)
@@ -828,13 +828,17 @@ type AuctionCatalogs<'w> = (
 /// Push the auction house into the VM and fire its events on a change, diffed against `VmMemo`s:
 /// an engine turn, since the house is the call host's too, whose events' handlers run as it ends.
 fn feed_auction(
-    mut vm: VmWith<ResMut<'static, AuctionOpen>>,
+    // The house, and the steps the handlers readied that the lanes' drain has still to fire: the
+    // host's too, whose auction getters keep their name waits there.
+    mut vm: VmWith<(
+        ResMut<'static, AuctionOpen>,
+        Option<ResMut<'static, net::HouseLane>>,
+    )>,
     items: Res<Items>,
     icons: Option<Res<ItemDisplays>>,
     names: Res<NameCache>,
     commands: Res<NetCommands>,
-    // The clock, and the steps the handlers readied that the lanes' drain has still to fire.
-    (time, mut steps): (Res<Time>, Option<ResMut<net::HouseLane>>),
+    time: Res<Time>,
     catalogs: AuctionCatalogs,
     houses: Option<Res<AuctionHouses>>,
     mut sink: MessageSink,
@@ -843,10 +847,9 @@ fn feed_auction(
     mut last_open: crate::ui_script::WindowMemo<Option<u64>>,
     mut last_can_query: Local<crate::ui_script::VmMemo<bool>>,
     mut last_classes: Local<crate::ui_script::VmMemo<Vec<AuctionCategory>>>,
-    mut fresh_vm: Local<crate::ui_script::VmMemo<()>>,
     mut closes: CoreCloses,
 ) {
-    vm.turn(|script, mut auction| {
+    vm.turn(|script, (mut auction, mut steps)| {
         let Some(script) = script else {
             return;
         };
@@ -870,7 +873,7 @@ fn feed_auction(
         // A `_S` line whose item was not cached when its handler ran, shown once the record lands,
         // as the reference defers it through `0x4cd190`; the `items.template` call below asks for
         // it.
-        {
+        if !auction.messages.is_empty() {
             let mut deferred = Vec::new();
             let mut lines = Vec::new();
             let asked = std::mem::take(&mut auction.messages_asked);
@@ -895,23 +898,16 @@ fn feed_auction(
             show_messages(script, &mut sink, "ui_auction", lines);
         }
 
-        // The names `GetAuctionItemInfo` missed, asked with the reading list's callback
-        // (`0x4cf167`, `0x4cf1c8`), kept on the house lane until the name lands, whose handler
-        // releases them ([`net::HouseLane::name_landed`]). A new VM's getters made none.
-        let (_, vm_reset) = fresh_vm.get_reset(script);
-        let asks = script.take_auction_name_asks();
-        for &(guid, _) in &asks {
-            let _ = names.resolve_player(guid, Ask::Event(&commands));
-        }
-        if let Some(lane) = steps.as_deref_mut() {
-            if vm_reset {
-                lane.clear_waits();
+        // The names `GetAuctionItemInfo` missed wait on the house lane, each with the reading
+        // list's callback, kept inside the getter's call ([`AuctionVerbs::wait_for_name`]), until
+        // the name lands, whose handler releases them ([`net::HouseLane::name_landed`]). The lane
+        // is written only when it has something to do, so a quiet frame leaves it unchanged.
+        if let Some(lane) = steps.as_mut() {
+            // A name the cache learned with no name answer of its own releases its waits here.
+            let named = |guid| names.resolve_player(guid, Ask::Read).is_some();
+            if lane.any_named(named) {
+                lane.release_named(named);
             }
-            for (guid, list) in asks {
-                lane.wait_for_name(guid, list);
-            }
-            // A name the cache already held when it was asked answers no packet: released here.
-            lane.release_named(|guid| names.resolve_player(guid, Ask::Read).is_some());
         }
 
         let self_guid = self_q.iter().next().map(|g| g.0);
@@ -924,8 +920,10 @@ fn feed_auction(
         let shown = last_open.is_none() || auction.show_requested;
         // A landed result's tick, on the clock `GetAuctionItemTimeLeft` reads (`0x4cc865`).
         let tick = script.auction_tick_ms();
-        for slot in &mut auction.lists {
-            slot.arrived_ms.get_or_insert(tick);
+        for i in 0..auction.lists.len() {
+            if auction.lists[i].arrived_ms.is_none() {
+                auction.lists[i].arrived_ms = Some(tick);
+            }
         }
         let lists = [LIST, BIDDER, OWNER].map(|i| {
             let ask = Ask::at(shown || auction.list_result_landed[i], &commands);
@@ -948,8 +946,14 @@ fn feed_auction(
 
         // A close is the core's, which told the VM; a disconnect's clear tells it nothing.
         let opened = last_open.is_none() && auction.auctioneer.is_some();
-        let show_requested = std::mem::take(&mut auction.show_requested);
-        auction.list_result_landed = [false; 3];
+        // Each written only on a change, so a quiet frame leaves the state unchanged.
+        let show_requested = auction.show_requested;
+        if show_requested {
+            auction.show_requested = false;
+        }
+        if auction.list_result_landed != [false; 3] {
+            auction.list_result_landed = [false; 3];
+        }
         // Per list, a page whose items are all answered with no answer left to run its tail, as a
         // page that landed with no VM is: its tail goes onto the house lane here
         // ([`net::record_answered`] runs it at the answer otherwise).
@@ -959,16 +963,16 @@ fn feed_auction(
                 .as_ref()
                 .is_some_and(|items_of| items_of.iter().all(|&e| items.template_answered(e)))
         });
-        for (slot, tail) in auction.lists.iter_mut().zip(tails) {
+        for (i, tail) in tails.into_iter().enumerate() {
             if tail {
-                slot.awaiting = None;
+                auction.lists[i].awaiting = None;
             }
         }
         // A tail run now leaves its list with nothing owed.
         for (list, slot) in fresh.lists.iter_mut().zip(&auction.lists) {
             list.pending = slot.awaiting.is_some();
         }
-        if let Some(lane) = steps.as_deref_mut() {
+        if let Some(lane) = steps.as_mut() {
             for list in [LIST, BIDDER, OWNER] {
                 if tails[list] {
                     lane.push(net::HouseStep::Tail(list));
@@ -1274,6 +1278,7 @@ mod tests {
             .init_resource::<Time>()
             .init_resource::<crate::ui_chat::ChatLog>()
             .init_resource::<crate::sound::MessageSounds>()
+            .init_resource::<crate::net::GuidIndex>()
             .init_resource::<net::HouseLane>();
         let (tx, rx) = crossbeam_channel::unbounded();
         app.insert_resource(NetCommands(tx));
@@ -1310,28 +1315,31 @@ mod tests {
             app.world_mut().run_system(feed).unwrap();
             // The lanes' drain, after the feed.
             net::fire_house_lane(app.world_mut());
-            let mut s = app.world_mut().non_send_resource_mut::<UiScript>();
-            s.resolve();
-            let seen = s.eval::<Vec<String>>("return SEEN").unwrap();
-            s.run("SEEN = {}").unwrap();
-            let bidder = s
-                .eval::<Option<String>>(
-                    r#"local _,_,_,_,_,_,_,_,_,_,h = GetAuctionItemInfo("owner", 1) return h"#,
-                )
-                .unwrap();
+            let seen = {
+                let mut s = app.world_mut().non_send_resource_mut::<UiScript>();
+                s.resolve();
+                let seen = s.eval::<Vec<String>>("return SEEN").unwrap();
+                s.run("SEEN = {}").unwrap();
+                seen
+            };
+            let bidder = super::sort_tests::hosted_eval::<Option<String>>(
+                app.world_mut(),
+                r#"local _,_,_,_,_,_,_,_,_,_,h = GetAuctionItemInfo("owner", 1) return h"#,
+            );
             (seen, bidder)
         };
 
         // The window opens with the page, which asks no name; the read finds the bidder unknown,
-        // so nil, and asks for it (`0x4cf167`), which the next feed sends.
+        // so nil, and asks for it inside its call (`0x4cf167`).
+        app.world_mut().run_system(feed).unwrap();
+        assert!(name_queries(&rx).is_empty(), "the page asks no name");
         let (_, bidder) = step(&mut app);
         assert_eq!(bidder, None);
-        assert!(name_queries(&rx).is_empty(), "the page asks no name");
+        assert_eq!(name_queries(&rx), vec![BIDDER_GUID], "the read asked it");
 
         let (seen, bidder) = step(&mut app);
         assert!(seen.is_empty(), "nothing new, nothing fired: {seen:?}");
         assert_eq!(bidder, None);
-        assert_eq!(name_queries(&rx), vec![BIDDER_GUID], "the read asked it");
 
         app.world_mut().resource_mut::<NameCache>().insert_player(
             BIDDER_GUID,
@@ -1355,6 +1363,7 @@ mod tests {
             .init_resource::<Time>()
             .init_resource::<crate::ui_chat::ChatLog>()
             .init_resource::<crate::sound::MessageSounds>()
+            .init_resource::<crate::net::GuidIndex>()
             .add_systems(Update, feed_auction);
         let (tx, rx) = crossbeam_channel::unbounded();
         app.insert_resource(NetCommands(tx));
@@ -1372,10 +1381,10 @@ mod tests {
             open.set_list(OWNER, vec![entry(ME, BIDDER_GUID)], 1);
         }
         let read = |app: &mut App| {
-            app.world_mut()
-                .non_send_resource_mut::<UiScript>()
-                .run(r#"GetAuctionItemInfo("owner", 1)"#)
-                .unwrap();
+            super::sort_tests::hosted_eval::<()>(
+                app.world_mut(),
+                r#"GetAuctionItemInfo("owner", 1)"#,
+            );
             app.update();
         };
         app.update();

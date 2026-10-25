@@ -8,10 +8,12 @@ use mlua::{Lua, Value};
 use super::super::binding_abi::flag;
 use super::super::calls::{submit, ScriptCall};
 use super::super::protected::select_may_cast;
+use super::super::stat_read::read_self;
 use super::super::Model;
 use super::{
-    check_unit_token, classification_word, grey_band, level_is_hidden, unit_is_grey,
-    unit_predicate, unknownobject, with_unit, PlayerRecord, SelectionRequest,
+    check_unit_token, classification_word, grey_band, level_is_hidden_at, object_predicate,
+    read_object, unit_is_grey, unit_predicate, unknownobject, with_object, with_unit, PlayerRecord,
+    SelectionRequest,
 };
 
 /// The `"player"` fast path of `UnitName`, `UnitRace`, `UnitClass` and `UnitSex`, never
@@ -83,11 +85,11 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
             name,
             lua.create_function(move |lua, token: Value| {
                 let token = Some(crate::script::binding_abi::string_arg(lua, token, usage)?);
-                let hit = with_unit(lua, &token, false, |u| {
+                let hit = with_object(lua, &token, false, |_, o| {
                     if by_player {
-                        u.tapped_by_player
+                        o.tapped_by_player()
                     } else {
-                        u.tapped
+                        o.tapped()
                     }
                 })?;
                 Ok(flag(hit))
@@ -104,16 +106,12 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
         "UnitIsPartyLeader",
         lua.create_function(|lua, token: Option<String>| {
             check_unit_token(&token)?;
-            let model = lua.app_data_ref::<Model>().expect("model app_data");
-            let by_flag = token
-                .as_ref()
-                .and_then(|t| model.unit(t))
-                .is_some_and(|u| u.group_leader);
             // A token with no snapshot is GUID 0, the reference's `0:0`.
-            let guid = token
-                .as_ref()
-                .and_then(|t| model.unit(t))
-                .map_or(0, |u| u.guid);
+            let (by_flag, guid) = token
+                .as_deref()
+                .and_then(|t| read_object(lua, t, |u, o| (o.group_leader(), u.guid)))
+                .unwrap_or((false, 0));
+            let model = lua.app_data_ref::<Model>().expect("model app_data");
             Ok(flag(by_flag || guid == model.party.leader_guid))
         })?,
     )?;
@@ -149,10 +147,9 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
                 Some((Some(n), _, _)) => Value::String(lua.create_string(&n)?),
                 Some((None, held, guid)) => {
                     // A unit with no object reads the name cache by guid with a callback
-                    // (`0x5171eb`), which asks on the miss: the host sends it.
+                    // (`0x5171eb`), which asks on the miss inside the call.
                     if !held && guid != 0 {
-                        let mut model = lua.app_data_mut::<Model>().expect("model app_data");
-                        model.unit_name_asks.insert(guid);
+                        crate::script::calls::ask(lua, crate::script::RecordAsk::PlayerName(guid))?;
                     }
                     Value::String(unknownobject(lua)?)
                 }
@@ -169,7 +166,7 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
                 token,
                 r#"Usage: UnitHealth("unit")"#,
             )?);
-            with_unit(lua, &token, 0i64, |u| i64::from(u.health))
+            with_object(lua, &token, 0i64, |_, o| i64::from(o.health()))
         })?,
     )?;
 
@@ -181,7 +178,7 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
                 token,
                 r#"Usage: UnitHealthMax("unit")"#,
             )?);
-            with_unit(lua, &token, 0i64, |u| i64::from(u.max_health))
+            with_object(lua, &token, 0i64, |_, o| i64::from(o.max_health()))
         })?,
     )?;
 
@@ -198,31 +195,42 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
                 r#"Usage: UnitLevel("unit")"#,
             )?);
             check_unit_token(&token)?;
-            let model = lua.app_data_ref::<Model>().expect("model app_data");
-            let Some(u) = token.as_ref().and_then(|t| model.unit(t)) else {
+            let player_level = lua
+                .app_data_ref::<Model>()
+                .expect("model app_data")
+                .player_req
+                .level;
+            let Some((hidden, level, has_object, guid)) = token.as_deref().and_then(|t| {
+                read_object(lua, t, |u, o| {
+                    let level = o.level();
+                    let hidden = level_is_hidden_at(u, level, player_level);
+                    (hidden, level, u.has_object, u.guid)
+                })
+            }) else {
                 return Ok(0i64);
             };
-            if level_is_hidden(u, model.player_req.level) {
+            if hidden {
                 return Ok(-1);
             }
-            if u.level == 0 {
+            if level == 0 {
                 return Ok(0);
             }
             // The drunk leg needs the unit's object and the active player (`0x518096`).
+            let drunk = read_object(lua, "player", |_, p| p.drunk()).unwrap_or(0);
+            let model = lua.app_data_ref::<Model>().expect("model app_data");
             let me = model.unit_guids.player;
-            let drunk = model.unit("player").map_or(0, |p| p.drunk);
             let attackable = || {
                 model
                     .unit_relations
                     .as_deref()
-                    .and_then(|r| r.can_attack(me, u.guid))
+                    .and_then(|r| r.can_attack(me, guid))
                     .unwrap_or(false)
             };
             Ok(i64::from(
-                if u.has_object && me != 0 && drunk != 0 && attackable() {
-                    super::unit_level_drunk_level(u.level, drunk)
+                if has_object && me != 0 && drunk != 0 && attackable() {
+                    super::unit_level_drunk_level(level, drunk)
                 } else {
-                    u.level
+                    level
                 },
             ))
         })?,
@@ -256,8 +264,8 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
                 .expect("model app_data")
                 .player_req
                 .level;
-            unit_predicate(lua, &token, |u| {
-                u.has_object && !u.is_player && unit_is_grey(player_level, u.level)
+            object_predicate(lua, &token, |u, o| {
+                u.has_object && !u.is_player && unit_is_grey(player_level, o.level())
             })
         })?,
     )?;
@@ -281,7 +289,7 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
                 token,
                 r#"Usage: UnitIsDead("unit")"#,
             )?);
-            unit_predicate(lua, &token, |u| u.dead)
+            object_predicate(lua, &token, |_, o| o.dead())
         })?,
     )?;
 
@@ -294,7 +302,7 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
                 token,
                 r#"Usage: UnitIsGhost("unit")"#,
             )?);
-            unit_predicate(lua, &token, |u| u.ghost)
+            object_predicate(lua, &token, |_, o| o.ghost())
         })?,
     )?;
     g.set(
@@ -305,7 +313,7 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
                 token,
                 r#"Usage: UnitIsDeadOrGhost("unit")"#,
             )?);
-            unit_predicate(lua, &token, |u| u.dead || u.ghost)
+            object_predicate(lua, &token, |_, o| o.dead() || o.ghost())
         })?,
     )?;
 
@@ -321,12 +329,15 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
                 unit,
                 r#"Usage: UnitIsCivilian("unit")"#,
             )?);
-            let model = lua.app_data_ref::<Model>().expect("model app_data");
-            let player_level = model.player_req.level;
-            Ok(flag(
-                unit.and_then(|u| model.unit(&u))
-                    .is_some_and(|u| super::is_civilian_kill(u, player_level)),
-            ))
+            let player_level = lua
+                .app_data_ref::<Model>()
+                .expect("model app_data")
+                .player_req
+                .level;
+            Ok(flag(unit.is_some_and(|t| {
+                read_object(lua, &t, |u, o| super::civilian_kill_of(u, o, player_level))
+                    == Some(true)
+            })))
         })?,
     )?;
     // UnitPlayerControlled(unit) (`0x516410`): `UNIT_FIELD_FLAGS` bit 0x8, vmangos
@@ -335,11 +346,9 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
     g.set(
         "UnitPlayerControlled",
         lua.create_function(|lua, unit: Option<String>| {
-            let model = lua.app_data_ref::<Model>().expect("model app_data");
-            Ok(flag(
-                unit.and_then(|u| model.unit(&u))
-                    .is_some_and(|u| u.player_controlled),
-            ))
+            Ok(flag(unit.is_some_and(|t| {
+                read_object(lua, &t, |_, o| o.player_controlled()) == Some(true)
+            })))
         })?,
     )?;
     g.set(
@@ -356,7 +365,7 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
         lua.create_function(|lua, token: Option<String>| {
             // No `lua_isstring` gate, so nil answers nil; an unrecognised token still raises in
             // the resolver (`0x515940`).
-            unit_predicate(lua, &token, |u| u.flags & 0x40 != 0)
+            object_predicate(lua, &token, |_, o| o.flags() & 0x40 != 0)
         })?,
     )?;
 
@@ -407,7 +416,7 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
                 token,
                 "Usage: UnitAffectingCombat(\"unit\")",
             )?;
-            let hot = with_unit(lua, &Some(token), false, |u| u.exists && u.in_combat)?;
+            let hot = with_object(lua, &Some(token), false, |u, o| u.exists && o.in_combat())?;
             Ok(flag(hot))
         })?,
     )?;
@@ -434,13 +443,16 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
             name,
             lua.create_function(move |lua, token: Option<String>| {
                 check_unit_token(&token)?;
-                let model = lua.app_data_ref::<Model>().expect("model app_data");
-                let Some(u) = token.as_ref().and_then(|t| model.unit(t)) else {
+                let Some((exists, guid, owner)) = token
+                    .as_deref()
+                    .and_then(|t| read_object(lua, t, |u, o| (u.exists, u.guid, o.owner())))
+                else {
                     return Ok(Value::Nil);
                 };
-                if !u.exists || u.guid == 0 {
+                if !exists || guid == 0 {
                     return Ok(Value::Nil);
                 }
+                let model = lua.app_data_ref::<Model>().expect("model app_data");
                 let me = model.unit("player").map(|p| p.guid).unwrap_or(0);
                 let in_group = |guid: u64| {
                     guid != 0
@@ -455,7 +467,7 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
                 } else {
                     !model.party.members.is_empty()
                 };
-                let hit = grouped && (in_group(u.guid) || in_group(u.owner));
+                let hit = grouped && (in_group(guid) || in_group(owner));
                 Ok(flag(hit))
             })?,
         )?;
@@ -692,7 +704,7 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
             // `{2, 3, 1, 6}` unchecked (`0x808be4`), so an unset record answers 2 there too.
             let sex = match player_record_arm(lua, &token, |r| r.sex) {
                 Some(sex) => sex,
-                None => with_unit(lua, &token, 0u8, |u| u.sex)?,
+                None => with_object(lua, &token, 0u8, |_, o| o.sex())?,
             };
             Ok(Value::Integer(i64::from(if sex == 0 { 2 } else { sex })))
         })?,
@@ -744,7 +756,7 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
                 token,
                 r#"Usage: UnitPowerType("unit")"#,
             )?);
-            let ty = with_unit(lua, &token, 0u8, |u| u.power_type)?;
+            let ty = with_object(lua, &token, 0u8, |_, o| o.power_type())?;
             Ok(i64::from(ty))
         })?,
     )?;
@@ -759,7 +771,7 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
                 token,
                 r#"Usage: UnitMana("unit")"#,
             )?);
-            with_unit(lua, &token, 0i64, |u| i64::from(u.power))
+            with_object(lua, &token, 0i64, |_, o| i64::from(o.power()))
         })?,
     )?;
     g.set(
@@ -770,13 +782,13 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
                 token,
                 r#"Usage: UnitManaMax("unit")"#,
             )?);
-            with_unit(lua, &token, 0i64, |u| i64::from(u.max_power))
+            with_object(lua, &token, 0i64, |_, o| i64::from(o.max_power()))
         })?,
     )?;
 
     // UnitXP/UnitXPMax(unit): the token resolved (`0x51738e`), then the active player's private
-    // `PLAYER_XP` pair for its object by whatever token names it (`0x5173ad`-`0x5173c9`), 0 for
-    // any other unit or none.
+    // `PLAYER_XP` pair for its object by whatever token names it (`0x5173ad`-`0x5173c9`), read
+    // off the object as the call runs ([`read_self`]), 0 for any other unit or none.
     fn names_self(model: &Model, token: &str) -> bool {
         token.eq_ignore_ascii_case("player")
             || (model.unit_guids.player != 0
@@ -790,7 +802,7 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
             check_unit_token(&Some(token.clone()))?;
             let model = lua.app_data_ref::<Model>().expect("model app_data");
             Ok(if names_self(&model, &token) {
-                i64::from(model.player_xp)
+                i64::from(read_self(lua, |own| own.xp()))
             } else {
                 0
             })
@@ -804,7 +816,7 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
             check_unit_token(&Some(token.clone()))?;
             let model = lua.app_data_ref::<Model>().expect("model app_data");
             Ok(if names_self(&model, &token) {
-                i64::from(model.player_next_level_xp)
+                i64::from(read_self(lua, |own| own.next_level_xp()))
             } else {
                 0
             })
@@ -816,16 +828,15 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
     g.set(
         "UnitIsCharmed",
         lua.create_function(|lua, token: Option<String>| {
-            unit_predicate(lua, &token, |u| u.charmed)
+            object_predicate(lua, &token, |_, o| o.charmed())
         })?,
     )?;
 
+    // GetMoney() (`0x518160`): the active player's coinage (`+0xf70`, `0x5181ae`) as the call
+    // runs.
     g.set(
         "GetMoney",
-        lua.create_function(|lua, ()| {
-            let model = lua.app_data_ref::<Model>().expect("model app_data");
-            Ok(model.money as i64)
-        })?,
+        lua.create_function(|lua, ()| Ok(read_self(lua, |own| own.money()) as i64))?,
     )?;
 
     // GetComboPoints() (`0x51a190`): `PLAYER_FIELD_BYTES` byte 1, behind two gates stock
@@ -849,14 +860,16 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
     )?;
 
     // GetRestState() (`0x48d350`) → the Exhaustion.dbc row's ID, name and factor, indexed directly
-    // by `PLAYER_BYTES_2` byte 3 (`0xc0dd78`); nil, nil, nil when there is no such row.
+    // by `PLAYER_BYTES_2` byte 3 (`0xc0dd78`) as the call runs; nil, nil, nil when there is no
+    // such row.
     g.set(
         "GetRestState",
         lua.create_function(|lua, ()| {
+            let state = read_self(lua, |own| own.rest_state());
             let model = lua.app_data_ref::<Model>().expect("model app_data");
-            Ok(match model.exhaustion.get(&model.rest_state) {
+            Ok(match model.exhaustion.get(&state) {
                 Some((name, factor)) => (
-                    Value::Number(f64::from(model.rest_state)),
+                    Value::Number(f64::from(state)),
                     Value::String(lua.create_string(name)?),
                     Value::Number(*factor),
                 ),
@@ -870,38 +883,30 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
     g.set(
         "GetXPExhaustion",
         lua.create_function(|lua, ()| {
+            let (state, pool) = read_self(lua, |own| (own.rest_state(), own.rest_pool()));
             let model = lua.app_data_ref::<Model>().expect("model app_data");
-            Ok(if model.rest_state != 1 {
+            Ok(if state != 1 {
                 Value::Nil
             } else {
                 let factor = model.exhaustion.get(&1).map_or(2.0, |(_, f)| *f);
-                Value::Number(f64::from(model.rest_pool) * factor)
+                Value::Number(f64::from(pool) * factor)
             })
         })?,
     )?;
-    // IsResting() (`0x516ea0`): `PLAYER_FLAGS` bit 0x20, in a rest area.
+    // IsResting() (`0x516ea0`): `PLAYER_FLAGS` bit 0x20, in a rest area, as the call runs.
     g.set(
         "IsResting",
-        lua.create_function(|lua, ()| {
-            let model = lua.app_data_ref::<Model>().expect("model app_data");
-            Ok(flag(model.resting))
-        })?,
+        lua.create_function(|lua, ()| Ok(flag(read_self(lua, |own| own.resting()))))?,
     )?;
     // PartialPlayTime()/NoPlayTime(): the play-time limit flags, `PLAYER_FLAGS` bits 0x1000
-    // (`0x48eb70`) and 0x2000 (`0x48ebe0`).
+    // (`0x48eb70`) and 0x2000 (`0x48ebe0`), as the call runs.
     g.set(
         "PartialPlayTime",
-        lua.create_function(|lua, ()| {
-            let model = lua.app_data_ref::<Model>().expect("model app_data");
-            Ok(flag(model.partial_play_time))
-        })?,
+        lua.create_function(|lua, ()| Ok(flag(read_self(lua, |own| own.partial_play_time()))))?,
     )?;
     g.set(
         "NoPlayTime",
-        lua.create_function(|lua, ()| {
-            let model = lua.app_data_ref::<Model>().expect("model app_data");
-            Ok(flag(model.no_play_time))
-        })?,
+        lua.create_function(|lua, ()| Ok(flag(read_self(lua, |own| own.no_play_time()))))?,
     )?;
     // GetBillingTimeRested() (`0x48ec50`): always one number, unconverted (`0x48ec5e`); stock
     // `PlayerFrame.lua:246` reads it as minutes. vmangos always sends 0 (`World.cpp:331`).

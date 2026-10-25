@@ -81,6 +81,8 @@ pub(crate) use by_name::{
 // The one SetSelection path, for the loot response's select (`0x48f3a0`), and what a selecting
 // call owes after its signals.
 pub(crate) use by_name::{SelectCommit, SelectDebt};
+// The follow's start gate, for `/follow` and for `FollowUnit` and `FollowByName` in their calls.
+pub(crate) use by_name::{FollowStart, FollowSteps};
 // The selector's colour and the faction catalog it and the model read.
 #[cfg(test)]
 pub(crate) use ring::{ring_variant, PlayerPath, SelectorInput};
@@ -313,6 +315,7 @@ impl Plugin for TargetPlugin {
             .init_resource::<Hovered>()
             .init_resource::<HoveredObject>()
             .init_resource::<PickOcclusion>()
+            .init_resource::<hover_probe::ProbeAim>()
             .init_resource::<PressPick>()
             .init_resource::<WorldCursor>()
             .init_resource::<cursor_mode::AttackFork>()
@@ -340,7 +343,12 @@ impl Plugin for TargetPlugin {
                 Update,
                 (
                     // The latch first, before any pick refresh clears what the press was over.
-                    (latch_press_pick, hover::update_pick_occlusion).chain(),
+                    // The trace reads the static world after this frame's stream reshapes it.
+                    (
+                        latch_press_pick,
+                        hover::aim_and_trace().after(WorldStage::Stream),
+                    )
+                        .chain(),
                     hover::update_hover,
                     hover::update_hovered_object,
                     cursor_mode::classify_cursor,
@@ -398,8 +406,7 @@ impl Plugin for TargetPlugin {
                     (
                         by_name::target_by_name_requests,
                         by_name::assist_requests,
-                        // After the follow drain, so a `FollowUnit` starts the frame it is made.
-                        by_name::follow_requests.after(crate::ui_follow::drain_follow),
+                        by_name::follow_requests,
                     )
                         .chain(),
                     scan::auto_acquire,

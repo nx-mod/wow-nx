@@ -77,9 +77,13 @@ fn harness_with_wire() -> (App, crossbeam_channel::Receiver<crate::net::ClientCo
     let mut data = [0i32; 24];
     data[0] = 1;
     books.insert(BOOK_ENTRY, 9, "Book".into(), &data);
+    // Its first page cached, which the reader's begin waits on (`0x4e3465`).
+    let mut pages = crate::ui_item_text::PageTexts::default();
+    pages.insert(1, "Page one.".into(), 0);
     app.insert_resource(NetCommands(tx))
         .add_message::<LatchVocal>()
         .insert_resource(books)
+        .insert_resource(pages)
         .init_resource::<crate::net::GuidIndex>()
         .init_resource::<crate::items::Items>()
         .init_resource::<TradeSession>()
@@ -159,7 +163,11 @@ fn read_book(world: &mut World, npc: u64) {
         .0
         .contains_key(&npc)
     {
-        crate::items::test_spawn_object(world, npc, crate::go_templates::test_fields(BOOK_ENTRY));
+        crate::items::test_spawn_object(
+            world,
+            npc,
+            crate::go_templates::test_typed_fields(BOOK_ENTRY, 9),
+        );
     }
     crate::ui_item_text::read_now(world, npc);
 }
@@ -182,7 +190,7 @@ pub(crate) fn open(app: &mut App, window: W, npc: u64) {
                 crate::items::test_spawn_object(
                     world,
                     npc,
-                    crate::go_templates::test_fields(BOOK_ENTRY),
+                    crate::go_templates::test_typed_fields(BOOK_ENTRY, 9),
                 );
             }
             crate::ui_item_text::read_now(world, npc)

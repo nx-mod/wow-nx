@@ -77,6 +77,7 @@ pub(crate) struct Lifecycle<'w> {
     actions: ResMut<'w, PlayerActions>,
     learned_in_tab: ResMut<'w, LearnedInTab>,
     reports: ResMut<'w, CastReports>,
+    tutorials: Option<Res<'w, crate::tutorial::Tutorials>>,
     pending: ResMut<'w, PendingCast>,
     /// With `pending`, `reports` and `net`, the in-flight slot the GO-deferred attack start's
     /// cancel reads (`0x5ecc85`).
@@ -143,9 +144,9 @@ fn active_player<'a>(
         .and_then(|&e| stores.get(e).ok())
 }
 
-fn on_action_buttons(In(ev): In<SessionEvent>, mut l: Lifecycle) {
+fn on_action_buttons(In(ev): In<SessionEvent>, mut slots: ResMut<crate::ui_action::ActionSlots>) {
     if let SessionEvent::ActionButtons { buttons } = ev {
-        action_buttons(buttons, &mut l.actions);
+        action_buttons(buttons, &mut slots);
     }
 }
 
@@ -221,6 +222,7 @@ fn on_cast_result(
             ground: &mut ladder.ground,
             reports: &mut ladder.reports,
             net: &ladder.commands,
+            tutorials: ladder.tutorials.as_deref(),
         };
         let chained = cast_result(
             spell_id,
@@ -301,10 +303,14 @@ fn on_spell_start(
 #[allow(clippy::type_complexity)] // a Bevy system's full input set
 fn on_spell_go(
     In(ev): In<SessionEvent>,
-    mut set: ParamSet<(
-        (Lifecycle, Scene),
-        crate::script_calls::VmWith<crate::target::SelectCommit<'static, 'static>>,
-    )>,
+    mut set: crate::script_calls::disjoint::Pair<
+        (Lifecycle<'static>, Scene<'static, 'static>),
+        crate::script_calls::VmWith<
+            'static,
+            'static,
+            crate::target::SelectCommit<'static, 'static>,
+        >,
+    >,
 ) {
     let mark = crate::lanes::mark();
     if let SessionEvent::SpellGo {
@@ -371,6 +377,7 @@ fn on_spell_go(
                         ground: &mut l.ground,
                         reports: &mut l.reports,
                         net: &l.net,
+                        tutorials: l.tutorials.as_deref(),
                     },
                 ),
                 l.play_seq.next(),
@@ -429,6 +436,7 @@ fn on_cancel_auto_repeat(In(ev): In<SessionEvent>, mut l: Lifecycle, sc: Scene) 
                 ground: &mut l.ground,
                 reports: &mut l.reports,
                 net: &l.net,
+                tutorials: l.tutorials.as_deref(),
             },
         );
     }
@@ -645,8 +653,10 @@ fn spell_book(
     // `ResetSpellBook 0x4b23a0` empties the opener list (`0x4b2464`-`0x4b2470`) before the
     // arrival's replay learns the list in wire order (`0x5dea8b`-`0x5deab9`).
     actions.openers.clear();
+    // It zeroes the effect-spell globals too (`0x4b2433`), `Stuck()`'s among them.
+    actions.stuck_spell = None;
     for &spell_id in &spell_ids {
-        list_opener(spell_id, spells, actions);
+        register_in_book(spell_id, spells, actions);
     }
     actions.spells.clear();
     actions.profession_order.clear();
@@ -670,10 +680,10 @@ fn spell_book(
 }
 
 /// `SMSG_ACTION_BUTTONS`, at login and on server-side edits, into the action store.
-fn action_buttons(buttons: Vec<ActionButton>, actions: &mut PlayerActions) {
+fn action_buttons(buttons: Vec<ActionButton>, slots: &mut crate::ui_action::ActionSlots) {
     debug!("net: action bar — {} occupied slots", buttons.len());
-    actions.buttons = buttons.into_iter().map(|b| (b.slot, b)).collect();
-    actions.dirty = true;
+    slots.buttons = buttons.into_iter().map(|b| (b.slot, b)).collect();
+    slots.dirty = true;
 }
 
 /// `SMSG_LEARNED_SPELL`: the spell joins the book (the spellbook feed diffs it; learning never
@@ -691,7 +701,7 @@ fn learned_spell(
         actions.dirty = true;
     }
     list_learn(spell_id, actions);
-    list_opener(spell_id, spells, actions);
+    register_in_book(spell_id, spells, actions);
     announce_learn(spell_id, spells, errors);
     tab_flash.0.push(spell_id);
 }
@@ -717,6 +727,23 @@ fn list_unlearn(spell_id: u32, actions: &mut PlayerActions) {
     }
     if let Some(at) = actions.craft_order.iter().position(|&id| id == spell_id) {
         actions.craft_order.remove(at);
+    }
+}
+
+/// `SPELL_EFFECT_STUCK` in `Effect[0]`, the registrar's test for `Stuck()`'s spell (`0x4b2614`).
+const SPELL_EFFECT_STUCK: u32 = 0x54;
+
+/// The registrar `0x4b25b0`'s effect legs this client keeps: the opener list, and `Stuck()`'s
+/// spell `[0xb70098]`, which each registered spell whose `Effect[0]` is `SPELL_EFFECT_STUCK`
+/// overwrites (`0x4b2614`-`0x4b261d`), so the last such learn holds it. No unlearn clears it; the
+/// book's reset does.
+fn register_in_book(spell_id: u32, spells: Option<&Spells>, actions: &mut PlayerActions) {
+    list_opener(spell_id, spells, actions);
+    if spells
+        .and_then(|s| s.catalog.get(spell_id))
+        .is_some_and(|d| d.effects[0] == SPELL_EFFECT_STUCK)
+    {
+        actions.stuck_spell = Some(spell_id);
     }
 }
 
@@ -832,7 +859,7 @@ fn superceded_spell(
     // unlearn of the old rank (`0x5e6392` → `0x5ea24c`) then runs the removal once more, and its
     // learn of the new one (`0x5e63a4`) skips the registrar (`0x5e9c5a`).
     unlist_opener(old_spell_id, actions);
-    list_opener(new_spell_id, spells, actions);
+    register_in_book(new_spell_id, spells, actions);
     unlist_opener(old_spell_id, actions);
     // A rank-up announces once, like a first learn: the supersede pair `0x4b2f50` calls the
     // unlearn `0x4b2c50`, which prints nothing, then the registrar `0x4b25b0` with `edx = 1`
@@ -1719,7 +1746,7 @@ fn spell_chain_targets(
 mod tests {
     use super::*;
     use crate::spell::QueuedMeleeSpell;
-    use benilla_protocol::messages::{ObjectType, ACTION_KIND_SPELL};
+    use benilla_protocol::messages::ObjectType;
 
     mod cooldown_sites;
     mod dispatch;
@@ -1982,14 +2009,6 @@ mod tests {
     fn superceded_spell_swaps_the_book_and_leaves_the_bar_to_the_rank_pass() {
         let mut actions = PlayerActions::default();
         actions.spells.insert(78); // Heroic Strike rank 1, known
-        actions.buttons.insert(
-            0,
-            ActionButton {
-                slot: 0,
-                action: 78,
-                kind: ACTION_KIND_SPELL,
-            },
-        );
 
         superceded_spell(
             78,
@@ -2008,11 +2027,10 @@ mod tests {
             actions.spells.contains(&284),
             "the new rank enters the book"
         );
-        assert_eq!(
-            actions.buttons[&0].action, 78,
-            "the bar follows from the book, not from here"
+        assert!(
+            actions.dirty,
+            "the bar follows from the book, and `dirty` is what makes it follow"
         );
-        assert!(actions.dirty, "…and `dirty` is what makes it follow");
     }
 
     /// The self player's own packets, run through the real handlers in the order a server sends
@@ -2374,6 +2392,7 @@ mod tests {
                                     ground: &mut Default::default(),
                                     reports: &mut Default::default(),
                                     net: &net_commands,
+                                    tutorials: None,
                                 },
                             ),
                             1,
@@ -3301,6 +3320,7 @@ mod tests {
                                 ground: &mut Default::default(),
                                 reports: &mut Default::default(),
                                 net: &net_commands,
+                                tutorials: None,
                             },
                         ),
                         1,
@@ -3499,6 +3519,7 @@ mod tests {
                                 ground: &mut Default::default(),
                                 reports: &mut Default::default(),
                                 net: &net_commands,
+                                tutorials: None,
                             },
                         ),
                         1,
@@ -3879,6 +3900,7 @@ mod tests {
                                     ground: &mut Default::default(),
                                     reports: &mut Default::default(),
                                     net: &net_commands,
+                                    tutorials: None,
                                 },
                             ),
                             1,

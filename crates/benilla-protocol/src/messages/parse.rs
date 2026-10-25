@@ -626,6 +626,10 @@ fn parse_server_body(
             let guid = read_u64_le(&mut r)?;
             ServerPacket::Emote { guid, emote_id }
         }
+        opcode::SMSG_ITEM_NAME_QUERY_RESPONSE => {
+            let (entry, name) = items::read_item_name_query_response(&mut r)?;
+            ServerPacket::ItemNameQueryResponse { entry, name }
+        }
         opcode::SMSG_ITEM_QUERY_SINGLE_RESPONSE => {
             let (entry, info) = items::read_item_query_response(&mut r)?;
             ServerPacket::ItemQueryResponse {
@@ -1287,8 +1291,8 @@ fn parse_server_body(
                 }
             }
         }
-        // `u32 petNumber, cstring name, u32 nameTimestamp` (`Pet.cpp:79-84`); the timestamp only
-        // ages the reference's on-disk pet-name cache.
+        // `u32 petNumber, cstring name, u32 nameTimestamp` (`Pet.cpp:79-84`); the timestamp is
+        // read and dropped.
         opcode::SMSG_PET_NAME_QUERY_RESPONSE => {
             let pet_number = read_u32_le(&mut r)?;
             let name = read_cstring(&mut r)?;
@@ -1315,6 +1319,9 @@ fn parse_server_body(
             let guid = gameobject::read_gameobject_despawn_anim(&mut r)?;
             ServerPacket::GameObjectDespawnAnim { guid }
         }
+        opcode::SMSG_GAMEOBJECT_PAGETEXT => ServerPacket::GameObjectPageText {
+            guid: gameobject::read_gameobject_page_text(&mut r)?,
+        },
         opcode::SMSG_OPEN_CONTAINER => ServerPacket::OpenContainer {
             item: items::read_open_container(&mut r)?,
         },
@@ -1332,6 +1339,7 @@ fn parse_server_body(
             instant: read_u8(&mut r)? != 0,
         },
         opcode::SMSG_LOGOUT_CANCEL_ACK => ServerPacket::LogoutCancelAck,
+        opcode::SMSG_CLEAR_FAR_SIGHT_IMMEDIATE => ServerPacket::ClearFarSightImmediate,
         opcode::SMSG_PONG => ServerPacket::Pong {
             sequence: read_u32_le(&mut r)?,
         },
@@ -1672,6 +1680,19 @@ fn parse_server_body(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `SMSG_CLEAR_FAR_SIGHT_IMMEDIATE` (`0x20d`) has a handler: its jump-table entry leads to
+    /// `0x5e43f8`, which ends far sight on the active player and reads no body.
+    #[test]
+    fn the_clear_far_sight_packet_decodes_to_its_event() {
+        let (packet, tail) = parse_server_with_tail(opcode::SMSG_CLEAR_FAR_SIGHT_IMMEDIATE, &[])
+            .expect("an empty body decodes");
+        assert_eq!(tail, 0);
+        assert!(matches!(
+            crate::events::decode(packet).as_slice(),
+            [crate::SessionEvent::FarSightCleared]
+        ));
+    }
 
     /// `SMSG_AUTH_RESPONSE` as vmangos writes its four shapes: the admitting `AUTH_OK` and the first
     /// `AUTH_WAIT_QUEUE` with the billing group (`World.cpp:325-331`, `:374-381`), then the queue's

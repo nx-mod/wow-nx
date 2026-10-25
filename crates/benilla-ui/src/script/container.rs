@@ -7,6 +7,7 @@ use mlua::{Lua, MultiValue, Value};
 
 use super::binding_abi::{self, flag, number_arg};
 use super::cursor::{self, CursorItem, CursorPayload};
+use super::item_read::read_item_or;
 use super::protected::{self, Tag};
 use super::{ItemCall, Model};
 
@@ -115,6 +116,11 @@ pub struct ContainerSlot {
 }
 
 impl ContainerSlot {
+    /// The item object the getters read as they run, while the slot names one.
+    pub(crate) fn item_key(&self) -> Option<super::ItemKey> {
+        (self.guid != 0).then_some(super::ItemKey::Object(self.guid))
+    }
+
     /// An item object whose record the cache does not hold yet, which the feed pushes with its
     /// entry and no quality: a cooldown query on it asks the record with the callback `0x6e2f70`
     /// (`0x6e2efb`), whose arrival runs it.
@@ -329,6 +335,13 @@ impl super::Model {
     }
 }
 
+/// The item the bag slot `(bag, slot)` holds, as its getters read it; `None` for an empty or
+/// unknown slot.
+fn slot_key(lua: &Lua, bag: i64, slot: u32) -> Option<Option<super::ItemKey>> {
+    let model = lua.app_data_ref::<Model>().expect("model app_data");
+    model.bag_slot(bag, slot).map(ContainerSlot::item_key)
+}
+
 impl super::UiScript {
     /// Push one bag's snapshot, or remove it with `None`; cooldowns arrive in ms on the `GetTime`
     /// clock and are stored in seconds.
@@ -391,10 +404,15 @@ impl super::UiScript {
         })
     }
 
-    /// Drain the item entries whose record a cooldown query found missing since the last call, each
-    /// asked with the callback `0x6e2f70`.
+    /// The item entries whose record a cooldown query found missing that a harness's VM kept
+    /// ([`Self::keep_calls`]), each asked with the callback `0x6e2f70`.
     pub fn take_cooldown_record_asks(&mut self) -> Vec<u32> {
-        std::mem::take(&mut self.model_mut().cooldown_record_asks)
+        self.take_calls_where(|call| match call {
+            super::ScriptCall::RecordAsk(super::RecordAsk::CooldownItem { entry, .. }) => {
+                Some(*entry)
+            }
+            _ => None,
+        })
     }
 
     /// Arm a gift wrap with the paper at `(bag, slot)`, as `0x5edea0` does: the paper locks, the
@@ -854,6 +872,17 @@ fn container_key(
     Ok((slot >= 1).then_some((i64::from(bag), slot as u32)))
 }
 
+/// The item cooldown query's lookup of a record the mirror lacks, inside the call: the callback
+/// `0x6e2f70`, deduped, with the active player as the owner id (`0x6e2eef`-`0x6e2f0d`).
+pub(super) fn ask_cooldown_record(lua: &Lua, entry: u32) -> mlua::Result<()> {
+    let owner = lua
+        .app_data_ref::<Model>()
+        .expect("model app_data")
+        .unit_guids
+        .player;
+    super::calls::ask(lua, super::RecordAsk::CooldownItem { entry, owner })
+}
+
 /// Register the container verbs as bare globals, as `reference/lua_globals.tsv` lists them;
 /// `C_Container` is a later client's namespace, and an addon that finds it assumes that client.
 pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
@@ -991,35 +1020,50 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                 slot,
                 "Usage: GetContainerItemCooldown(index, slot)",
             )?;
-            let mut model = lua.app_data_mut::<Model>().expect("model app_data");
-            let slot = key.and_then(|k| model.bag_slot(k.0, k.1));
-            let held = slot.is_some();
-            // The query asks a missing record with the callback `0x6e2f70` (`0x6e2efb`).
-            if let Some(entry) = slot.filter(|s| s.record_pending()).map(|s| s.item_id) {
-                model.cooldown_record_asks.push(entry);
+            let (pending, triple) = {
+                let model = lua.app_data_ref::<Model>().expect("model app_data");
+                let slot = key.and_then(|k| model.bag_slot(k.0, k.1));
+                let pending = slot.filter(|s| s.record_pending()).map(|s| s.item_id);
+                let triple = match slot {
+                    Some(_) => item_cooldown_triple(
+                        key.and_then(|k| model.container_cooldowns.get(&k).copied()),
+                        now,
+                    ),
+                    None => (0.0, 0.0, 0),
+                };
+                (pending, triple)
+            };
+            // The query asks a missing record with the callback `0x6e2f70` inside the call
+            // (`0x6e2efb`).
+            if let Some(entry) = pending {
+                ask_cooldown_record(lua, entry)?;
             }
-            Ok(if held {
-                item_cooldown_triple(
-                    key.and_then(|k| model.container_cooldowns.get(&k).copied()),
-                    now,
-                )
-            } else {
-                (0.0, 0.0, 0)
-            })
+            Ok(triple)
         })?,
     )?;
 
     lua.globals().set(
         "GetContainerItemLink",
         lua.create_function(|lua, (bag, slot): (Value, Value)| {
-            let key = container_key(lua, bag, slot, "Usage: GetContainerItemLink(index, slot)")?;
-            let link = {
-                let model = lua.app_data_ref::<Model>().expect("model app_data");
-                key.and_then(|(bag, slot)| {
-                    let s = model.bag_slot(bag, slot)?;
-                    s.link.clone().or_else(|| s.uncached_link.clone())
-                })
+            let Some((bag, slot)) =
+                container_key(lua, bag, slot, "Usage: GetContainerItemLink(index, slot)")?
+            else {
+                return Ok(MultiValue::new());
             };
+            let Some(key) = slot_key(lua, bag, slot) else {
+                return Ok(MultiValue::new());
+            };
+            // The object and its record as the call runs (`0x4f997f` → `0x52ae00`).
+            let link = read_item_or(
+                lua,
+                key,
+                |item| item.link().or_else(|| item.uncached_link()),
+                |f| {
+                    let model = lua.app_data_ref::<Model>().expect("model app_data");
+                    model.bag_slot(bag, slot).map(|s| f(s))
+                },
+            )
+            .flatten();
             // Nothing at all when the resolver fails or finds no item object (`0x4f996b`,
             // `0x4f997b`, both to `0x4f99a5`); any object links (`0x4f997f` → `0x52ae00`), with
             // no record white and nameless.
@@ -1045,15 +1089,31 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                 // The resolver failed (`0x4f990d`): nothing is pushed (`0x4f9810`).
                 return Ok(mlua::MultiValue::new());
             };
-            let (info, locked) = {
+            let (key, locked) = {
                 let model = lua.app_data_ref::<Model>().expect("model app_data");
-                let info = model.bag_slot(bag, slot).cloned();
-                let locked = info
-                    .as_ref()
-                    .is_some_and(|s| cursor::item_locked(&model, s.guid));
-                (info, locked)
+                let Some(s) = model.bag_slot(bag, slot) else {
+                    return Ok(mlua::MultiValue::new());
+                };
+                (s.item_key(), cursor::item_locked(&model, s.guid))
             };
-            let Some(s) = info else {
+            // The object and its record as the call runs (`0x4f96dc`, `0x4f978b`).
+            let Some((texture, count, quality, readable)) = read_item_or(
+                lua,
+                key,
+                |item| {
+                    (
+                        item.texture(),
+                        // A slot's stack is always its object's or its push's.
+                        item.stack_count().unwrap_or(1),
+                        super::item_stats::gated_quality(item.quality(), item.inventory_type()),
+                        item.readable(),
+                    )
+                },
+                |f| {
+                    let model = lua.app_data_ref::<Model>().expect("model app_data");
+                    model.bag_slot(bag, slot).map(|s| f(s))
+                },
+            ) else {
                 return Ok(mlua::MultiValue::new());
             };
             Ok(mlua::MultiValue::from_vec(vec![
@@ -1061,21 +1121,18 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                 // (`0x5d8af0`).
                 Value::String(
                     lua.create_string(
-                        s.texture
+                        texture
                             .as_deref()
                             .unwrap_or(super::item_stats::MISSING_ITEM_ICON),
                     )?,
                 ),
-                Value::Integer(i64::from(s.count)),
+                Value::Integer(i64::from(count)),
                 // The item's lock bit (`0x4f9752`, [`cursor::item_locked`]).
                 flag(locked),
                 // A number on every path: -1 unless the template is cached and equippable
                 // (`0x4f9794`).
-                Value::Integer(super::item_stats::gated_quality(
-                    s.quality,
-                    s.inventory_type,
-                )),
-                flag(s.readable),
+                Value::Integer(quality),
+                flag(readable),
             ]))
         })?,
     )?;
@@ -3001,7 +3058,7 @@ mod tests {
 
         let mut s = UiScript::new().unwrap();
         s.set_player_control(true);
-        s.open_trade_window();
+        s.open_trade_window(0x7);
         s.set_container(0, Some(crate::script::cursor::two_item_bag()));
         s.keep_calls();
         s.run("PickupContainerItem(0, 2) ClickTradeButton(1) ClearCursor()")

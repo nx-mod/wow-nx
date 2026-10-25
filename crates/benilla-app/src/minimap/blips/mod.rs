@@ -17,7 +17,8 @@
 //! draws the gold cell 3 (status 6 draws nothing; green cell 2 is never used in 1.12), and every
 //! other object falls through to tracking: a GameObject passing `0x5ed2b0` draws gold cell 0, a
 //! unit passing `0x5ed210` red cell 1, against the `PLAYER_TRACK_CREATURES`/`RESOURCES` masks.
-//! Party members are blue cell 4. Dots cull at the view radius in 3-D distance and draw last.
+//! Party members and our pet, our charm else our summon (`0x6dad10` slot 4), are blue cell 4 within
+//! 0.8 of the radius. Object dots cull at the view radius in 3-D distance; all draw last.
 //!
 //! Blip sizes are frozen once by the CGMinimapFrame ctor (`0x4edbc0`) against a 140.8-px basis.
 //!
@@ -109,18 +110,55 @@ pub(crate) fn corpse_landmark(position: [f32; 3], map_id: u32, name: String) -> 
 /// An in-range POI icon's quad, 16 px (`[0xbc7658]`, frozen by the ctor).
 const POI_ICON_PX: f32 = 16.0;
 
-/// The blip under the cursor this frame, for [`drive_blip_tooltip`].
-#[derive(Resource, Default)]
-pub(crate) enum MinimapBlipHover {
-    #[default]
-    None,
-    /// A landmark's name.
-    Landmark(String),
-    /// A unit dot's guid, resolved through the name cache, and whether the dot drew grey; the
-    /// tooltip line greys the same way (`|cffb0b0b0`).
-    Npc(u64, bool),
-    /// A tracked GameObject dot: its template name and the grey flag.
-    TrackedGo(String, bool),
+/// Which of the probe's masks an element under the cursor sets, in the order the tooltip's text
+/// joins them (`0x4eb58c`-`0x4eb840`): the rim arrows (`0xbdcbb0`), the party and pet arrow frames
+/// (`0xbdcbb4`), the landmark icons (`0xbdcbac`), then the dots of categories 0 to 4 (`0xbc81e4`).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub(crate) enum BlipBlock {
+    RimArrow,
+    GroupArrow,
+    Icon,
+    /// A dot's category: 0 a tracked game object, 1 a tracked unit, 3 a quest giver, 4 a party
+    /// member or the pet.
+    Dot(u8),
+}
+
+/// How a hovered element names itself.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) enum BlipName {
+    /// A landmark's name or a game object's template name, already in hand.
+    Known(String),
+    /// A unit's guid, resolved through its object or the name cache (`0x4eb31a`, `0x4eb33c`).
+    Unit(u64),
+}
+
+/// One element under the cursor.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) struct BlipLine {
+    pub(crate) block: BlipBlock,
+    pub(crate) name: BlipName,
+    /// A dot record's colour flag `+0x10`, set across a subzone line: its line is wrapped in
+    /// `|cffb0b0b0` (`0x4eb7bb`-`0x4eb7cf`).
+    pub(crate) grey: bool,
+}
+
+/// Every element under the cursor this frame, as the probe's masks keep them, for
+/// [`drive_blip_tooltip`].
+#[derive(Resource, Default, Debug)]
+pub(crate) struct MinimapBlipHover(Vec<BlipLine>);
+
+impl MinimapBlipHover {
+    /// One element under the cursor, in its block's list order.
+    pub(super) fn push(&mut self, block: BlipBlock, name: BlipName, grey: bool) {
+        self.0.push(BlipLine { block, name, grey });
+    }
+
+    /// The elements in the order the text joins them: block by block, each in list order.
+    pub(crate) fn lines(&self) -> Vec<&BlipLine> {
+        let mut lines: Vec<&BlipLine> = self.0.iter().collect();
+        lines.sort_by_key(|l| l.block);
+        lines
+    }
 }
 
 /// The blip layer's system inputs, tupled to keep `emit_minimap` under Bevy's 16-parameter cap.
@@ -234,8 +272,7 @@ fn poi_icon_cell(icon: u32) -> Option<[f32; 4]> {
     Some([c / 8.0, (c + 1.0) / 8.0, r / 8.0, (r + 1.0) / 8.0])
 }
 
-/// Draw the in-range POI icons, then hover-test the rim arrows, which the engine children draw;
-/// the later hit wins.
+/// Draw the in-range POI icons, then hover-test the rim arrows, which the engine children draw.
 pub(super) fn emit_landmarks(
     ctx: &BlipCtx,
     cat: Option<&AreaPoiCatalog>,
@@ -274,7 +311,7 @@ pub(super) fn emit_landmarks(
             });
             if let Some(c) = ctx.cursor {
                 if rect.contains(c) {
-                    *hover = MinimapBlipHover::Landmark(poi.name.clone());
+                    hover.push(BlipBlock::Icon, BlipName::Known(poi.name.clone()), false);
                 }
             }
         }
@@ -282,13 +319,18 @@ pub(super) fn emit_landmarks(
     for (_d, poi, _art) in &sel.arrows {
         if let Some(c) = ctx.cursor {
             if rim_arrow_rect(ctx, poi.pos).contains(c) {
-                *hover = MinimapBlipHover::Landmark(poi.name.clone());
+                hover.push(
+                    BlipBlock::RimArrow,
+                    BlipName::Known(poi.name.clone()),
+                    false,
+                );
             }
         }
     }
 }
 
-/// A rim arrow's square on the 0.8 rim toward its target, for the hover test.
+/// A rim arrow's square on the 0.8 rim toward its target, for the hover test: the probe tests the
+/// landmark and the group arrow frames alike (`0x4eb3b0`, `0x4eb433`).
 fn rim_arrow_rect(ctx: &BlipCtx, target: [f32; 3]) -> Rect {
     let dir = ctx.offset(target).normalize_or_zero();
     let pos = ctx.center + dir * (ctx.side * 0.5 * BLIP_EDGE_RATIO);
@@ -351,11 +393,30 @@ pub(crate) fn party_member_pos<F: bevy::ecs::query::QueryFilter>(
         .map(|(x, y)| (f32::from(x), f32::from(y)))
 }
 
-/// The party and pet arrow frames' bearings, the out-of-range half of the party placement
-/// `0x6dad10`: slots 0 to 3 the party members, slot 4 the pet, our charm else our summon
+/// The five group records of the party placement `0x6dad10`, each its guid (record `+0`) and
+/// position: slots 0 to 3 the party members, slot 4 the pet, our charm else our summon
 /// (`0x6dad60`–`0x6dad9c`), each fetched as a unit (`0x6dadc8`); a member that is not streamed
-/// falls back to its party-stats position, the pet to nothing (`0x6dae25`). Beyond 0.8 of the
-/// radius it has an arrow at its bearing (`0x6daf5c`–`0x6daf7f`).
+/// falls back to its party-stats position, the pet to nothing (`0x6dae25`).
+pub(super) fn group_records<F: bevy::ecs::query::QueryFilter>(
+    group: &crate::ui_party::GroupState,
+    guids: &GuidIndex,
+    unit_pos: &Query<&GlobalTransform, F>,
+    pet: Option<u64>,
+) -> [Option<(u64, (f32, f32))>; benilla_ui::widget::MINIMAP_GROUP_ARROWS] {
+    let mut records = [None; benilla_ui::widget::MINIMAP_GROUP_ARROWS];
+    for (i, m) in group.party_slots().enumerate().take(4) {
+        records[i] = party_member_pos(m, group, guids, unit_pos).map(|p| (m.guid, p));
+    }
+    records[4] = pet.and_then(|g| {
+        let tf = unit_pos.get(*guids.0.get(&g)?).ok()?;
+        let w = bevy_to_wow(tf.translation());
+        Some((g, (w[0], w[1])))
+    });
+    records
+}
+
+/// The party and pet arrow frames' bearings, the out-of-range half of the placement: beyond 0.8
+/// of the radius a [`group_records`] record has an arrow at its bearing (`0x6daf5c`–`0x6daf7f`).
 pub(super) fn group_arrow_records<F: bevy::ecs::query::QueryFilter>(
     wx: f32,
     wy: f32,
@@ -365,30 +426,24 @@ pub(super) fn group_arrow_records<F: bevy::ecs::query::QueryFilter>(
     unit_pos: &Query<&GlobalTransform, F>,
     pet: Option<u64>,
 ) -> [Option<f32>; benilla_ui::widget::MINIMAP_GROUP_ARROWS] {
-    let arrow = |(x, y): (f32, f32)| {
-        (((x - wx).powi(2) + (y - wy).powi(2)).sqrt() / radius_yd > BLIP_EDGE_RATIO)
-            .then(|| bearing(wx, wy, x, y))
-    };
-    let mut records = [None; benilla_ui::widget::MINIMAP_GROUP_ARROWS];
-    for (i, m) in group.party_slots().enumerate().take(4) {
-        records[i] = party_member_pos(m, group, guids, unit_pos).and_then(arrow);
-    }
-    records[4] = pet
-        .and_then(|g| guids.0.get(&g))
-        .and_then(|e| unit_pos.get(*e).ok())
-        .map(|tf| {
-            let w = bevy_to_wow(tf.translation());
-            (w[0], w[1])
-        })
-        .and_then(arrow);
-    records
+    group_records(group, guids, unit_pos, pet).map(|record| {
+        record
+            .map(|(_, pos)| pos)
+            .filter(|&(x, y)| {
+                ((x - wx).powi(2) + (y - wy).powi(2)).sqrt() / radius_yd > BLIP_EDGE_RATIO
+            })
+            .map(|(x, y)| bearing(wx, wy, x, y))
+    })
 }
 
-/// Show the hovered blip's name; a unit's resolves through the name cache. This is the in-rect
-/// half of the Minimap's probe `0x4eb0c0`, which the hover walk runs on the Minimap while it holds
-/// the hover or the capture ([`UiScript::minimap_probed`]). A new blip shows; no blip where one
-/// was held hides `GameTooltip`, whoever holds it (`0x4eb55f`). The cursor off the Minimap is the
-/// walk's: the probe's miss and the Minimap's leave.
+/// Show a line for every element under the cursor; a unit's name resolves through its object or
+/// the name cache. This is the in-rect half of the Minimap's probe `0x4eb0c0`, which the hover walk
+/// runs on the Minimap while it holds the hover or the capture ([`UiScript::minimap_probed`]). The
+/// names join in [`MinimapBlipHover::lines`]' order with `\n` between them (`0x835144`), a grey
+/// dot's wrapped in `|cffb0b0b0`…`|r` (`0x84c69c`, `0x844538`), and go up as one gold line
+/// (`0x530380`, `0x4eb856`); a dot whose name does not resolve has no line (`0x4eb785`). A new text
+/// shows; nothing under the cursor where something was held hides `GameTooltip`, whoever holds it
+/// (`0x4eb55f`). The cursor off the Minimap is the walk's: the probe's miss and the Minimap's leave.
 pub(super) fn drive_blip_tooltip(
     mut hosted_vm: crate::script_calls::HostedVm,
     hover: Res<MinimapBlipHover>,
@@ -403,30 +458,38 @@ pub(super) fn drive_blip_tooltip(
         if !script.minimap_probed() {
             return;
         }
-        let show = match &*hover {
-            MinimapBlipHover::None => None,
-            MinimapBlipHover::Landmark(name) => Some((name.clone(), false)),
-            // A live object names itself through its name method (`0x4eb31a`, vtable slot 28,
-            // `GetUnitName` with a callback), which every probe runs, so a refused name is asked
-            // again about once per answer; a guid with no object only reads (`0x4eb33c`), and so
-            // does a creature's record (`0x60934b`).
-            MinimapBlipHover::Npc(npc, grey) => {
-                let ask = if objects.store(*npc).is_some() {
-                    Ask::Event(&commands)
-                } else {
-                    Ask::Read
+        let lines: Vec<String> = hover
+            .lines()
+            .into_iter()
+            .filter_map(|line| {
+                let name = match &line.name {
+                    BlipName::Known(name) => name.clone(),
+                    // A live object names itself through its name method (`0x4eb31a`, vtable slot
+                    // 28, `GetUnitName` with a callback), which every probe runs, so a refused name
+                    // is asked again about once per answer; a guid with no object only reads
+                    // (`0x4eb33c`), and so does a creature's record (`0x60934b`).
+                    BlipName::Unit(guid) => {
+                        let ask = if objects.store(*guid).is_some() {
+                            Ask::Event(&commands)
+                        } else {
+                            Ask::Read
+                        };
+                        names.resolve(&objects, *guid, ask)?.to_string()
+                    }
                 };
-                names
-                    .resolve(&objects, *npc, ask)
-                    .map(|n| (n.to_string(), *grey))
-            }
-            MinimapBlipHover::TrackedGo(name, grey) => Some((name.clone(), *grey)),
-        };
+                Some(if line.grey {
+                    format!("|cffb0b0b0{name}|r")
+                } else {
+                    name
+                })
+            })
+            .collect();
+        let show = (!lines.is_empty()).then(|| lines.join("\n"));
         match (show, script.minimap_blip()) {
-            // Same blip: the plate, owned in mode 6, follows the cursor in its own update.
-            (Some((t, _)), Some(held)) if t == held => {}
-            (Some((t, grey)), _) => {
-                script.minimap_tooltip(&t, grey);
+            // The same text: the plate, owned in mode 6, follows the cursor in its own update.
+            (Some(t), Some(held)) if t == held => {}
+            (Some(t), _) => {
+                script.minimap_tooltip(&t);
             }
             (None, Some(_)) => script.minimap_blip_lost(),
             (None, None) => {}

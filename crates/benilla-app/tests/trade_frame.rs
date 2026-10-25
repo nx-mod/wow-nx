@@ -54,6 +54,7 @@ fn item(item_id: u32, name: &str, count: u32, quality: u32) -> TradeSlotItem {
         charges: 0,
         durability: (0, 0),
         link: Some(format!("|cffffffff|Hitem:{item_id}:0:0:0|h[{name}]|h|r")),
+        roll: Default::default(),
     }
 }
 
@@ -301,7 +302,7 @@ fn player_money_input_reflects_then_offers() {
     s.keep_calls();
     s.set_money(1_000_000); // SetTradeMoney is purse-gated
     load_ui(&s);
-    s.open_trade_window(); // our money getter tests the partner cell (`0x4c0706`)
+    s.open_trade_window(0x7); // our money getter tests the partner cell (`0x4c0706`)
     s.set_trade(Some(state())); // state().player.gold == 12345 (1g 23s 45c)
     s.fire_event("TRADE_SHOW", vec![]);
 

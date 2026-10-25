@@ -3,7 +3,7 @@
 use crate::messages::{CastOutcome, Object, ObjectFields, ObjectType, ServerPacket};
 use crate::wire::Vector3d;
 
-use super::{EntityKind, MoveSpeeds, NotifyBlock, SessionEvent};
+use super::{EntityKind, MoveSpeeds, NotifyBlock, SessionEvent, TransportClock};
 
 fn v3(v: Vector3d) -> [f32; 3] {
     [v.x, v.y, v.z]
@@ -46,6 +46,7 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
             vec![SessionEvent::LogoutResponse { reason, instant }]
         }
         ServerPacket::LogoutCancelAck => vec![SessionEvent::LogoutCancelled],
+        ServerPacket::ClearFarSightImmediate => vec![SessionEvent::FarSightCleared],
         ServerPacket::PlaySound { sound_id } => vec![SessionEvent::PlaySound { sound_id }],
         ServerPacket::PlayMusic { music_id } => vec![SessionEvent::PlayMusic { music_id }],
         ServerPacket::PlayObjectSound { sound_id, guid } => {
@@ -130,6 +131,9 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
                 model_id,
                 position: [position.x, position.y, position.z],
             }]
+        }
+        ServerPacket::ItemNameQueryResponse { entry, name } => {
+            vec![SessionEvent::ItemName { entry, name }]
         }
         ServerPacket::ItemQueryResponse { entry, info } => {
             vec![SessionEvent::ItemTemplate { entry, info }]
@@ -741,7 +745,8 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
         }],
         ServerPacket::TransferPending { map, transport } => vec![SessionEvent::TransferPending {
             map_id: map,
-            transport_entry: transport.map(|(entry, _old_map)| entry),
+            transport_entry: transport.map(|(entry, _)| entry),
+            from_map: transport.map(|(_, from_map)| from_map),
         }],
         ServerPacket::TransferAborted { reason } => {
             vec![SessionEvent::TransferAborted { reason }]
@@ -920,6 +925,9 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
         }
         ServerPacket::GameObjectDespawnAnim { guid } => {
             vec![SessionEvent::GameObjectDespawnAnim { guid }]
+        }
+        ServerPacket::GameObjectPageText { guid } => {
+            vec![SessionEvent::GameObjectPageText { guid }]
         }
         ServerPacket::OpenContainer { item } => vec![SessionEvent::OpenContainer { item }],
         ServerPacket::StandStateUpdate { state } => {
@@ -1227,7 +1235,12 @@ fn create_event(
         scale: object_scale(object_type, &mask),
         speeds: movement.speeds.map(MoveSpeeds::from_wire),
         mover: movement.mover,
-        transport_progress: movement.transport_progress,
+        transport_progress: movement
+            .transport_progress
+            .map(|progress_ms| TransportClock {
+                progress_ms,
+                arrived: None,
+            }),
         transport: movement.transport,
         spline: movement.spline,
         fields: mask,

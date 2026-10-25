@@ -7,17 +7,18 @@
 
 use bevy::prelude::*;
 
-use benilla_protocol::messages::PLAYER_SKILL_SLOTS;
+use benilla_protocol::messages::{ItemInfo, PLAYER_SKILL_SLOTS};
+use benilla_protocol::ObjectFields;
 use benilla_ui::script::{
-    weapon_subclass_skill, BankBagSlots, InvSlotView, InventorySlots, SkillEntry, SkillsState,
-    UnitCombatStats, SKILL_DEFENSE, SKILL_UNARMED,
+    weapon_subclass_skill, BankBagSlots, CombatRead, InvSlotView, InventorySlots, ItemRead,
+    SkillEntry, SkillsState, UnitCombatStats, SKILL_DEFENSE, SKILL_UNARMED,
 };
 
 use crate::entities::ItemDisplays;
 use crate::items::Items;
 use crate::net::{ClientCommand, NetCommands, ObjectStore, Objects, SelfPlayer};
 use crate::query_cache::Ask;
-use crate::ui_items::{find_equip_slot, item_link};
+use crate::ui_items::find_equip_slot;
 use crate::ui_script::{gate, UiFeed};
 
 /// Equipment slots, 0-based (`EQUIPMENT_SLOT_*`): main hand, off hand, ranged.
@@ -57,6 +58,7 @@ pub(crate) struct UiCharPlugin;
 impl Plugin for UiCharPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<CharFeedState>()
+            .init_resource::<AmmoRecordHits>()
             .add_systems(
                 Startup,
                 load_skill_tiers.after(benilla_assets::AssetSet::Open),
@@ -224,26 +226,13 @@ impl SkillSteps<'_> {
     }
 }
 
-/// The item entry in an equipped slot; `None` for an empty slot or an item not yet streamed.
-fn slot_entry(store: &ObjectStore, objects: &Objects, slot0: u8) -> Option<u32> {
-    let guid = store.0.player_inv_slot(slot0)?;
-    objects.object(guid)?.object_entry()
-}
-
-/// The weapon-skill line for `slot0`: vmangos's subclass table (`Item.cpp:700`) for a weapon,
-/// Unarmed (162) for anything else.
-fn weapon_skill_id(store: &ObjectStore, objects: &Objects, items: &Items, slot0: u8) -> u32 {
-    let Some(entry) = slot_entry(store, objects, slot0) else {
-        return SKILL_UNARMED;
-    };
-    // A worn item's record only read: its create asked.
-    let Some(t) = items.template(entry, 0, Ask::Read) else {
-        return SKILL_UNARMED; // in flight: refined when the template lands
-    };
-    if t.class != ITEM_CLASS_WEAPON {
-        return SKILL_UNARMED;
-    }
-    weapon_subclass_skill(t.subclass).unwrap_or(SKILL_UNARMED)
+/// The weapon-skill line for a worn item's record: vmangos's subclass table (`Item.cpp:700`) for
+/// a weapon, Unarmed (162) for anything else, an empty slot, or a record in flight.
+fn weapon_skill_id(record: Option<&ItemInfo>) -> u32 {
+    record
+        .filter(|t| t.class == ITEM_CLASS_WEAPON)
+        .and_then(|t| weapon_subclass_skill(t.subclass))
+        .unwrap_or(SKILL_UNARMED)
 }
 
 /// A skill's `(value + permanent bonus, temporary bonus)`, split as the reference's `0x5ea460`
@@ -265,121 +254,258 @@ fn skill_pair(store: &ObjectStore, skill_id: u32) -> (i32, i32) {
     (0, 0)
 }
 
-pub(crate) fn unit_combat_stats(store: &ObjectStore) -> UnitCombatStats {
-    let f = &store.0;
+/// The active player's own half of its combat stats: its worn weapons, each slot's item resolved
+/// by `entry` and its record only read, as the getter that asks reads it (`0x518f19`, `0x4c99c2`),
+/// so the getters that read no weapon look none up.
+pub(crate) struct Worn<'a> {
+    /// The active player's store, whose seats name the items.
+    store: &'a ObjectStore,
+    /// An item's entry by guid, `None` for no object.
+    entry: &'a dyn Fn(u64) -> Option<u32>,
+    items: &'a Items,
+}
 
-    let mut stats = [0i32; 5];
-    let mut stat_pos = [0i32; 5];
-    let mut stat_neg = [0i32; 5];
-    for i in 0..5u8 {
-        stats[usize::from(i)] = f.unit_stat(i).unwrap_or(0) as i32;
-        // The buff-split arrays are integers on the wire, not floats.
-        stat_pos[usize::from(i)] = f.player_posstat(i).unwrap_or(0);
-        stat_neg[usize::from(i)] = f.player_negstat(i).unwrap_or(0);
+impl<'a> Worn<'a> {
+    /// The weapons `store`, the active player's, wears, each item looked up through `entry`.
+    pub(crate) fn new(
+        store: &'a ObjectStore,
+        entry: &'a dyn Fn(u64) -> Option<u32>,
+        items: &'a Items,
+    ) -> Self {
+        Worn {
+            store,
+            entry,
+            items,
+        }
     }
-    let mut resistances = [0i32; 7];
-    let mut resistance_pos = [0i32; 7];
-    let mut resistance_neg = [0i32; 7];
-    for i in 0..7u8 {
-        resistances[usize::from(i)] = f.unit_resistance(i).unwrap_or(0);
-        resistance_pos[usize::from(i)] = f.player_resistance_buff_pos(i).unwrap_or(0);
-        resistance_neg[usize::from(i)] = f.player_resistance_buff_neg(i).unwrap_or(0);
-    }
 
-    let (ap_pos, ap_neg) = f.unit_attack_power_mods();
-    let (rap_pos, rap_neg) = f.unit_ranged_attack_power_mods();
-
-    UnitCombatStats {
-        stats,
-        stat_pos,
-        stat_neg,
-        resistances,
-        resistance_pos,
-        resistance_neg,
-        min_damage: f.unit_min_damage().unwrap_or(0.0),
-        max_damage: f.unit_max_damage().unwrap_or(0.0),
-        min_offhand_damage: f.unit_min_offhand_damage().unwrap_or(0.0),
-        max_offhand_damage: f.unit_max_offhand_damage().unwrap_or(0.0),
-        physical_bonus_pos: f.player_mod_damage_done_pos(0).unwrap_or(0),
-        physical_bonus_neg: f.player_mod_damage_done_neg(0).unwrap_or(0),
-        damage_percent: f.player_mod_damage_done_pct(0).unwrap_or(1.0),
-        // School 0 here; the player's ranged school is `combat_stats`' to read.
-        ranged_bonus_pos: f.player_mod_damage_done_pos(0).unwrap_or(0),
-        ranged_bonus_neg: f.player_mod_damage_done_neg(0).unwrap_or(0),
-        ranged_percent: f.player_mod_damage_done_pct(0).unwrap_or(1.0),
-        // As the fields stand, 0 when unsent (`0x518ea0`).
-        main_attack_time_ms: f.unit_base_attack_time(0).unwrap_or(0),
-        offhand_attack_time_ms: f.unit_base_attack_time(1).unwrap_or(0),
-        attack_power: f.unit_attack_power().unwrap_or(0),
-        attack_power_pos: i32::from(ap_pos),
-        attack_power_neg: i32::from(ap_neg),
-        attack_power_multiplier: f.unit_attack_power_multiplier().unwrap_or(0.0),
-        ranged_attack_power: f.unit_ranged_attack_power().unwrap_or(0),
-        ranged_attack_power_pos: i32::from(rap_pos),
-        ranged_attack_power_neg: i32::from(rap_neg),
-        ranged_attack_power_multiplier: f.unit_ranged_attack_power_multiplier().unwrap_or(0.0),
-        ranged_attack_time_ms: f.unit_ranged_attack_time().unwrap_or(0),
-        ranged_min_damage: f.unit_min_ranged_damage().unwrap_or(0.0),
-        ranged_max_damage: f.unit_max_ranged_damage().unwrap_or(0.0),
-        // The equipment and skill half is `combat_stats`'s; any other unit keeps these defaults.
-        has_offhand: false,
-        has_wand: false,
-        main_weapon_skill: (0, 0),
-        offhand_weapon_skill: (0, 0),
-        ranged_weapon_skill: (0, 0),
-        defense_skill: (0, 0),
-        dodge_percent: 0.0,
-        parry_percent: 0.0,
-        block_percent: 0.0,
+    /// The record of the item in 0-based `slot0`; `None` for an empty slot, an item not held or a
+    /// record in flight.
+    fn record(&self, slot0: u8) -> Option<&'a ItemInfo> {
+        let guid = self.store.0.player_inv_slot(slot0)?;
+        (self.entry)(guid).and_then(|e| self.items.template(e, 0, Ask::Read))
     }
 }
 
-/// The player's snapshot: [`unit_combat_stats`] plus the equipment flags and the skill pairs.
-fn combat_stats(store: &ObjectStore, objects: &Objects, items: &Items) -> UnitCombatStats {
-    // The off hand counts only as a weapon (a shield does not swing); both flags read false
-    // until the template lands.
-    let has_offhand = slot_entry(store, objects, SLOT_OFF_HAND)
-        .and_then(|e| items.template(e, 0, Ask::Read))
-        .is_some_and(|t| t.class == ITEM_CLASS_WEAPON);
-    let has_wand = slot_entry(store, objects, SLOT_RANGED)
-        .and_then(|e| items.template(e, 0, Ask::Read))
-        .is_some_and(|t| t.class == ITEM_CLASS_WEAPON && t.subclass == SUBCLASS_WAND);
+/// A unit's combat stats as the stat getters read them ([`CombatRead`]): each field derived off
+/// its descriptor as it is asked for, the active player's with its [`Worn`] weapons and its skill
+/// and avoidance fields; any other unit's leave those at their defaults. The snapshots' builds
+/// take every field from here ([`unit_combat_stats`], [`combat_stats`]), so the live read and the
+/// frame's push are one derivation.
+pub(crate) struct StatsObject<'a> {
+    store: &'a ObjectStore,
+    own: Option<Worn<'a>>,
+    /// [`Self::ranged_school`], once looked up: `UnitRangedDamage` reads three fields at it.
+    school: std::cell::OnceCell<u8>,
+}
 
-    let main_skill = weapon_skill_id(store, objects, items, SLOT_MAIN_HAND);
-    let offhand_skill = weapon_skill_id(store, objects, items, SLOT_OFF_HAND);
-    let ranged_skill_id = slot_entry(store, objects, SLOT_RANGED)
-        .and_then(|e| items.template(e, 0, Ask::Read))
-        .filter(|t| t.class == ITEM_CLASS_WEAPON)
-        .and_then(|t| weapon_subclass_skill(t.subclass));
-    // `UnitRangedDamage`'s school (`0x5189e1`-`0x518a45`): the ranged-slot item's record, read
-    // without asking, and its first damage line whose minimum is above 0, else school 0. The
-    // template keeps only lines whose maximum is above 0, which drops no well-formed such line.
-    let ranged_school = slot_entry(store, objects, SLOT_RANGED)
-        .and_then(|e| items.template(e, 0, Ask::Read))
-        .and_then(|t| t.damages.iter().find(|d| d.min > 0.0))
-        .map_or(0, |d| u8::try_from(d.school).unwrap_or(u8::MAX));
-    let f = &store.0;
-
-    UnitCombatStats {
-        has_offhand,
-        has_wand,
-        main_weapon_skill: skill_pair(store, main_skill),
-        // `UnitAttackBothHands`'s second pair; a shield or an empty off hand reads Unarmed.
-        offhand_weapon_skill: skill_pair(store, offhand_skill),
-        ranged_weapon_skill: ranged_skill_id.map_or((0, 0), |id| skill_pair(store, id)),
-        // `UnitDefense`'s pair. The 1.12 player sheet has no Defense row: its `SKILL_LINES_CHANGED`
-        // arm (`PaperDollFrame.lua:70-72`) redraws only the Attack row.
-        defense_skill: skill_pair(store, SKILL_DEFENSE),
-        // `GetDodgeChance`/`GetParryChance`/`GetBlockChance`: player fields, already percentages.
-        dodge_percent: store.0.player_dodge_percentage().unwrap_or(0.0),
-        parry_percent: store.0.player_parry_percentage().unwrap_or(0.0),
-        block_percent: store.0.player_block_percentage().unwrap_or(0.0),
-        // The three at that school (`0x518a77`, `0x518ac0`, `0x518b0e`).
-        ranged_bonus_pos: f.player_mod_damage_done_pos(ranged_school).unwrap_or(0),
-        ranged_bonus_neg: f.player_mod_damage_done_neg(ranged_school).unwrap_or(0),
-        ranged_percent: f.player_mod_damage_done_pct(ranged_school).unwrap_or(1.0),
-        ..unit_combat_stats(store)
+impl<'a> StatsObject<'a> {
+    /// Any unit's: its descriptor alone.
+    pub(crate) fn unit(store: &'a ObjectStore) -> Self {
+        StatsObject {
+            store,
+            own: None,
+            school: Default::default(),
+        }
     }
+
+    /// The active player's, wearing `worn`.
+    pub(crate) fn player(store: &'a ObjectStore, worn: Worn<'a>) -> Self {
+        StatsObject {
+            store,
+            own: Some(worn),
+            school: Default::default(),
+        }
+    }
+
+    fn f(&self) -> &ObjectFields {
+        &self.store.0
+    }
+
+    /// `UnitRangedDamage`'s school (`0x5189e1`-`0x518a45`): the ranged-slot item's record, read
+    /// without asking, and its first damage line whose minimum is above 0, else school 0. The
+    /// template keeps only lines whose maximum is above 0, which drops no well-formed such line.
+    fn ranged_school(&self) -> u8 {
+        *self.school.get_or_init(|| {
+            self.own
+                .as_ref()
+                .and_then(|w| w.record(SLOT_RANGED))
+                .and_then(|t| t.damages.iter().find(|d| d.min > 0.0))
+                .map_or(0, |d| u8::try_from(d.school).unwrap_or(u8::MAX))
+        })
+    }
+
+    /// The active player's avoidance chance `read` names; 0 for any other unit.
+    fn own_chance(&self, read: impl FnOnce(&ObjectFields) -> Option<f32>) -> f32 {
+        self.own
+            .as_ref()
+            .and_then(|_| read(self.f()))
+            .unwrap_or(0.0)
+    }
+
+    /// The active player's pair for `skill_id`; `(0, 0)` for any other unit.
+    fn own_skill(&self, skill_id: impl FnOnce(&Worn<'_>) -> Option<u32>) -> (i32, i32) {
+        self.own
+            .as_ref()
+            .and_then(skill_id)
+            .map_or((0, 0), |id| skill_pair(self.store, id))
+    }
+}
+
+impl CombatRead for StatsObject<'_> {
+    fn stats(&self, i: usize) -> i32 {
+        self.f().unit_stat(i as u8).unwrap_or(0) as i32
+    }
+    // The buff-split arrays are integers on the wire, not floats.
+    fn stat_pos(&self, i: usize) -> i32 {
+        self.f().player_posstat(i as u8).unwrap_or(0)
+    }
+    fn stat_neg(&self, i: usize) -> i32 {
+        self.f().player_negstat(i as u8).unwrap_or(0)
+    }
+    fn resistances(&self, i: usize) -> i32 {
+        self.f().unit_resistance(i as u8).unwrap_or(0)
+    }
+    fn resistance_pos(&self, i: usize) -> i32 {
+        self.f().player_resistance_buff_pos(i as u8).unwrap_or(0)
+    }
+    fn resistance_neg(&self, i: usize) -> i32 {
+        self.f().player_resistance_buff_neg(i as u8).unwrap_or(0)
+    }
+    fn min_damage(&self) -> f32 {
+        self.f().unit_min_damage().unwrap_or(0.0)
+    }
+    fn max_damage(&self) -> f32 {
+        self.f().unit_max_damage().unwrap_or(0.0)
+    }
+    fn min_offhand_damage(&self) -> f32 {
+        self.f().unit_min_offhand_damage().unwrap_or(0.0)
+    }
+    fn max_offhand_damage(&self) -> f32 {
+        self.f().unit_max_offhand_damage().unwrap_or(0.0)
+    }
+    fn physical_bonus_pos(&self) -> i32 {
+        self.f().player_mod_damage_done_pos(0).unwrap_or(0)
+    }
+    fn physical_bonus_neg(&self) -> i32 {
+        self.f().player_mod_damage_done_neg(0).unwrap_or(0)
+    }
+    fn damage_percent(&self) -> f32 {
+        self.f().player_mod_damage_done_pct(0).unwrap_or(1.0)
+    }
+    // The three at the ranged school (`0x518a77`, `0x518ac0`, `0x518b0e`).
+    fn ranged_bonus_pos(&self) -> i32 {
+        self.f()
+            .player_mod_damage_done_pos(self.ranged_school())
+            .unwrap_or(0)
+    }
+    fn ranged_bonus_neg(&self) -> i32 {
+        self.f()
+            .player_mod_damage_done_neg(self.ranged_school())
+            .unwrap_or(0)
+    }
+    fn ranged_percent(&self) -> f32 {
+        self.f()
+            .player_mod_damage_done_pct(self.ranged_school())
+            .unwrap_or(1.0)
+    }
+    // As the fields stand, 0 when unsent (`0x518ea0`).
+    fn main_attack_time_ms(&self) -> u32 {
+        self.f().unit_base_attack_time(0).unwrap_or(0)
+    }
+    fn offhand_attack_time_ms(&self) -> u32 {
+        self.f().unit_base_attack_time(1).unwrap_or(0)
+    }
+    // The off hand counts only as a weapon (a shield does not swing); false until the record
+    // lands.
+    fn has_offhand(&self) -> bool {
+        self.own
+            .as_ref()
+            .and_then(|w| w.record(SLOT_OFF_HAND))
+            .is_some_and(|t| t.class == ITEM_CLASS_WEAPON)
+    }
+    fn attack_power(&self) -> i32 {
+        self.f().unit_attack_power().unwrap_or(0)
+    }
+    fn attack_power_pos(&self) -> i32 {
+        i32::from(self.f().unit_attack_power_mods().0)
+    }
+    fn attack_power_neg(&self) -> i32 {
+        i32::from(self.f().unit_attack_power_mods().1)
+    }
+    fn attack_power_multiplier(&self) -> f32 {
+        self.f().unit_attack_power_multiplier().unwrap_or(0.0)
+    }
+    fn ranged_attack_power(&self) -> i32 {
+        self.f().unit_ranged_attack_power().unwrap_or(0)
+    }
+    fn ranged_attack_power_pos(&self) -> i32 {
+        i32::from(self.f().unit_ranged_attack_power_mods().0)
+    }
+    fn ranged_attack_power_neg(&self) -> i32 {
+        i32::from(self.f().unit_ranged_attack_power_mods().1)
+    }
+    fn ranged_attack_power_multiplier(&self) -> f32 {
+        self.f()
+            .unit_ranged_attack_power_multiplier()
+            .unwrap_or(0.0)
+    }
+    fn ranged_attack_time_ms(&self) -> u32 {
+        self.f().unit_ranged_attack_time().unwrap_or(0)
+    }
+    fn ranged_min_damage(&self) -> f32 {
+        self.f().unit_min_ranged_damage().unwrap_or(0.0)
+    }
+    fn ranged_max_damage(&self) -> f32 {
+        self.f().unit_max_ranged_damage().unwrap_or(0.0)
+    }
+    fn main_weapon_skill(&self) -> (i32, i32) {
+        self.own_skill(|w| Some(weapon_skill_id(w.record(SLOT_MAIN_HAND))))
+    }
+    // `UnitAttackBothHands`'s second pair; a shield or an empty off hand reads Unarmed.
+    fn offhand_weapon_skill(&self) -> (i32, i32) {
+        self.own_skill(|w| Some(weapon_skill_id(w.record(SLOT_OFF_HAND))))
+    }
+    fn ranged_weapon_skill(&self) -> (i32, i32) {
+        self.own_skill(|w| {
+            w.record(SLOT_RANGED)
+                .filter(|t| t.class == ITEM_CLASS_WEAPON)
+                .and_then(|t| weapon_subclass_skill(t.subclass))
+        })
+    }
+    // `UnitDefense`'s pair. The 1.12 player sheet has no Defense row: its `SKILL_LINES_CHANGED`
+    // arm (`PaperDollFrame.lua:70-72`) redraws only the Attack row.
+    fn defense_skill(&self) -> (i32, i32) {
+        self.own_skill(|_| Some(SKILL_DEFENSE))
+    }
+    fn has_wand(&self) -> bool {
+        self.own
+            .as_ref()
+            .and_then(|w| w.record(SLOT_RANGED))
+            .is_some_and(|t| t.class == ITEM_CLASS_WEAPON && t.subclass == SUBCLASS_WAND)
+    }
+    // `GetDodgeChance`/`GetParryChance`/`GetBlockChance`: player fields, already percentages.
+    fn dodge_percent(&self) -> f32 {
+        self.own_chance(ObjectFields::player_dodge_percentage)
+    }
+    fn parry_percent(&self) -> f32 {
+        self.own_chance(ObjectFields::player_parry_percentage)
+    }
+    fn block_percent(&self) -> f32 {
+        self.own_chance(ObjectFields::player_block_percentage)
+    }
+}
+
+/// Any unit's combat stats off its descriptor alone ([`StatsObject::unit`]).
+pub(crate) fn unit_combat_stats(store: &ObjectStore) -> UnitCombatStats {
+    UnitCombatStats::read(&StatsObject::unit(store))
+}
+
+/// The player's snapshot: [`unit_combat_stats`] plus the equipment flags and the skill pairs
+/// ([`StatsObject::player`]).
+fn combat_stats(store: &ObjectStore, objects: &Objects, items: &Items) -> UnitCombatStats {
+    let entry = |guid| objects.object(guid)?.object_entry();
+    UnitCombatStats::read(&StatsObject::player(store, Worn::new(store, &entry, items)))
 }
 
 /// One slot's view from the item object and its ask-once template (no icon while in flight).
@@ -403,7 +529,9 @@ fn slot_view(
     let duration_ms = countdowns.and_then(|c| c.lifetime_remaining_display_ms());
     let obj = objects.object(guid)?;
     let entry = obj.object_entry()?;
-    let count = obj.item_stack_count().unwrap_or(1).max(1);
+    // What the getters read of it as they run, read here the same way.
+    let live = crate::ui_items::live::LiveItem::object(obj, guid, items, icons, rolls);
+    let count = live.stack_count().unwrap_or(1).max(1);
     // `OBJECT_FIELD_TYPE & TYPEMASK_CONTAINER`, read off the object as `GetInventoryItemCount`'s
     // first fork reads it (`0x4c87a6`).
     let is_container = obj.is_container();
@@ -411,10 +539,7 @@ fn slot_view(
         let slots = obj.container_num_slots().unwrap_or(0).min(36) as u8;
         (0..slots).filter_map(|s| obj.container_slot(s)).collect()
     };
-    let durability = obj
-        .item_durability()
-        .zip(obj.item_max_durability())
-        .filter(|&(_, max)| max > 0);
+    let durability = live.durability();
     // `ITEM_FIELD_FLAGS`, for its wrapped (0x08) and force-red (0x10) bits.
     let flags = obj.item_flags().unwrap_or(0);
     // Soulbound or carrying a binding enchant (`0x5da2c0`), read off the raw descriptor, never off
@@ -446,25 +571,14 @@ fn slot_view(
     );
     // Only read, as the inventory getters read it (`0x4c8a0a`, `0x4c8d34`): the item's create asked.
     let t = items.template(entry, guid, Ask::Read);
-    // `GetInventoryItemLink` links the player's own item object (`0x4c8ce2` → `0x52ae00`), its
-    // record cached or not.
-    let object_link = crate::ui_items::object_link(obj, t, rolls);
-    let (name, quality, display, link, equip_slots, kind, bar_placeable, consumable) = match t {
-        Some(t) => {
-            // The item object's name (`0x5d8bc0`): the roll's suffix, unless it is wrapped.
-            let name = crate::ui_items::object_name(obj, t, rolls);
-            (
-                Some(name.clone()),
-                t.quality as i32,
-                t.display_info_id,
-                Some(object_link.clone()),
-                find_equip_slot(t.inventory_type, has_relic_slot),
-                (t.class, t.subclass),
-                t.placeable_on_action_bar(),
-                t.is_consumable(),
-            )
-        }
-        None => (None, 0, 0, None, Vec::new(), (0, 0), false, false),
+    let (equip_slots, kind, bar_placeable, consumable) = match t {
+        Some(t) => (
+            find_equip_slot(t.inventory_type, has_relic_slot),
+            (t.class, t.subclass),
+            t.placeable_on_action_bar(),
+            t.is_consumable(),
+        ),
+        None => (Vec::new(), (0, 0), false, false),
     };
     // A container counts its contents' stacks when its subclass's `DisplayFlags` has 0x4, else 0
     // (`GetInventoryItemCount` `0x4c8680`: `0x4c881a`, summed by `0x622130`); the bit is on Soul
@@ -481,11 +595,9 @@ fn slot_view(
             0
         }
     });
-    let icon = icons
-        .and_then(|i| i.catalog.get(display))
-        .and_then(|d| d.icon.clone());
     Some(InvSlotView {
-        inventory_type: t.map(|t| t.inventory_type),
+        roll: Default::default(),
+        inventory_type: live.cached().then(|| live.inventory_type()),
         bonding: t.map_or(0, |t| t.bonding),
         // A container's filled seats, which `ClickTradeButton` counts (`0x4bff50`).
         occupied_seats: is_container
@@ -497,13 +609,16 @@ fn slot_view(
             crate::ui_items::dispatch_fork(t, flags, obj.item_text_id().unwrap_or(0))
         }),
         item_id: entry,
-        icon,
+        icon: live.texture(),
         count,
         contents_count,
-        quality,
-        name,
-        uncached_link: t.is_none().then_some(object_link),
-        link,
+        quality: live.quality().map_or(0, |q| q as i32),
+        // The item object's name (`0x5d8bc0`): the roll's suffix, unless it is wrapped.
+        name: live.name(),
+        // `GetInventoryItemLink` links the player's own item object (`0x4c8ce2` → `0x52ae00`),
+        // its record cached or not.
+        uncached_link: live.uncached_link(),
+        link: live.link(),
         durability,
         flags,
         already_bound,
@@ -571,23 +686,16 @@ fn inventory_slots(
     if ammo_id != 0 {
         // Only read: what asks the record are the texture and quality getters' lookups with the
         // callback `0x4c84f0` (`0x4c83ce`, `0x4c8a0a`), drained in `feed_char`.
-        let t = items.template(ammo_id, 0, Ask::Read);
-        let inventory_type = t.map(|t| t.inventory_type);
-        let (name, quality, display, link) = match t {
-            Some(t) => (
-                Some(t.name.clone()),
-                t.quality as i32,
-                t.display_info_id,
-                Some(item_link(ammo_id, &t.name, t.quality)),
-            ),
-            None => (None, 0, 0, None),
-        };
-        let icon = icons
-            .and_then(|i| i.catalog.get(display))
-            .and_then(|d| d.icon.clone());
+        let live = crate::ui_items::live::LiveItem::record(
+            ammo_id,
+            Default::default(),
+            items,
+            icons,
+            rolls,
+        );
         inv[0] = Some(InvSlotView {
             uncached_link: None,
-            inventory_type,
+            inventory_type: live.cached().then(|| live.inventory_type()),
             durability: None,
             flags: 0,
             // Ammo has no item object, only its template, so there is no bind to read.
@@ -597,13 +705,14 @@ fn inventory_slots(
             use_spell: 0,
             use_fork: Default::default(),
             item_id: ammo_id,
-            icon,
+            icon: live.texture(),
             count: ammo_count(store, objects, ammo_id),
             // `GetInventoryItemCount`'s `PLAYER_AMMO_ID` leg, before the container fork.
             contents_count: None,
-            quality,
-            name,
-            link,
+            quality: live.quality().map_or(0, |q| q as i32),
+            name: live.name(),
+            link: live.link(),
+            roll: Default::default(),
             // No click or drag path reaches the ammo slot: nothing locks it, it fits nowhere.
             guid: 0,
             equip_slots: Vec::new(),
@@ -673,39 +782,53 @@ fn bank_bag_slots(
     bags
 }
 
+/// The ammo getters' calls that found the record the cache holds and the VM's doll lacked: the
+/// reference's call would have read it, so the feed's next push fires `UNIT_INVENTORY_CHANGED`
+/// after it, once per call, for the frame to read it there.
+#[derive(Resource, Default)]
+pub(crate) struct AmmoRecordHits(u32);
+
+/// The ammo slot getters' lookup with the callback `0x4c84f0` (`0x4c83bc`, `0x4c89cf`), inside
+/// their calls ([`benilla_ui::script::RecordAsk::AmmoItem`]): a miss asks, a refused entry again,
+/// and waits for the answer, whose ready record signals `UNIT_INVENTORY_CHANGED` (`0x4c8509`) at
+/// its packet. A hit registers no callback; it is the doll's push's to show ([`AmmoRecordHits`]).
+pub(crate) fn ask_ammo_record(
+    items: &Items,
+    commands: &NetCommands,
+    hits: &mut AmmoRecordHits,
+    entry: u32,
+    owner: u64,
+) {
+    if items.template(entry, owner, Ask::Event(commands)).is_none() {
+        items.wait_for_ammo_record(entry);
+    } else {
+        hits.0 += 1;
+    }
+}
+
 pub(crate) fn feed_char(
     // `ChrClasses.dbc` field 16, the relic flag `find_equip_slot` reads; absent, no class has one.
     classes: Option<Res<crate::chr_classes::ChrClassTable>>,
-    mut hosted_vm: crate::script_calls::HostedVm,
+    // The VM beside the hits its getters' calls leave.
+    mut vm: crate::script_calls::disjoint::Pair<
+        crate::script_calls::HostedVm<'static, 'static>,
+        ResMut<'static, AmmoRecordHits>,
+    >,
+    mut field_notices: ResMut<crate::field_watch::NoticeLane>,
     mut inv: crate::items::Inventory,
     items: Res<Items>,
     icons: Option<Res<ItemDisplays>>,
     enchants: Option<Res<crate::items::Enchants>>,
     props: Option<Res<crate::items::RandomProperties>>,
-    commands: Res<NetCommands>,
     mut feed: ResMut<CharFeedState>,
     names: Res<crate::names::NameCache>,
     // `ItemSubClass.dbc`, for `GetInventoryItemCount`'s container count bit.
     sub_classes: Option<Res<crate::ui_items::ItemSubClasses>>,
-    // The ammo getters' record callback, fired with the field events after this push.
-    mut field_notices: ResMut<crate::field_watch::NoticeLane>,
 ) {
-    hosted_vm.run(|script| {
+    vm.p0().run(|script| {
         let Some(script) = script else {
             return;
         };
-        // The ammo slot getters' lookups with the callback `0x4c84f0` (`0x4c83bc`, `0x4c89cf`),
-        // registered after the script's tick: a miss asks and waits for the answer; a record that
-        // landed since the call runs the callback now, `UNIT_INVENTORY_CHANGED` (`0x4c8509`).
-        for entry in script.take_ammo_record_asks() {
-            if items.template(entry, 0, Ask::Event(&commands)).is_some() {
-                field_notices.write(crate::field_watch::FieldNotice::Player {
-                    id: crate::field_watch::id::UNIT_INVENTORY_CHANGED,
-                });
-            } else {
-                items.wait_for_ammo_record(entry);
-            }
-        }
         // Per VM: after a `/reload` both snapshots re-push.
         let (memo, vm_reset) = feed.vm.get_reset(script);
 
@@ -814,7 +937,12 @@ pub(crate) fn feed_char(
             memo.last_inv = Some(inv);
             memo.last_bank_bags = Some(bank_bags);
         }
-    })
+    });
+    // Fired with the field events, after this push ([`AmmoRecordHits`]).
+    let hits = std::mem::take(&mut vm.p1().0);
+    field_notices.write_batch((0..hits).map(|_| crate::field_watch::FieldNotice::Player {
+        id: crate::field_watch::id::UNIT_INVENTORY_CHANGED,
+    }));
 }
 
 /// The 0-based weapon slots `GetWeaponEnchantInfo` (`0x4c9790`) reads (`0x4c97c3`, `0x4c988b`);
@@ -966,6 +1094,7 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut app = App::new();
         app.init_resource::<CharFeedState>()
+            .init_resource::<AmmoRecordHits>()
             .init_resource::<Items>()
             .init_resource::<crate::net::GuidIndex>()
             .init_resource::<crate::names::NameCache>()
@@ -1214,6 +1343,27 @@ mod tests {
         assert_eq!(name(0xC2).as_deref(), Some("Red Ribboned Gift"));
     }
 
+    /// The ammo asks a harness's VM kept, asked as the host asks them inside the call
+    /// ([`benilla_ui::script::RecordAsk::AmmoItem`]).
+    fn ask_kept_ammo(app: &mut App) {
+        let entries = app
+            .world_mut()
+            .non_send_resource_mut::<UiScript>()
+            .take_ammo_record_asks();
+        app.world_mut()
+            .resource_scope(|world, mut hits: Mut<AmmoRecordHits>| {
+                for entry in entries {
+                    ask_ammo_record(
+                        world.resource::<Items>(),
+                        world.resource::<NetCommands>(),
+                        &mut hits,
+                        entry,
+                        0,
+                    );
+                }
+            });
+    }
+
     /// The ammo view only reads the record: what asks it are the texture and quality getters'
     /// lookups with the callback `0x4c84f0` (`0x4c83ce`, `0x4c8a0a`), so a frame no getter read
     /// the slot in sends nothing.
@@ -1237,65 +1387,94 @@ mod tests {
         app.world_mut().run_system_once(feed_char).unwrap();
         app.world_mut().run_system_once(feed_char).unwrap();
         assert_eq!(asked(&rx), 0, "the view reads");
-        app.world_mut()
-            .non_send_resource_mut::<UiScript>()
+        let mut script = app.world_mut().non_send_resource_mut::<UiScript>();
+        script.keep_calls();
+        script
             .run(r#"GetInventoryItemQuality("player", 0)"#)
             .unwrap();
-        app.world_mut().run_system_once(feed_char).unwrap();
+        ask_kept_ammo(&mut app);
         assert_eq!(asked(&rx), 1, "the getter asks");
     }
 
     /// The ammo slot getters' record lookups with the callback `0x4c84f0` (`0x4c83bc`,
-    /// `0x4c89cf`): a call that missed waits for the answer; one whose record landed since runs
-    /// its callback at once, `UNIT_INVENTORY_CHANGED` with `"player"` (`0x4c8509`).
+    /// `0x4c89cf`): a call that misses the cache waits for the answer, one callback per call; a
+    /// call that finds the record registers none.
     #[test]
-    fn an_ammo_getters_miss_waits_and_a_record_landed_since_signals_at_once() {
-        use crate::field_watch::{id, FieldNotice};
+    fn an_ammo_getters_miss_waits_and_a_hit_registers_nothing() {
         const ARROW: u32 = 2512;
         /// `PLAYER_AMMO_ID`.
         const AMMO_ID: u16 = 1223;
         let mut app = world_with_bank_bag(None);
         set_self(&mut app, &[(AMMO_ID, ARROW)]);
         app.world_mut().run_system_once(feed_char).unwrap();
+        app.world_mut()
+            .non_send_resource_mut::<UiScript>()
+            .keep_calls();
         let ask = |app: &mut App| {
             app.world_mut()
                 .non_send_resource_mut::<UiScript>()
                 .run(r#"GetInventoryItemQuality("player", 0)"#)
                 .unwrap();
+            ask_kept_ammo(app);
         };
-        let signals = |app: &mut App| -> Vec<FieldNotice> {
-            app.world_mut()
-                .resource_mut::<crate::field_watch::NoticeLane>()
-                .drain()
-                .collect()
-        };
-        ask(&mut app);
-        app.world_mut().run_system_once(feed_char).unwrap();
-        assert!(signals(&mut app).is_empty());
-        assert_eq!(
+        let waiters = |app: &mut App| {
             app.world_mut()
                 .resource_mut::<Items>()
-                .take_ammo_waiters(ARROW),
-            1,
-            "the miss waits for its answer"
-        );
+                .take_ammo_waiters(ARROW)
+        };
         ask(&mut app);
+        ask(&mut app);
+        assert_eq!(waiters(&mut app), 2, "each miss waits for its answer");
         app.world_mut()
             .resource_mut::<Items>()
             .insert_template(ARROW, Some(crate::items::test_template("Rough Arrow")));
+        // The view still lacks the name, so the getter looks up, and the cache answers.
+        ask(&mut app);
+        assert_eq!(waiters(&mut app), 0, "a hit registers no callback");
+    }
+
+    /// A getter call that finds the record the host holds and the doll's view lacks, which landed
+    /// after the doll's last push, reaches the frame: the next push fires `UNIT_INVENTORY_CHANGED`
+    /// after it, as the callback `0x4c84f0` would at the landing (`0x4c8509`), so the frame reads
+    /// the record the reference's call would have returned.
+    #[test]
+    fn a_held_record_the_doll_lacks_reaches_the_frame() {
+        use crate::field_watch::{id, FieldNotice, NoticeLane};
+        const ARROW: u32 = 2512;
+        /// `PLAYER_AMMO_ID`.
+        const AMMO_ID: u16 = 1223;
+        let mut app = world_with_bank_bag(None);
+        set_self(&mut app, &[(AMMO_ID, ARROW)]);
         app.world_mut().run_system_once(feed_char).unwrap();
+        app.world_mut()
+            .non_send_resource_mut::<UiScript>()
+            .keep_calls();
+        app.world_mut()
+            .resource_mut::<Items>()
+            .insert_template(ARROW, Some(crate::items::test_template("Rough Arrow")));
+        app.world_mut()
+            .non_send_resource_mut::<UiScript>()
+            .run(r#"GetInventoryItemQuality("player", 0)"#)
+            .unwrap();
+        ask_kept_ammo(&mut app);
+        app.world_mut().run_system_once(feed_char).unwrap();
+        let fired: Vec<_> = app
+            .world_mut()
+            .resource_mut::<NoticeLane>()
+            .drain()
+            .collect();
         assert_eq!(
-            signals(&mut app),
+            fired,
             [FieldNotice::Player {
                 id: id::UNIT_INVENTORY_CHANGED
             }]
         );
-        assert_eq!(
-            app.world_mut()
-                .resource_mut::<Items>()
-                .take_ammo_waiters(ARROW),
-            0
-        );
+        let named = app
+            .world_mut()
+            .non_send_resource_mut::<UiScript>()
+            .eval::<bool>(r#"return GetInventoryItemQuality("player", 0) ~= nil"#)
+            .unwrap();
+        assert!(named, "the push carries the record");
     }
 
     /// The lock is the VM's, keyed by the guid this feed pushes: a lock moves no snapshot, and

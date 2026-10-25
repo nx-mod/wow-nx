@@ -154,22 +154,39 @@ impl Until {
     }
 }
 
+/// What an exclusive firing touches beside the call host and its own lane, as the access a system
+/// declares: Bevy reports an exclusive system's as empty, so the lanes' measure takes this one
+/// instead. Built from the systems the firing runs ([`system_access`]) and what its world-held
+/// steps read.
+pub(crate) type LaneReads = fn(&mut World) -> bevy::ecs::query::FilteredAccessSet;
+
+/// The access `system` declares, measured on `world` by initializing a copy of it.
+pub(crate) fn system_access<M>(
+    world: &mut World,
+    system: impl IntoSystem<(), (), M>,
+) -> bevy::ecs::query::FilteredAccessSet {
+    use bevy::ecs::system::System;
+    IntoSystem::into_system(system).initialize(world)
+}
+
 /// One lane: its name, its head, its firing (a one-shot taking [`Until`], the `NetHandlers`
-/// shape), and what it does once ahead of each drain.
+/// shape), what it does once ahead of each drain, and an exclusive firing's declared reads.
 struct Lane {
     name: &'static str,
     peek: fn(&World) -> Option<Stamp>,
     fire: SystemId<In<Until>>,
     begin: Option<fn(&World)>,
+    reads: Option<LaneReads>,
 }
 
 /// Every lane, in registration order.
 #[derive(Resource, Default)]
 pub(crate) struct Lanes(
     Vec<Lane>,
-    /// Each lane's firing's declared access, for the tests that ask what the drain touches.
+    /// Each lane's firing's declared access, an exclusive one's from its [`LaneReads`], and whether
+    /// it is exclusive, once [`measure`] ran.
     #[cfg(test)]
-    pub(crate) Vec<bevy::ecs::query::FilteredAccessSet>,
+    Option<Vec<(bevy::ecs::query::FilteredAccessSet, bool)>>,
 );
 
 impl Lanes {
@@ -178,6 +195,61 @@ impl Lanes {
     pub(crate) fn names(&self) -> Vec<&'static str> {
         self.0.iter().map(|l| l.name).collect()
     }
+
+    /// Each lane's firing's declared access, in registration order, for the tests that ask what
+    /// the drain touches. Panics before [`measure`].
+    #[cfg(test)]
+    pub(crate) fn accesses(&self) -> Vec<&bevy::ecs::query::FilteredAccessSet> {
+        self.1
+            .as_deref()
+            .expect("the lanes' accesses are read after `lanes::measure`")
+            .iter()
+            .map(|(a, _)| a)
+            .collect()
+    }
+
+    /// Each lane's firing, in registration order: whether it is exclusive, and whether it
+    /// declares its reads. Panics before [`measure`].
+    #[cfg(test)]
+    pub(crate) fn exclusive_reads(&self) -> Vec<(bool, bool)> {
+        let measured = self
+            .1
+            .as_deref()
+            .expect("the lanes' firings are read after `lanes::measure`");
+        measured
+            .iter()
+            .zip(&self.0)
+            .map(|((_, exclusive), lane)| (*exclusive, lane.reads.is_some()))
+            .collect()
+    }
+}
+
+/// Reads every lane firing's declared access, for [`Lanes::accesses`]: each is initialized, its
+/// access kept (an exclusive one's from its [`LaneReads`]), and registered again, where its first run initializes it again on the same state.
+/// Done on a test's asking, not at registration: a firing that lends the call host is most of a
+/// plugin's build to initialize, and most tests fire few lanes or none.
+#[cfg(test)]
+pub(crate) fn measure(world: &mut World) {
+    world.resource_scope(|world, mut lanes: Mut<Lanes>| {
+        if lanes.1.is_some() {
+            return;
+        }
+        let mut accesses = Vec::new();
+        for lane in &mut lanes.0 {
+            let mut system = world
+                .unregister_system(lane.fire)
+                .expect("a registered lane firing")
+                .system();
+            let exclusive = system.is_exclusive();
+            let mut access = system.initialize(world);
+            if let (true, Some(reads)) = (exclusive, lane.reads) {
+                access = reads(world);
+            }
+            accesses.push((access, exclusive));
+            lane.fire = world.register_boxed_system(system);
+        }
+        lanes.1 = Some(accesses);
+    });
 }
 
 /// What runs once after each drain, however it ended: a lane's firing that stopped early leaves
@@ -186,7 +258,7 @@ impl Lanes {
 struct DrainEnds(Vec<fn(&mut World)>);
 
 /// The drain's place: after every feed in [`crate::ui_script::UiFeed`] has pushed, and before
-/// the tick ([`crate::ui_script::UiInput`]).
+/// the tick ([`crate::ui_script::UiTick`]).
 #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct UiLanes;
 
@@ -200,6 +272,16 @@ pub(crate) trait LaneApp {
         peek: fn(&World) -> Option<Stamp>,
         fire: impl IntoSystem<In<Until>, (), M> + 'static,
         begin: Option<fn(&World)>,
+    ) -> &mut Self;
+
+    /// Register a lane whose firing holds the world, with what it reads beside the call host and
+    /// its own lane ([`LaneReads`]).
+    fn add_exclusive_lane(
+        &mut self,
+        name: &'static str,
+        peek: fn(&World) -> Option<Stamp>,
+        fire: fn(In<Until>, &mut World),
+        reads: LaneReads,
     ) -> &mut Self;
 
     /// Run `end` once after each drain, whether it fired every item or stopped.
@@ -220,7 +302,7 @@ impl LaneApp for App {
                     Update,
                     UiLanes
                         .after(crate::ui_script::UiFeed)
-                        .before(crate::ui_script::UiInput),
+                        .before(crate::ui_script::UiTick),
                 )
                 .add_systems(
                     Update,
@@ -238,22 +320,34 @@ impl LaneApp for App {
         {
             return self;
         }
-        // Initialized here, its access kept: the run initializes it again, on the same state.
-        #[cfg(test)]
-        let (fire, access) = {
-            let mut system = IntoSystem::into_system(fire);
-            let access = bevy::ecs::system::System::initialize(&mut system, self.world_mut());
-            (system, access)
-        };
         let fire = self.world_mut().register_system(fire);
-        #[cfg(test)]
-        self.world_mut().resource_mut::<Lanes>().1.push(access);
         self.world_mut().resource_mut::<Lanes>().0.push(Lane {
             name,
             peek,
             fire,
             begin,
+            reads: None,
         });
+        self
+    }
+
+    fn add_exclusive_lane(
+        &mut self,
+        name: &'static str,
+        peek: fn(&World) -> Option<Stamp>,
+        fire: fn(In<Until>, &mut World),
+        reads: LaneReads,
+    ) -> &mut Self {
+        self.add_lane(name, peek, fire, None);
+        if let Some(lane) = self
+            .world_mut()
+            .resource_mut::<Lanes>()
+            .0
+            .iter_mut()
+            .find(|l| l.name == name)
+        {
+            lane.reads = Some(reads);
+        }
         self
     }
 
@@ -334,9 +428,21 @@ mod group_view_tests;
 #[cfg(test)]
 mod guard_tests;
 #[cfg(test)]
+mod item_live_tests;
+#[cfg(test)]
 mod item_tests;
 #[cfg(test)]
+mod packet_signal_tests;
+#[cfg(test)]
+mod quiet_tests;
+#[cfg(test)]
+mod stat_live_tests;
+#[cfg(test)]
+mod storm_tests;
+#[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod unit_live_tests;
 #[cfg(test)]
 mod unit_view_tests;
 

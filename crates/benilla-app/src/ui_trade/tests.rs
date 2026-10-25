@@ -449,6 +449,18 @@ fn feed_app() -> (App, crossbeam_channel::Receiver<ClientCommand>) {
     (app, rx)
 }
 
+/// The getters' record asks the VM kept, made as the host makes them inside the call
+/// ([`ask_trade_record`]).
+fn ask_kept_records(
+    mut script: NonSendMut<UiScript>,
+    items: Res<Items>,
+    commands: Res<NetCommands>,
+) {
+    for entry in script.take_trade_record_asks() {
+        ask_trade_record(&items, &commands, entry, 0);
+    }
+}
+
 /// The server's status `status`, through the handler table.
 fn status(app: &mut App, status: TradeStatus) {
     crate::net::handlers::dispatch(
@@ -1252,6 +1264,38 @@ fn both_offers_answer_inside_trade_closed_and_until_the_next_open() {
     }
 }
 
+/// A partner's slot looks its record up with the partner cell `[0xb71728]` as the owner id
+/// (`0x4c016c`), which the open sets from the trade's partner (`0x4bf549`): no unit stands for it.
+#[test]
+fn a_partner_slot_asks_with_the_partner_cell_as_its_owner() {
+    use benilla_ui::script::RecordAsk;
+    let (mut app, _rx) = feed_app();
+    open_with(&mut app, 0x7);
+    app.update();
+    let mut theirs = [None; TRADE_SLOT_COUNT];
+    theirs[0] = Some(wire_item(4306));
+    app.world_mut()
+        .resource_mut::<TradeSession>()
+        .set_offer(&TradeStatusExtended {
+            their_window: true,
+            sequence: 7,
+            flag: 7,
+            gold: 0,
+            enchant_spell_id: 0,
+            slots: theirs,
+        });
+    app.update();
+    let mut script = app.world_mut().non_send_resource_mut::<UiScript>();
+    script.run("GetTradeTargetItemInfo(1)").unwrap();
+    assert_eq!(
+        script.take_record_asks(),
+        [RecordAsk::TradeItem {
+            entry: 4306,
+            owner: 0x7
+        }]
+    );
+}
+
 /// `TRADE_UPDATE` has one producer, the getters' record callback `0x4c0340` (`0x4c034f`): an
 /// offer or gold change signals its slot and money events and nothing else, and a getter
 /// that finds an unanswered template is called back once per call when the record lands,
@@ -1260,7 +1304,7 @@ fn both_offers_answer_inside_trade_closed_and_until_the_next_open() {
 fn trade_update_comes_only_from_a_landed_record_a_getter_asked_for() {
     use crate::item_watch::ItemNotice;
     let (mut app, _rx) = feed_app();
-    app.add_systems(Update, drain_trade.after(feed_trade))
+    app.add_systems(Update, ask_kept_records.after(feed_trade))
         .init_resource::<Selection>()
         .init_resource::<GroupState>();
     app.world_mut()
@@ -1383,7 +1427,7 @@ fn trade_update_comes_only_from_a_landed_record_a_getter_asked_for() {
 #[test]
 fn a_refused_slot_record_is_asked_by_the_next_getter_never_by_a_frame() {
     let (mut app, rx) = feed_app();
-    app.add_systems(Update, drain_trade.after(feed_trade))
+    app.add_systems(Update, ask_kept_records.after(feed_trade))
         .init_resource::<Selection>()
         .init_resource::<GroupState>();
     open_with(&mut app, 0x7);

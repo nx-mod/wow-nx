@@ -72,7 +72,8 @@ fn an_absent_catalog_returns_nothing_rather_than_erroring() {
 /// Two `GetGMTicket()` calls are two packets: `TicketStatus_OnUpdate` re-polls every 10 minutes.
 #[test]
 fn the_payload_free_verbs_queue_rather_than_latch() {
-    let mut s = script();
+    let mut s = in_world();
+    s.keep_calls();
     s.run("GetGMTicket() GetGMTicket() GetGMStatus() DeleteGMTicket() Stuck() Stuck() Stuck()")
         .unwrap();
     assert_eq!(
@@ -93,6 +94,7 @@ fn the_payload_free_verbs_queue_rather_than_latch() {
 #[test]
 fn the_queue_preserves_call_order_across_different_verbs() {
     let mut s = in_world();
+    s.keep_calls();
     s.run("DeleteGMTicket() GetGMTicket()").unwrap();
     assert_eq!(
         s.take_gm_ticket_intents(),
@@ -118,6 +120,7 @@ fn the_queue_preserves_call_order_across_different_verbs() {
 #[test]
 fn new_and_update_are_distinguishable_and_keep_their_order() {
     let mut s = in_world();
+    s.keep_calls();
     s.run("NewGMTicket(4, \"My sword vanished.\") UpdateGMTicket(4, \"Still gone.\")")
         .unwrap();
     assert_eq!(
@@ -145,17 +148,14 @@ fn an_empty_ticket_body_shows_no_text_and_sends_nothing() {
     use crate::script::ui_errors::shown::seen_in_call;
     let mut s = in_world();
     for verb in ["NewGMTicket", "UpdateGMTicket"] {
-        let (seen, _) = seen_in_call(&mut s, &format!("{verb}(1, \"\")"));
+        let (seen, host) = seen_in_call(&mut s, &format!("{verb}(1, \"\")"));
         assert_eq!(seen, "ERR_TICKET_NO_TEXT", "{verb}");
-        assert!(
-            s.take_gm_ticket_intents().is_empty(),
-            "{verb} sends nothing"
-        );
+        assert!(host.calls.is_empty(), "{verb} sends nothing");
     }
     // A one-character text goes out, with no line.
-    let (seen, _) = seen_in_call(&mut s, "NewGMTicket(1, \"x\")");
+    let (seen, host) = seen_in_call(&mut s, "NewGMTicket(1, \"x\")");
     assert_eq!(seen, "");
-    assert_eq!(s.take_gm_ticket_intents().len(), 1);
+    assert_eq!(host.calls.len(), 1);
 }
 
 /// With no active player the writes do nothing at all, an empty text included: the bindings find
@@ -170,11 +170,24 @@ fn a_ticket_write_with_no_player_does_nothing() {
         "UpdateGMTicket(1, \"stuck\")",
         "NewGMTicket(1, \"\")",
     ] {
-        let (seen, _) = seen_in_call(&mut s, chunk);
+        let (seen, host) = seen_in_call(&mut s, chunk);
         assert_eq!(seen, "", "{chunk} shows nothing");
-        assert!(
-            s.take_gm_ticket_intents().is_empty(),
-            "{chunk} sends nothing"
-        );
+        assert!(host.calls.is_empty(), "{chunk} sends nothing");
     }
+}
+
+/// With no active player `GetGMTicket` and `DeleteGMTicket` send nothing: each finds the player
+/// (`0x468550`, then `0x468460` with mask 0x10) and skips the sender on null (`0x48c9bd`,
+/// `0x48cb8d`). `GetGMStatus` has no such gate (`0x48cfc0` builds message 0x21a straight away).
+#[test]
+fn ticket_get_and_delete_with_no_player_send_nothing() {
+    let mut s = script();
+    s.keep_calls();
+    s.run("GetGMTicket() DeleteGMTicket() GetGMStatus()")
+        .unwrap();
+    assert_eq!(
+        s.take_gm_ticket_intents(),
+        vec![GmTicketIntent::AskStatus],
+        "only the status ask goes out"
+    );
 }

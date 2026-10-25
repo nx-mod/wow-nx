@@ -348,7 +348,7 @@ pub enum ServerPacket {
         info: Option<CreatureQueryInfo>,
     },
     /// `SMSG_PET_NAME_QUERY_RESPONSE`: keyed by pet number, as the client's pet-name cache is; the
-    /// `nameTimestamp` tail, which only ages that on-disk cache, is read and dropped.
+    /// `nameTimestamp` tail is read and dropped.
     PetNameQueryResponse {
         pet_number: u32,
         name: String,
@@ -389,6 +389,10 @@ pub enum ServerPacket {
     GameObjectDespawnAnim {
         guid: u64,
     },
+    /// `SMSG_GAMEOBJECT_PAGETEXT`: a bare `u64` guid, the object whose page the reader opens on.
+    GameObjectPageText {
+        guid: u64,
+    },
     /// `SMSG_FISH_NOT_HOOKED`: the channel ended unhooked (empty body; `ERR_FISH_NOT_HOOKED`).
     FishNotHooked,
     /// `SMSG_FISH_ESCAPED`: the skill roll failed on the click (empty body; `ERR_FISH_ESCAPED`).
@@ -425,6 +429,11 @@ pub enum ServerPacket {
     Emote {
         guid: u64,
         emote_id: u32,
+    },
+    /// `SMSG_ITEM_NAME_QUERY_RESPONSE`: an item's name by entry; `None` is a refusal.
+    ItemNameQueryResponse {
+        entry: u32,
+        name: Option<String>,
     },
     /// `SMSG_ITEM_QUERY_SINGLE_RESPONSE`: the full item template, boxed for size; `None` is a miss.
     ItemQueryResponse {
@@ -947,6 +956,8 @@ pub enum ServerPacket {
     },
     /// `SMSG_LOGOUT_CANCEL_ACK` (empty): the logout was cancelled; it takes the countdown down.
     LogoutCancelAck,
+    /// `SMSG_CLEAR_FAR_SIGHT_IMMEDIATE` (empty): end far sight on the active player (`0x5e43f8`).
+    ClearFarSightImmediate,
     /// `SMSG_PONG`: our `CMSG_PING`'s sequence echoed back, timed for the round trip.
     Pong {
         sequence: u32,
@@ -1382,6 +1393,7 @@ impl ServerPacket {
             ServerPacket::PageTextQueryResponse { .. } => "SMSG_PAGE_TEXT_QUERY_RESPONSE".into(),
             ServerPacket::GameObjectCustomAnim { .. } => "SMSG_GAMEOBJECT_CUSTOM_ANIM".into(),
             ServerPacket::GameObjectDespawnAnim { .. } => "SMSG_GAMEOBJECT_DESPAWN_ANIM".into(),
+            ServerPacket::GameObjectPageText { .. } => "SMSG_GAMEOBJECT_PAGETEXT".into(),
             ServerPacket::OpenContainer { .. } => "SMSG_OPEN_CONTAINER".into(),
             ServerPacket::Inspect { .. } => "SMSG_INSPECT".into(),
             ServerPacket::StandStateUpdate { .. } => "SMSG_STANDSTATE_UPDATE".into(),
@@ -1394,6 +1406,7 @@ impl ServerPacket {
             ServerPacket::TextEmote { .. } => "SMSG_TEXT_EMOTE".into(),
             ServerPacket::Emote { .. } => "SMSG_EMOTE".into(),
             ServerPacket::ItemQueryResponse { .. } => "SMSG_ITEM_QUERY_SINGLE_RESPONSE".into(),
+            ServerPacket::ItemNameQueryResponse { .. } => "SMSG_ITEM_NAME_QUERY_RESPONSE".into(),
             ServerPacket::InventoryChangeFailure { .. } => "SMSG_INVENTORY_CHANGE_FAILURE".into(),
             ServerPacket::MessageChat(_) => "SMSG_MESSAGECHAT".into(),
             ServerPacket::ChannelNotify(_) => "SMSG_CHANNEL_NOTIFY".into(),
@@ -1558,6 +1571,7 @@ impl ServerPacket {
             ServerPacket::LogoutComplete => "SMSG_LOGOUT_COMPLETE".into(),
             ServerPacket::LogoutResponse { .. } => "SMSG_LOGOUT_RESPONSE".into(),
             ServerPacket::LogoutCancelAck => "SMSG_LOGOUT_CANCEL_ACK".into(),
+            ServerPacket::ClearFarSightImmediate => "SMSG_CLEAR_FAR_SIGHT_IMMEDIATE".into(),
             ServerPacket::Pong { .. } => "SMSG_PONG".into(),
             ServerPacket::ForceSpeedChange { kind, .. } => {
                 format!("SMSG_FORCE_{kind:?}_SPEED_CHANGE")

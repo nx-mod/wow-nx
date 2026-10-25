@@ -38,6 +38,9 @@ mod controller;
 mod world_focus;
 #[cfg(test)]
 pub(crate) use world_focus::insert_test_room;
+/// The reload gate and the destination's residency, which a cinematic's far shot waits on as a
+/// teleport does.
+pub(crate) use world_focus::{is_far_reload, residency_reached};
 pub(crate) use world_focus::{publish_caster_outdoors, BarUnitOutdoors, PlayerOutdoors};
 // The remembered camera pose, inside `player/` to read the rig's `pub(super)` fields.
 mod camera_saved;
@@ -69,6 +72,11 @@ mod state;
 pub(crate) mod step_probe;
 mod swim;
 mod view_subject;
+/// A far-sight pose, for a test that seats the camera on another object.
+#[cfg(test)]
+pub(crate) use view_subject::RemoteView;
+#[cfg(test)]
+mod teleport_hold_tests;
 mod walk;
 mod wire_in;
 pub(crate) use wire_in::regain_control_on_arrival;
@@ -116,7 +124,7 @@ pub(crate) use state::{
 pub(crate) use swim::{may_swim, swim_enter_depth};
 /// The camera's followed unit when not our body; [`crate::camera_shake`] takes its body frame and
 /// two suspend gates from it, as the reference does from `[cam+0x88]`.
-pub(crate) use view_subject::ViewSubject;
+pub(crate) use view_subject::{FarSight, ViewSubject};
 
 /// `UNIT_FLAG_STUNNED`, the `UNIT_FIELD_FLAGS` bit that stops turning. The reference reads it off
 /// the descriptor (`[[unit+0x110]+0xa0]`, predicate `0x5145b0`, an inverted `not/shr/and` test) at
@@ -239,7 +247,8 @@ pub(super) type BodyQuery<'w, 's> = Query<
     (With<Embodied>, Without<FlyCam>),
 >;
 
-/// The armed transports, for the deck carry ([`ride`]). `ColliderAabb` is for the ride trace:
+/// The armed transports, for the deck carry ([`ride`]) and its hold aboard (`TransportVolume`,
+/// `0x6173b0`). `ColliderAabb` is for the ride trace:
 /// avian refreshes it in `FixedPostUpdate`, before `tick_transports` moves the deck in `Update`, so
 /// the broad-phase box lags its deck by a frame.
 pub(super) type TransportQuery<'w, 's> = Query<
@@ -249,6 +258,7 @@ pub(super) type TransportQuery<'w, 's> = Query<
         &'static Transform,
         &'static crate::net::Guid,
         Option<&'static avian3d::prelude::ColliderAabb>,
+        Option<&'static crate::transport::TransportVolume>,
     ),
     (
         With<crate::transport::Transport>,
@@ -315,7 +325,9 @@ impl Plugin for PlayerPlugin {
         app.init_resource::<camera_dynamics::CameraOptions>();
         // Far sight resolves `PLAYER_FARSIGHT` to a pose before `control` seats the camera: a
         // separate system, as `control` holds our `Transform` mutably and cannot read another's.
+        view_subject::register(app);
         app.init_resource::<view_subject::ViewSubject>()
+            .init_resource::<view_subject::FarSight>()
             .init_resource::<scoped_view::ScopedView>()
             .add_systems(
                 Update,

@@ -53,11 +53,15 @@ use mount::reseat_mounts;
 pub(crate) mod corpse;
 
 mod live_display;
-pub(crate) use live_display::DisplaySwapped;
 use live_display::{refresh_live_display, tick_scale_ease};
+pub(crate) use live_display::{AppliedDisplay, DisplaySwapped};
 
 /// Terrain conform: a model flagged `GlobalModelFlags & 3 ∈ {1,3}` tilts to the ground.
 mod conform;
+
+/// Whether the last render drew a unit, the scene-node test the bubble and plate gates read.
+mod scene_drawn;
+pub(crate) use scene_drawn::SceneDrawn;
 
 /// The per-unit collision height, the `h` the swim, wade, splash and foam depths are fractions of.
 mod collision_height;
@@ -88,7 +92,7 @@ use chain_beam::{simulate_chain_beams, spawn_chain_beams};
 // `equip_slot` is the one InventoryType → slot table; the dressing room places items by it.
 pub(crate) use attach::equip_slot;
 pub(crate) use equipment::ItemDisplays;
-pub(crate) use equipment::{attach_id, DressKey, HeldAttached};
+pub(crate) use equipment::{attach_id, DressKey, HeldAttached, HeldItems};
 pub(crate) use equipment::{BoneAttach, Equipment};
 // Only the tests that build a `DressKey` name this type.
 #[cfg(test)]
@@ -420,9 +424,33 @@ pub(crate) struct DisplayRig<'a> {
 
 /// The `GameObjectDisplayInfo` catalog and per-display [`DisplayModel`] cache.
 #[derive(Resource)]
-struct GameObjects {
+pub(crate) struct GameObjects {
     catalog: GameObjectCatalog,
     models: HashMap<u32, DisplayModel>,
+}
+
+impl GameObjects {
+    /// The point test of a transport with this display once its model has loaded, the world
+    /// entity's answer (`0x670a70`): a map object's convex volume, a doodad's file box; `None`
+    /// while the model is unloaded, which holds no rider.
+    pub(crate) fn transport_volume(
+        &self,
+        display_id: u32,
+        wmos: &Assets<WmoModel>,
+        m2s: &Assets<M2Model>,
+    ) -> Option<crate::transport::TransportVolume> {
+        use crate::transport::TransportVolume;
+        match &self.models.get(&display_id)?.handle {
+            ModelHandle::Wmo(h) => Some(TransportVolume::Planes(
+                wmos.get(h)?.convex_volume.clone().into(),
+            )),
+            ModelHandle::M2(h) => {
+                let b = m2s.get(h)?.bounds.as_ref()?;
+                Some(TransportVolume::Box(b.bbox_min, b.bbox_max))
+            }
+            ModelHandle::None => None,
+        }
+    }
 }
 
 /// The customization → visible-geoset tables; without them players render every geoset.

@@ -3502,7 +3502,7 @@ fn the_away_lines_fire_inside_the_call() {
 fn the_call_host_applies_the_chat_calls_inside_the_verb() {
     use crate::net::{ChatKind, ClientCommand, NetCommands};
 
-    let mut app = crate::game_plugins::schedule_tests::headless_client();
+    let mut app = crate::game_plugins::schedule_tests::headless_client_unrun();
     let (tx, rx) = crossbeam_channel::unbounded();
     app.insert_resource(NetCommands(tx));
     app.world_mut().insert_non_send_resource(in_world_vm());
@@ -4248,4 +4248,16 @@ fn a_notices_chat_line_shows_where_the_notice_fires() {
             .unwrap();
         assert_eq!(order, heard);
     }
+}
+
+/// The chat event helper triggers Replying to Tells for a received whisper, type 6, before the
+/// event (`0x49b0fb`-`0x49b107`); a whisper we sent (type 7) triggers nothing.
+#[test]
+fn a_received_whisper_triggers_replying_to_tells() {
+    let mut s = benilla_ui::script::UiScript::new().unwrap();
+    let mut windows = super::frames::ChatWindows::default();
+    super::frames::route(&mut s, &mut windows, &ev(K::WhisperInform, "hi", "Bob"));
+    assert!(s.take_tutorial_triggers().is_empty(), "our own tell");
+    super::frames::route(&mut s, &mut windows, &ev(K::Whisper, "hi", "Bob"));
+    assert_eq!(s.take_tutorial_triggers(), [0x10]);
 }

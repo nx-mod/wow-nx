@@ -589,6 +589,14 @@ pub(crate) enum RealmRequest {
     /// select drops and the thread returns to the logon park, the realmd link as it was (closed
     /// since a world entry). Elsewhere, nothing.
     Leave,
+    /// `PINEntered`'s keys for the logon waiting at the keypad (`0x5ab5a0` → `0x5b3120`), for the
+    /// prompt numbered `prompt` alone ([`benilla_protocol::LoginStage::Pin`]), or no keys when no
+    /// screen can show the keypad, which fails the logon. Elsewhere, nothing. The keys never print
+    /// ([`benilla_ui::script::GluePin`]).
+    Pin {
+        prompt: u64,
+        keys: Option<benilla_ui::script::GluePin>,
+    },
 }
 
 /// The credentials channel to the IO thread's pre-logon park, sent by [`crate::glue_session::login`].
@@ -610,7 +618,7 @@ impl LoginAbandon {
 /// Guid to entity for every kind, items included, like the reference's one `ClntObjMgr` index.
 /// Written only by `net::objects`.
 #[derive(Resource, Default)]
-pub(crate) struct GuidIndex(pub(crate) HashMap<u64, Entity>);
+pub(crate) struct GuidIndex(pub(crate) bevy::platform::collections::HashMap<u64, Entity>);
 
 /// The streamed objects, whatever the kind, with their descriptor stores, our own player, and an
 /// item's countdown cells. Read-only. The by-guid lookups are `ClntObjMgrObjectPtr` (`0x468460`).
@@ -1030,6 +1038,11 @@ pub(crate) enum ClientCommand {
     /// `CMSG_PET_NAME_QUERY`: a pet's bits 24-47 are its pet number, not a creature entry.
     PetNameQuery {
         pet_number: u32,
+        guid: u64,
+    },
+    /// `CMSG_ITEM_NAME_QUERY`, sent only by [`crate::item_names::ItemNames`]' lookups.
+    ItemNameQuery {
+        entry: u32,
         guid: u64,
     },
     /// `CMSG_ITEM_QUERY_SINGLE` (`guid` 0 for template-only), sent only by
@@ -2396,6 +2409,9 @@ pub(crate) struct SelfMoveMessage {
     /// The server's deck-local pose for us. Never re-derive it from the boat's transform, which
     /// [`crate::transport::tick_transports`] holds at the far pose across a map seam.
     pub(crate) transport: Option<benilla_protocol::TransportPose>,
+    /// `MSG_MOVE_TELEPORT`, whose apply is a teleport's (`0x6016e2` → `0x602f90` → `0x6186b0` →
+    /// `0x617e90`), where the other relays only place the mover.
+    pub(crate) teleport: bool,
 }
 
 /// `SMSG_CLIENT_CONTROL_UPDATE`, verbatim; the controller decides. `mover` is the unit spoken
@@ -2461,6 +2477,8 @@ pub(crate) struct PendingTransfer(pub(crate) Option<PendingTransferInfo>);
 pub(crate) struct PendingTransferInfo {
     pub(crate) map_id: u32,
     pub(crate) transport_entry: Option<u32>,
+    /// The map left, sent with the transport entry.
+    pub(crate) from_map: Option<u32>,
 }
 
 /// `SMSG_PLAY_SOUND`, `PLAY_MUSIC` or `PLAY_OBJECT_SOUND`: a SoundEntries id. An unstreamed

@@ -10,7 +10,7 @@ use bevy::prelude::*;
 use benilla_formats::SpellCatalog;
 use benilla_protocol::messages::ActionButton;
 
-use crate::ui_script::UiInput;
+use crate::ui_script::UiTick;
 use crate::ui_unit::UnitFeed;
 use benilla_assets::{AssetSet, LockRecover, WorldAssets};
 
@@ -20,9 +20,8 @@ pub(crate) use cast_lines::{CastFailLines, CastFailRedisplays};
 mod drain;
 // A `UseAction` press, applied in call order by `crate::script_calls`.
 pub(crate) use drain::{attack_nearest_probe, use_action, ActionPress, AttackPress, UseOutcome};
-// The bar's drain of the VM's queued writes, which the macro migration's test runs end to end.
-#[cfg(test)]
-pub(crate) use drain::drain_action_sets;
+// The bar's sends and slot writes inside their calls.
+pub(crate) use drain::ActionBarSteps;
 // The right-click casts' drain, which the click's tests run after the click.
 #[cfg(test)]
 pub(crate) use drain::drain_click_casts;
@@ -45,7 +44,7 @@ mod reactive;
 mod reactive_tests;
 pub(crate) mod recount;
 mod state;
-pub(crate) use state::ActionStates;
+pub(crate) use state::{ActionStates, EnterUsable};
 pub(crate) mod toggle;
 mod unlearn;
 mod weapon_icon;
@@ -71,13 +70,22 @@ pub(crate) use weapon_icon::{melee_auto_attack_icon, ranged_weapon_icon, substit
 /// keys on this id; the icon keys on `SPELL_EFFECT_ATTACK`, which only 6603 carries.
 pub(crate) const SPELL_ATTACK: u32 = 6603;
 
-/// The action slots (wire 0..119) and the known spells. The bar is client-authoritative:
-/// [`drain::drain_action_sets`] writes it directly, and vmangos stores a slot without a reply
+/// The action slots (wire 0..119), the reference's slot arrays, which `0x4e58e0` writes inside the
+/// call that places or clears one (`0x4e590a`), so the chunk's next verb reads the write. Apart
+/// from [`PlayerActions`] so the call host's bar verbs hold it alone ([`ActionBarSteps`]). The bar
+/// is client-authoritative: vmangos stores a slot without a reply
 /// (`MasterPlayer::addActionButton`).
 #[derive(Resource, Default)]
-pub(crate) struct PlayerActions {
+pub(crate) struct ActionSlots {
     /// Wire slot (0-based) to its packed action; the Lua action id is slot + 1.
     pub buttons: HashMap<u8, ActionButton>,
+    /// Set by every slot change, cleared once the feed re-resolves slot identity.
+    pub dirty: bool,
+}
+
+/// The known spells and the book's lists the registrar keeps.
+#[derive(Resource, Default)]
+pub(crate) struct PlayerActions {
     /// The known spells (`SMSG_INITIAL_SPELLS` and the learns since), the reference's known-spell
     /// bits `0xb710fc` (`0x4b2603`): a set, which keeps no learn order.
     pub spells: BTreeSet<u32>,
@@ -96,6 +104,10 @@ pub(crate) struct PlayerActions {
     /// item tooltip's lock walk `0x5da5e0` scan it from the front, so its order picks between
     /// 6478 "Opening" and 22810 "Opening - No Text", which open the same locks.
     pub openers: Vec<u32>,
+    /// `[0xb70098]`, the spell `Stuck()` casts: the last registered spell whose `Effect[0]` is
+    /// `SPELL_EFFECT_STUCK` (`0x4b2614`-`0x4b261d`); `None` is its 0, after the book's reset
+    /// (`0x4b2433`).
+    pub stuck_spell: Option<u32>,
     /// `SMSG_SUPERCEDED_SPELL`'s `(old, new)` pairs in arrival order, for the macro arm of
     /// `0x4e5e60`: a macro on the bar whose cached spell is `old` gets `new` (`0x4e5ec4`). The
     /// macro rebind drains it ([`crate::ui_macro`]).
@@ -104,7 +116,7 @@ pub(crate) struct PlayerActions {
     /// arrival order, whose bar slots the unlearn clears (`0x5ea253` into `0x4e5e20`), drained by
     /// the bar's clear (`unlearn`).
     pub unlearned: Vec<u32>,
-    /// Set by every book or bar change, cleared once the feed re-resolves slot identity, which a
+    /// Set by every book change, cleared once the feed re-resolves slot identity, which a
     /// landed item template ([`crate::items::Items::template_epoch`]) also triggers. Between
     /// resolves an item slot's count moves only by the item watchers' recount (`recount`).
     pub dirty: bool,
@@ -263,6 +275,7 @@ impl Spells {
 pub(crate) fn run_feed_action_state_once(world: &mut World) {
     use bevy::ecs::system::RunSystemOnce;
     world.init_resource::<state::ActionStateMemory>();
+    world.init_resource::<state::EnterUsable>();
     world
         .run_system_once(state::feed_action_state)
         .expect("the action-state feed runs as a one-shot system");
@@ -385,9 +398,11 @@ impl Plugin for UiActionPlugin {
         // A UI-only harness has no net stack; declaring a message twice is idempotent.
         app.add_message::<crate::net::FieldChanged>()
             .init_resource::<state::ActionEvents>()
+            .init_resource::<state::EnterUsable>()
             .init_resource::<state::ActionStateMemory>()
             .add_message::<crate::net::WorldEnterCascadeMessage>()
             .init_resource::<PlayerActions>()
+            .init_resource::<ActionSlots>()
             .init_resource::<LearnedAbilities>()
             .init_resource::<CastFailRedisplays>()
             .init_resource::<MountErrors>()
@@ -450,10 +465,9 @@ impl Plugin for UiActionPlugin {
                         .after(state::feed_action_state)
                         .after(crate::ui_unit::UnitSnapshots)
                         .before(crate::ui_cast::feed_cast_reports),
-                    drain::drain_action_sets.in_set(crate::ui_script::UiDrain),
                     // The target chain queues the right-click casts earlier in the frame.
                     drain::drain_click_casts
-                        .after(UiInput)
+                        .after(UiTick)
                         .after(crate::target::TargetUpdate),
                     // The latches must be current before the target chain's cursor reads them.
                     track_learned_abilities

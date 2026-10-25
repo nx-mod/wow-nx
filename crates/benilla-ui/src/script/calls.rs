@@ -124,6 +124,8 @@ pub enum ScriptCall {
     RandomRoll { min: u32, max: u32 },
     /// `RequestTimePlayed()` (`0x48a900`): the empty `CMSG_PLAYED_TIME`, sent at `0x48a936`.
     RequestTimePlayed,
+    /// `OpeningCinematic()` (`0x48c8c0`): the empty `CMSG_OPENING_CINEMATIC`, sent at `0x48c8f6`.
+    OpeningCinematic,
     /// `DoEmote(token, target)` (`0x49fd30`) past its empty-token check: the host finds the
     /// `EmotesText` row by name (`0x49fd72`-`0x49fda6`), resolves the target (`0x49fdb1`-`0x49fdee`)
     /// and runs `0x5ef560` (`0x49fe16`), its gates, posture, play and `CMSG_TEXT_EMOTE`.
@@ -238,6 +240,139 @@ pub enum ScriptCall {
     Instance(super::InstanceCall),
     /// The PvP flag's toggle ([`super::PvpCall`]): its packet inside the call.
     Pvp(super::PvpCall),
+    /// `ShowHelm` or `ShowCloak` past the belief's test ([`super::WornDisplay`]): the flip's packet
+    /// inside the call (`0x5ee6e3`).
+    WornDisplay(super::WornDisplay),
+    /// An action bar verb's packet ([`super::ActionBarCall`]): the toggles' send, or a slot write
+    /// stored and sent ahead of its signal (`0x4e58e0`).
+    ActionBar(super::ActionBarCall),
+    /// A GM ticket verb's packet, or `Stuck`'s cast ([`super::GmTicketCall`]), inside the call.
+    GmTicket(super::GmTicketCall),
+    /// A send of a system no 1.12 server runs ([`super::UnservedSend`]), inside its verb.
+    Unserved(super::UnservedSend),
+    /// An inspect verb ([`super::InspectCall`]): its packet and the target it sets inside the
+    /// call.
+    Inspect(super::InspectCall),
+    /// An item text verb ([`super::ItemTextCall`]): the page move and its ask, or the close core,
+    /// inside the call.
+    ItemText(super::ItemTextCall),
+    /// An aura cancel ([`super::AuraCall`]): `0x6e7040` whole inside the call.
+    Aura(super::AuraCall),
+    /// A minimap verb ([`super::MinimapCall`]): the ping or the ground cast inside the call.
+    Minimap(super::MinimapCall),
+    /// A posture verb ([`super::PostureCall`]): the stand-state setter inside the call.
+    Posture(super::PostureCall),
+    /// A getter's lookup with a callback on a record its mirror misses ([`RecordAsk`]): the host
+    /// asks the cache inside the call, which sends the query on the miss (`0x556aa0`).
+    RecordAsk(RecordAsk),
+    /// A `ConsoleExec` line that is no CVar write: `ConsoleCommandExecute` (`0x63ce00`) inside the
+    /// call (`0x515f43`), a registered command, a CVar's print or `Unknown command`.
+    Console(String),
+    /// `FollowUnit` or `FollowByName` ([`super::FollowRequest`]): the start gate, its refusal's
+    /// line or the follow armed and `AUTOFOLLOW_BEGIN` signalled, inside the call (`0x60fed0`).
+    Follow(super::FollowRequest),
+    /// A plate verb (`ShowNameplates` `0x489450` and its three siblings): its bit of
+    /// `[0xc4da34]` written inside the call ([`super::PlateBitWrite`]).
+    Nameplates(super::PlateBitWrite),
+    /// `ConfirmPetUnlearn()` (`0x48dca0` → `0x5dfba0(0, 0)`): `CMSG_PET_UNLEARN` to the
+    /// remembered trainer, or the money refusal's line, inside the call.
+    ConfirmPetUnlearn,
+}
+
+/// A getter's lookup with a callback, which the host makes inside the getter's call: the cache
+/// sends the query on a miss, once while it is in flight, and keeps the callback for the answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecordAsk {
+    /// `UnitName` on a unit with no object: the player-name cache by guid (`0x5171eb`).
+    PlayerName(u64),
+    /// `GetBattlefieldPosition` on a nameless teammate: the player-name cache by guid, with the
+    /// callback `0x4ac190` and no dedupe (`0x4ac104`-`0x4ac118`), which signals
+    /// `WORLD_MAP_NAME_UPDATE` when the name answers, a refusal too.
+    BattlefieldName(u64),
+    /// A trade getter's filled slot whose template the mirror lacks: the item cache, with the
+    /// callback `0x4c0340` that signals `TRADE_UPDATE` (`0x4c017f`, `0x4c0582`). The owner id is
+    /// the partner (`[0xb71728]`, `0x4c016c`) for theirs, the active player (`0x4c0573`) for ours.
+    TradeItem { entry: u32, owner: u64 },
+    /// `GetGuildInfo` on a player whose guild the mirror lacks: the guild cache, with a waiter
+    /// of the call's own for the unit (`0x4c93b6`-`0x4c93d2`).
+    Guild { guild_id: u32, guid: u64 },
+    /// The ammo slot's texture or quality getter on ammunition whose record the mirror lacks: the
+    /// item cache, with the callback `0x4c84f0` that signals `UNIT_INVENTORY_CHANGED` for a ready
+    /// record (`0x4c83bc`, `0x4c89cf`). The owner id is the unit's, the active player's
+    /// (`0x4c83ad`-`0x4c83c4`).
+    AmmoItem { entry: u32, owner: u64 },
+    /// The item cooldown query `0x6e2ed0` on an item whose record the mirror lacks, from
+    /// `GetContainerItemCooldown` or the bag and inventory tooltips: the item cache, with the
+    /// callback `0x6e2f70`, deduped (`0x6e2ef4`-`0x6e2f0d`). The owner id is the active player
+    /// (`0x6e2eef`).
+    CooldownItem { entry: u32, owner: u64 },
+    /// A getter's item-record lookup on a record its mirror lacks: the item cache, with the
+    /// getter's callback, kept by its owner ([`ItemCallback`]), and the lookup's owner id, the
+    /// query's guid ([`spell_owner`] for the profession and trainer getters, 0 for the quest
+    /// log's; the questgiver's is the panel's source, which the host holds).
+    Item {
+        entry: u32,
+        owner: u64,
+        callback: ItemCallback,
+    },
+    /// The quest log's leaderboard on a creature objective whose name the mirror lacks: the
+    /// creature cache, with the callback `0x4e07d0`, whose wait the VM keeps (`0x4e044c`).
+    QuestCreature(u32),
+    /// `GetSummonConfirmSummoner` with no name: the player-name cache by the latched summoner
+    /// (`0xb4e358`), with the callback `0x48b710`, which does nothing (`0x48b6bf`-`0x48b6e1`).
+    Summoner,
+    /// `GetAuctionItemInfo` on a row whose bidder (`0x4cf167`) or seller (`0x4cf1c8`) the name
+    /// cache misses: the player-name cache by guid, with the list's callback (`0x4cf290`,
+    /// `0x4cf2b0`, `0x4cf2d0`), kept once per name and list (`0x55f080`'s dedupe flag 1).
+    AuctionName { guid: u64, list: usize },
+}
+
+/// The owner id a profession or trainer getter's item lookup passes: `0xb0000000` over a spell id
+/// (`cdq; or edx,0xb0000000`), the row's at a profession (`0x4f75cf`, `0x4fdb8a`-`0x4fdb99`), the
+/// taught spell's at a trainer (`0x4d9074`-`0x4d9087`).
+pub fn spell_owner(spell_id: u32) -> u64 {
+    0xb000_0000_0000_0000 | u64::from(spell_id)
+}
+
+/// Who keeps the callback of a getter's item-record lookup ([`RecordAsk::Item`]); each is
+/// registered once per call, with no dedupe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ItemCallback {
+    /// `GetTrainerServiceIcon` and `GetTrainerServiceDescription` (`0x4d9140`, `0x4d9db0`), whose
+    /// landing runs the window's pass `0x4d7d40` (`0x4d914a`, `0x4d9dba`).
+    Trainer,
+    /// `GetQuestItemInfo` (`0x5018c0`), whose landing fires `QUEST_ITEM_UPDATE` for a ready record
+    /// (`0x5018fe`-`0x501903`), kept by the questgiver window.
+    Quest,
+    /// `GetCraftReagentInfo` and `GetCraftSpellFocus` (`0x4f7710`), whose landing rebuilds the
+    /// craft list (`0x4f771a`), kept beside the craft window.
+    Craft,
+    /// The trade-skill getters (`0x4fdc30`), whose landing rebuilds the list (`0x4fdc3c`), kept
+    /// beside the trade-skill window.
+    TradeSkill,
+    /// The quest log's leaderboard and reward getters (`0x4e0830`), whose callback the VM keeps
+    /// and signals `QUEST_LOG_UPDATE` with at its flush (`0x4e083a`): the cache only asks.
+    QuestLog,
+}
+
+/// Make `ask` inside the getter's call. A getter never raises for its lookup: with no host lent,
+/// and no harness keeping calls, nothing asks, and at the nesting bound ([`MAX_NESTING`]) the ask
+/// is dropped where a verb would raise [`TOO_DEEP`].
+pub(crate) fn ask(lua: &Lua, ask: RecordAsk) -> mlua::Result<()> {
+    let open = super::host::open(lua);
+    let Some(model) = lua.app_data_ref::<Model>() else {
+        return Ok(());
+    };
+    let skip = if open {
+        model.call_depth >= MAX_NESTING
+    } else {
+        model.kept_calls.is_none()
+    };
+    drop(model);
+    if skip {
+        return Ok(());
+    }
+    submit(lua, ScriptCall::RecordAsk(ask))
 }
 
 /// The mode the four `TargetNearest*` shims hand the TAB cycler `0x493f60`, the only byte that
@@ -760,6 +895,26 @@ impl UiScript {
             .len()
     }
 
+    /// The entries of the item-record lookups with `callback` a harness's VM kept, in call order
+    /// ([`RecordAsk::Item`]).
+    pub fn take_item_asks(&mut self, callback: ItemCallback) -> Vec<u32> {
+        self.take_calls_where(|call| match call {
+            ScriptCall::RecordAsk(RecordAsk::Item {
+                entry, callback: c, ..
+            }) if *c == callback => Some(*entry),
+            _ => None,
+        })
+    }
+
+    /// The record lookups a harness's VM kept, each with its owner id, in call order
+    /// ([`RecordAsk`]).
+    pub fn take_record_asks(&mut self) -> Vec<RecordAsk> {
+        self.take_calls_where(|call| match call {
+            ScriptCall::RecordAsk(ask) => Some(*ask),
+            _ => None,
+        })
+    }
+
     /// Take the kept calls `pick` answers for, in call order, leaving the rest kept.
     pub(crate) fn take_calls_where<T>(
         &mut self,
@@ -897,6 +1052,65 @@ mod tests {
         assert!(errors[0].contains(TOO_DEEP), "{errors:?}");
         drop(errors);
         assert_eq!(s.refuse_waiting(), 0, "nothing waits");
+    }
+
+    /// A host whose every `TargetLastEnemy` leaves `UnitName` on an unheld unit and then
+    /// `TargetLastEnemy` again to run in its tail, so the getter's ask is made at every depth.
+    struct AskingAtDepth {
+        applied: Vec<ScriptCall>,
+        errors: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+    }
+
+    impl CallHost for AskingAtDepth {
+        fn apply(&mut self, _: &mut UiScript, call: ScriptCall) -> Option<CallTail> {
+            let again = call == LAST_ENEMY;
+            self.applied.push(call);
+            if !again {
+                return None;
+            }
+            let errors = self.errors.clone();
+            Some(Box::new(move |script: &mut UiScript| {
+                let chunk = r#"UnitName("target") reached = (reached or 0) + 1 TargetLastEnemy()"#;
+                if let Err(e) = script.run(chunk) {
+                    errors.borrow_mut().push(e.to_string());
+                }
+            }))
+        }
+    }
+
+    /// A getter never raises for its lookup: at the nesting bound its ask is dropped and the
+    /// getter returns, and only the verb after it raises [`TOO_DEEP`]. The reference's getter
+    /// simply asks (`0x5171eb`).
+    #[test]
+    fn a_getters_ask_at_the_nesting_bound_is_dropped_not_raised() {
+        let mut s = UiScript::new().unwrap();
+        s.set_unit(
+            "target",
+            Some(super::super::UnitState {
+                guid: 0x77,
+                ..Default::default()
+            }),
+        );
+        let mut host = AskingAtDepth {
+            applied: Vec::new(),
+            errors: Default::default(),
+        };
+        s.hosted(&mut host, |s| s.run("TargetLastEnemy()").unwrap());
+        let levels = usize::from(MAX_NESTING);
+        assert_eq!(
+            s.eval::<usize>("return reached").unwrap(),
+            levels,
+            "every tail, the one at the bound too, gets past its getter"
+        );
+        let asks = host
+            .applied
+            .iter()
+            .filter(|c| matches!(c, ScriptCall::RecordAsk(_)))
+            .count();
+        assert_eq!(asks, levels - 1, "the ask at the bound is dropped");
+        let errors = host.errors.borrow();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains(TOO_DEEP), "{errors:?}");
     }
 
     /// With no host lent a call is refused with an error: an entry ran Lua without lending one.

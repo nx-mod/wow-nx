@@ -392,6 +392,18 @@ impl super::UiScript {
         }
     }
 
+    /// Reads the templates of `ids` the store lacks off the app's cache, asking nothing: the
+    /// trade-skill and craft link verbs pass no callback (`0x4ff8da`, `0x4f780a`), so a template
+    /// the cache holds is the store's, and one it lacks waits for a getter's own ask.
+    pub fn read_item_templates(&mut self, ids: impl IntoIterator<Item = u32>) {
+        let mut model = self.model_mut();
+        for id in ids {
+            if id != 0 && !model.item_templates.contains_key(&id) {
+                model.item_stat_reads.insert(id);
+            }
+        }
+    }
+
     /// Drains the ids asked for that the store did not hold.
     pub fn take_item_stat_asks(&mut self) -> Vec<u32> {
         self.model_mut().item_stat_asks.drain().collect()
@@ -627,33 +639,50 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             let Ok(item_id) = u32::try_from(id) else {
                 return Ok(MultiValue::new()); // no record holds a negative or past-u32 id
             };
-            let view = {
+            {
                 let mut model = lua.app_data_mut::<Model>().expect("model app_data");
-                let v = model.item_templates.get(&item_id).cloned();
-                if v.is_none() && item_id != 0 {
+                if item_id != 0 && !model.item_templates.contains_key(&item_id) {
                     model.item_stat_reads.insert(item_id);
                 }
-                v
+            }
+            // The record as the cache holds it now, the snapshot's copy only with no host lent.
+            // The base name: the suffix is the VM's own `ITEM_SUFFIX_TEMPLATE` fill, below.
+            let key = (item_id != 0).then_some(super::ItemKey::Record {
+                entry: item_id,
+                roll: super::ItemRoll::default(),
+            });
+            let read = |r: &dyn super::ItemRead| {
+                Some((
+                    r.name()?,
+                    r.quality()?,
+                    r.info()?,
+                    r.inventory_type(),
+                    r.texture(),
+                ))
             };
-            let Some(v) = view else {
+            let answer = super::item_read::read_item_or(lua, key, read, |read| {
+                let model = lua.app_data_ref::<Model>().expect("model app_data");
+                model.item_templates.get(&item_id).map(|v| read(v))
+            });
+            let Some((base, quality, info, inventory_type, icon)) = answer.flatten() else {
                 return Ok(MultiValue::new());
             };
-            let name = suffixed_name(lua, &v.name, random_property);
+            let name = suffixed_name(lua, &base, random_property);
             let str_or_empty = |s: &Option<String>| s.clone().unwrap_or_default();
             Ok(MultiValue::from_vec(vec![
                 Value::String(lua.create_string(&name)?),
                 Value::String(lua.create_string(format!(
                     "item:{item_id}:{enchant}:{random_property}:{suffix}"
                 ))?),
-                Value::Integer(i64::from(v.quality)),
-                Value::Integer(i64::from(v.required_level)),
-                Value::String(lua.create_string(str_or_empty(&v.item_type))?),
-                Value::String(lua.create_string(str_or_empty(&v.item_sub_type))?),
-                Value::Integer(i64::from(v.stackable)),
-                Value::String(lua.create_string(equip_loc_token(v.inventory_type))?),
+                Value::Integer(i64::from(quality)),
+                Value::Integer(i64::from(info.required_level)),
+                Value::String(lua.create_string(str_or_empty(&info.item_type))?),
+                Value::String(lua.create_string(str_or_empty(&info.item_sub_type))?),
+                Value::Integer(i64::from(info.stackable)),
+                Value::String(lua.create_string(equip_loc_token(inventory_type))?),
                 // Deviation: nil for a display row with no icon, where the reference answers the
                 // unloadable `Interface\Icons\`, because `SetTexture` shows no icon for either.
-                match &v.icon {
+                match &icon {
                     Some(icon) => Value::String(lua.create_string(icon)?),
                     None => Value::Nil,
                 },

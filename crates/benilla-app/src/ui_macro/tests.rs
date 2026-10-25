@@ -330,7 +330,9 @@ fn rebind_app(script: UiScript) -> bevy::prelude::App {
     script.run(r#"SLASH_CAST1 = "/cast""#).unwrap();
     let mut app = App::new();
     app.init_resource::<crate::ui_action::PlayerActions>()
+        .init_resource::<crate::ui_action::ActionSlots>()
         .init_resource::<super::MacroBoundSpells>()
+        .init_resource::<crate::ui_pet::PetBar>()
         .insert_non_send_resource(script)
         .add_systems(Update, super::rebind_macro_spells);
     app
@@ -344,12 +346,19 @@ fn book_slot(spell_id: u32, name: &str) -> benilla_ui::script::SpellSlotView {
     }
 }
 
-/// `0x4f0ce0`, from the pet spell message (`0x4bdae0`), derives only the records whose cached
+/// One `SMSG_PET_SPELLS`'s sort of the pet book (`0x4bdadb`), which the derivation follows.
+fn pet_spell_list(app: &mut bevy::prelude::App) {
+    let mut bar = app.world_mut().resource_mut::<crate::ui_pet::PetBar>();
+    bar.book_sorts = bar.book_sorts.wrapping_add(1);
+}
+
+/// `0x4f0ce0`, from each pet spell message (`0x4bdae0`), derives only the records whose cached
 /// spell is below 0 or whose book selector is the pet's (`0x4f0cfb`-`0x4f0d11`), and a miss leaves
 /// the selector (`0x4eff81` stores the spell alone). So a `/cast` that missed binds when the pet's
 /// spell arrives; a `CastSpellByName` that was bound to it and lost it binds again when the pet
-/// returns; and one made while the pet was away keeps its 0 through the pet's list alone. The
-/// engine's copy carries the book, which `GetActionAutocast` reads.
+/// returns; and one made while the pet was away keeps its 0 through the pet's list alone. A book
+/// pushed with no message derives nothing. The engine's copy carries the book, which
+/// `GetActionAutocast` reads.
 #[test]
 fn the_pets_spell_list_rebinds_the_failed_and_the_pet_bound_macros_only() {
     use super::run::{Bound, BoundSpell};
@@ -408,25 +417,20 @@ fn the_pets_spell_list_rebinds_the_failed_and_the_pet_bound_macros_only() {
         "the binding's book reaches GetActionAutocast"
     );
 
-    // A cooldown or autocast change is not a spell message: nothing is derived again.
-    let before = script.pet_book_generation();
-    let mut ticking = seduction.clone();
-    ticking.slots[0].cooldown = Some((1_000, 5_000, true));
+    // The pet's book empties with no spell message: nothing is derived again.
     app.world_mut()
         .non_send_resource_mut::<UiScript>()
-        .set_pet_book(ticking);
+        .set_pet_book(PetBookState::default());
+    app.update();
     assert_eq!(
-        app.world()
-            .non_send_resource::<UiScript>()
-            .pet_book_generation(),
-        before
+        (bound(&app, 1), bound(&app, 2)),
+        (pet_spell, pet_spell),
+        "no spell message, no derivation"
     );
 
     // The pet is dismissed. The `/cast` is a miss (-1) and the quoted call stores 0; both keep the
     // pet's book. A quoted call made now never found the spell.
-    app.world_mut()
-        .non_send_resource_mut::<UiScript>()
-        .set_pet_book(PetBookState::default());
+    pet_spell_list(&mut app);
     app.world_mut()
         .non_send_resource::<UiScript>()
         .run(r#"CreateMacro("Later", 1, 'CastSpellByName("Seduction")')"#)
@@ -457,6 +461,7 @@ fn the_pets_spell_list_rebinds_the_failed_and_the_pet_bound_macros_only() {
     app.world_mut()
         .non_send_resource_mut::<UiScript>()
         .set_pet_book(seduction);
+    pet_spell_list(&mut app);
     app.update();
     assert_eq!(
         (
@@ -553,9 +558,9 @@ fn a_position_numbered_character_bar_moves_to_macro_ids_once() {
         (5, 0x4000_0001),
         (6, 0x4000_0025),
     ];
-    let mut actions = PlayerActions::default();
+    let mut slots = crate::ui_action::ActionSlots::default();
     for (slot, word) in placed {
-        actions.buttons.insert(
+        slots.buttons.insert(
             slot,
             ActionButton {
                 slot,
@@ -566,7 +571,8 @@ fn a_position_numbered_character_bar_moves_to_macro_ids_once() {
     }
     let (tx, rx) = crossbeam_channel::unbounded();
     let mut app = App::new();
-    app.insert_resource(actions)
+    app.insert_resource(PlayerActions::default())
+        .insert_resource(slots)
         .insert_resource(crate::net::NetCommands(tx))
         .insert_resource(crate::glue_session::roster::Roster::with_pending_pick(
             vec![crate::glue_session::roster::test_character(7, "Probeone")],
@@ -574,10 +580,7 @@ fn a_position_numbered_character_bar_moves_to_macro_ids_once() {
         ))
         .init_resource::<super::MacroFiles>()
         .insert_non_send_resource(UiScript::new().unwrap())
-        .add_systems(
-            Update,
-            (super::load_macros, crate::ui_action::drain_action_sets).chain(),
-        );
+        .add_systems(Update, super::load_macros);
     let sent = |rx: &crossbeam_channel::Receiver<crate::net::ClientCommand>| {
         rx.try_iter()
             .map(|c| match c {
@@ -594,7 +597,11 @@ fn a_position_numbered_character_bar_moves_to_macro_ids_once() {
         "Alpha, Charlie and Bravo by their ids, the button past the last macro cleared, each once"
     );
     let word = |app: &App, slot: u8| {
-        let b = app.world().resource::<PlayerActions>().buttons.get(&slot)?;
+        let b = app
+            .world()
+            .resource::<crate::ui_action::ActionSlots>()
+            .buttons
+            .get(&slot)?;
         Some((u32::from(b.kind) << 24) | b.action)
     };
     let held: Vec<Option<u32>> = (0..7).map(|slot| word(&app, slot)).collect();
@@ -622,7 +629,7 @@ fn a_position_numbered_character_bar_moves_to_macro_ids_once() {
     // The next session: a fresh VM loads the renumbered file. A button at 0x40000013 is now the
     // account macro of that id, and nothing moves it.
     app.world_mut()
-        .resource_mut::<PlayerActions>()
+        .resource_mut::<crate::ui_action::ActionSlots>()
         .buttons
         .insert(
             9,
@@ -779,7 +786,7 @@ fn a_superseded_rank_rewrites_the_cached_spell_of_a_macro_on_the_bar() {
     ));
     let mut app = rebind_app(script);
     app.world_mut()
-        .resource_mut::<crate::ui_action::PlayerActions>()
+        .resource_mut::<crate::ui_action::ActionSlots>()
         .buttons
         .insert(
             4,
@@ -824,7 +831,7 @@ fn a_supersede_with_no_vm_yet_is_kept_for_the_first_pass() {
     ));
     let mut app = rebind_app(script);
     app.world_mut()
-        .resource_mut::<crate::ui_action::PlayerActions>()
+        .resource_mut::<crate::ui_action::ActionSlots>()
         .buttons
         .insert(
             4,
@@ -874,7 +881,7 @@ fn an_edit_derives_against_the_book_at_its_call() {
     ));
     let mut app = rebind_app(script);
     app.world_mut()
-        .resource_mut::<crate::ui_action::PlayerActions>()
+        .resource_mut::<crate::ui_action::ActionSlots>()
         .buttons
         .insert(
             4,

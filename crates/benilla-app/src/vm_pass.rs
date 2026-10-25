@@ -15,10 +15,12 @@
 //! in, which only a changed registration moves. The reference's tick runs its due timers, then the
 //! queued window input (`0x423920`, called at `0x420d23`), each record whole through its
 //! category's handlers (`0x4239a0`, `0x4245b0`), then category 6 (`0x420d55`), where the packet
-//! dispatch `0x403620` is registered, then the frame time, category 5 (`0x420f70`); which category
-//! the frame's `OnUpdate` walk runs in is not read. benilla runs the net feeds, then the tick, then
-//! the UI's input records, and its bindings and world clicks after the input stage: the window
-//! input ahead of the net drain is an order it does not keep yet.
+//! dispatch `0x403620` is registered, then the frame time, category 5 (`0x420d63`), and last the
+//! frame pass, category 0x11 (`0x420d6a`, `0x442350`), whose interface layer runs the `OnUpdate`
+//! walk (`0x764330` → `0x765650` → `0x76b2c0`) before the draw. benilla runs the UI's input
+//! records and the bindings, then the feeds, then the tick, then the paint, all after the net
+//! drain, which applies the frame's packets to the world before its input; its world clicks and
+//! the controller's frame-time step follow the tick.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
@@ -166,6 +168,7 @@ pub(crate) fn shared_sinks(world: &World) -> Vec<ComponentId> {
         std::any::TypeId::of::<crate::ui_action::UiErrorKeys>(),
         std::any::TypeId::of::<crate::sound::MessageSounds>(),
         std::any::TypeId::of::<crate::creature_anim::UnitEdits>(),
+        std::any::TypeId::of::<crate::player::FarSight>(),
     ]
     .into_iter()
     .filter_map(|t| world.components().get_resource_id(t))
@@ -189,15 +192,15 @@ pub(crate) fn shared_sinks(world: &World) -> Vec<ComponentId> {
 /// already orders keep that order and its sync point. Panics on a cycle in the declared order,
 /// the pass's ends included.
 pub(crate) fn order_the_pass(world: &mut World, label: impl ScheduleLabel) -> Vec<String> {
+    let label = label.intern();
+    if !world.resource::<Schedules>().contains(label) {
+        return Vec::new();
+    }
     let host = System::initialize(
         &mut IntoSystem::into_system(|_: crate::script_calls::ScriptCallHost| {}),
         world,
     );
     let sinks = shared_sinks(world);
-    let label = label.intern();
-    if !world.resource::<Schedules>().contains(label) {
-        return Vec::new();
-    }
     world.schedule_scope(label, |world, schedule| {
         schedule.graph_mut().systems.initialize(world);
         let graph = schedule.graph();
@@ -237,6 +240,7 @@ pub(crate) fn order_the_pass(world: &mut World, label: impl ScheduleLabel) -> Ve
         let in_phase = members(&[
             &crate::ui_script::UiFeed,
             &crate::ui_script::UiInput,
+            &crate::ui_script::UiTick,
             &crate::ui_script::UiDrain,
             &crate::ui_script::UiPaint,
             &VmPass::Member,
@@ -250,6 +254,9 @@ pub(crate) fn order_the_pass(world: &mut World, label: impl ScheduleLabel) -> Ve
             Always,
             Sink,
         }
+        // A host's access holds the call host's: adding the host's changes nothing. The sum is
+        // made in one buffer, reused for every system, so the host's access is never cloned.
+        let mut with_host = bevy::ecs::query::Access::default();
         let joins: Vec<Joins> = graph
             .systems
             .iter()
@@ -261,14 +268,10 @@ pub(crate) fn order_the_pass(world: &mut World, label: impl ScheduleLabel) -> Ve
                     return Joins::No;
                 }
                 let combined = declared.combined_access();
-                // wow-nx: the combined access of the set with the host's is the two combined accesses merged
-                // (`FilteredAccessSet::extend`), so only those are cloned: cloning the whole set and the host's
-                // per system took most of the start's eight seconds on the Switch (upstream #2324).
-                let mut with_host = combined.clone();
+                with_host.clone_from(combined);
                 with_host.extend(host.combined_access());
                 let hosted = with_host == *combined;
-                let meets = in_phase[index[&key]] && !declared.is_compatible(&host);
-                if hosted || meets {
+                if hosted || (in_phase[index[&key]] && !declared.is_compatible(&host)) {
                     Joins::Always
                 } else if sinks.iter().any(|id| combined.has_resource_read(*id)) {
                     Joins::Sink
@@ -677,23 +680,23 @@ mod tests {
         next
     }
 
-    /// The pass runs its phases in their declared order: the net feeds (the unit feed), then the
-    /// frame's tick and the input pass, then the drains of what their Lua asked, then the paint.
+    /// The pass runs its phases in the reference's tick order: the input pass, then the net feeds
+    /// (the unit feed), then the tick, then the drains of what their Lua asked, then the paint.
     #[test]
-    fn the_pass_runs_the_feeds_then_the_tick_then_the_drains() {
+    fn the_pass_runs_the_input_then_the_feeds_then_the_tick_then_the_drains() {
         let app = headless_client();
         let Some(order) = pass_order(&app) else {
             return;
         };
         let at = |name: &str| at(&order, name);
-        let (feed, tick, input) = (
+        let (input, feed, tick) = (
+            at("::feed_ui_input"),
             at("::ui_unit::feed_units"),
             at("::tick_script"),
-            at("::feed_ui_input"),
         );
         let (drain, paint) = (at("::drain_chat_input"), at("::paint_script"));
         assert!(
-            feed < tick && tick < drain && input < drain && drain < paint,
+            input < feed && feed < tick && tick < drain && drain < paint,
             "{order:?}"
         );
     }
@@ -885,7 +888,7 @@ mod tests {
     fn every_user_of_a_shared_sink_runs_in_one_order() {
         let mut app = headless_client_with(crate::dev::add_every_instrument);
         let sinks = super::shared_sinks(app.world());
-        assert_eq!(sinks.len(), 4, "the sinks are registered");
+        assert_eq!(sinks.len(), 5, "the sinks are registered");
         let users: Vec<SystemKey> = app.world_mut().schedule_scope(Update, |world, schedule| {
             schedule.graph_mut().systems.initialize(world);
             let graph = schedule.graph();
@@ -995,24 +998,6 @@ mod tests {
             (Some((key, _)), None) => *key,
             _ => panic!("exactly one system named `…{suffix}` in Update"),
         }
-    }
-
-    /// A follow the Lua asks (`FollowUnit`, `FollowByName`) starts the frame it is made: the
-    /// request's reader runs after the drain that writes it.
-    #[test]
-    fn a_follow_the_lua_asks_starts_the_frame_it_is_made() {
-        let mut app = headless_client();
-        if pass_order(&app).is_none() {
-            return;
-        }
-        let update = census(&mut app, Update, SyncPoints::Declared);
-        let next = successors(&update);
-        let drain = one(&update, "ui_follow::drain_follow");
-        let reader = one(&update, "by_name::follow_requests");
-        assert!(
-            after(&next, drain).contains(&reader),
-            "`follow_requests` reads the `FollowRequest` before `drain_follow` writes it"
-        );
     }
 
     /// A `SetCVar` the input pass makes moves the camera the frame it is made: the registry's
