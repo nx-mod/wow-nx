@@ -72,9 +72,23 @@ fn run_calls(mut vm: benilla_app::ScriptVm) {
     if calls.is_empty() {
         return;
     }
+    // wow-nx: the first calls, logged, while the pad's events are traced on the Switch.
+    static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let hosted = vm.has_host();
     vm.run(|script| {
-        let Some(script) = script else { return };
+        let Some(script) = script else {
+            warn!("pad: {} call(s) dropped: no VM", calls.len());
+            return;
+        };
         for call in calls {
+            if LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 40 {
+                let what = match &call {
+                    Call::Binding(c, down) => format!("binding {c} {}", if *down { "down" } else { "up" }),
+                    Call::Event(e, _) => format!("event {e}"),
+                    Call::Chunk(lua) => format!("chunk {lua}"),
+                };
+                info!("pad: call {what} (host lent: {hosted})");
+            }
             match call {
                 Call::Binding(command, true) => match script.execute_binding(&command, true) {
                     Ok(true) => {}

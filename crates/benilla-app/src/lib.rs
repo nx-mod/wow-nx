@@ -220,6 +220,11 @@ pub struct ScriptVm<'w, 's> {
 }
 
 impl ScriptVm<'_, '_> {
+    /// Whether there is a host to lend: without one the calls run unhosted, and an engine call is refused.
+    pub fn has_host(&self) -> bool {
+        self.vm.has_host()
+    }
+
     /// Run `f` on the VM with the host lent; `f` gets `None` before there is a VM.
     pub fn run<R>(&mut self, f: impl FnOnce(Option<&mut benilla_ui::script::UiScript>) -> R) -> R {
         self.vm.run(f)

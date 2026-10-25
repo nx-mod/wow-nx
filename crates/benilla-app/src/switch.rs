@@ -135,9 +135,11 @@ fn log_ui_geometry(
         s.eval::<String>(
             "local p = UIParent \
              if not p then return string.format('screen %.0fx%.0f, no UIParent', GetScreenWidth(), GetScreenHeight()) end \
-             return string.format('screen %.1fx%.1f, UIParent scale %.3f effective %.3f, %.1fx%.1f at (%.1f, %.1f)', \
+             local mode = BenillaPad_Mode and BenillaPad_Mode() or 'none' \
+             local bar = BenillaPadBar and (BenillaPadBar:IsVisible() and 'shown' or 'hidden') or 'none' \
+             return string.format('screen %.1fx%.1f, UIParent scale %.3f effective %.3f, %.1fx%.1f at (%.1f, %.1f); pad mode %s, bar %s', \
                  GetScreenWidth(), GetScreenHeight(), p:GetScale(), p:GetEffectiveScale(), p:GetWidth() or -1, \
-                 p:GetHeight() or -1, p:GetLeft() or -1, p:GetBottom() or -1)",
+                 p:GetHeight() or -1, p:GetLeft() or -1, p:GetBottom() or -1, tostring(mode), bar)",
         )
         .ok()
     });
