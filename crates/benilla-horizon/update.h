@@ -1,6 +1,7 @@
 // wow-nx: what https.c (haloce-nx's host_https.c) takes from its host, and the updater's own entry (update.c).
 #pragma once
 
+#include <stdarg.h>
 #include <stddef.h>
 
 // The log: update.c's sdmc:/wow-nx/update.txt, written before Bevy's log is up.
