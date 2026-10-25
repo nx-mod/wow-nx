@@ -1345,6 +1345,22 @@ impl crate::Device for Device {
         {
             maker.flags |= DkImageFlags_Usage2DEngine;
         }
+        // A sampled 2D image's tile height is the smallest that covers it. deko3d's own choice is 1.5 times its height,
+        // so an image 6 to 8 rows tall gets tiles two GOBs (16 rows) tall; the copy engine that fills it and the
+        // texture unit that reads it did not agree on such a tile, and every other GOB column read empty: the status
+        // bars (UI-StatusBar.blp, 64x8) drew green, dark, green, dark across their four GOBs.
+        if !desc.usage.intersects(render_usage) && desc.dimension == wgt::TextureDimension::D2 && desc.sample_count == 1 {
+            let (_, block_height) = desc.format.block_dimensions();
+            let gobs = desc.size.height.div_ceil(block_height).div_ceil(8);
+            maker.flags |= DkImageFlags_CustomTileSize;
+            maker.__bindgen_anon_1.tileSize = match gobs {
+                0..=1 => DkTileSize::DkTileSize_OneGob,
+                2 => DkTileSize::DkTileSize_TwoGobs,
+                3..=4 => DkTileSize::DkTileSize_FourGobs,
+                5..=8 => DkTileSize::DkTileSize_EightGobs,
+                _ => DkTileSize::DkTileSize_SixteenGobs,
+            };
+        }
         // Hardware compression only where the GPU renders: a render target's writes go through the compressing raster
         // path, but a sampled texture is filled by copy-engine transfers, and with the flag on one drew with chunks
         // missing (status bars, a squeezed texture sampled from its lower mips).
