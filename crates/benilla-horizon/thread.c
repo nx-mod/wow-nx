@@ -6,6 +6,8 @@
 #include <switch.h>
 
 struct __pthread_t;
+// sampler.c: the threads it may sample.
+void wownx_sampler_thread(Handle handle);
 int __real___syscall_thread_create(struct __pthread_t** thread, void* (*func)(void*), void* arg, void* stack_addr,
                                    size_t stack_size);
 
@@ -27,7 +29,9 @@ int __wrap___syscall_thread_create(struct __pthread_t** thread, void* (*func)(vo
     for (; core < 64; core++)
         if ((mask >> core) & 1 && n-- == 0) break;
     // struct __pthread_t starts with libnx's Thread, and Thread with its handle.
-    svcSetThreadCoreMask(*(Handle*)*thread, core, (u32)mask);
+    Handle handle = *(Handle*)*thread;
+    svcSetThreadCoreMask(handle, core, (u32)mask);
+    wownx_sampler_thread(handle);
     return rc;
 }
 

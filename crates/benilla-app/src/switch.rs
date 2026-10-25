@@ -35,6 +35,8 @@ pub(crate) fn prepare() {
         fn wownx_network_init() -> u32;
         /// benilla-horizon's update.c: the look for a newer release, on its own thread.
         fn wownx_update_start();
+        /// benilla-horizon's sampler.c: the profiler, with WOWNX_PROFILE=1.
+        fn wownx_sampler_start();
     }
     unsafe { wownx_black_screen() };
     NETWORK.store(unsafe { wownx_network_init() }, std::sync::atomic::Ordering::Relaxed);
@@ -65,6 +67,8 @@ pub(crate) fn prepare() {
     // A release looks for a newer one on GitHub while the game loads, and offers it when the renderer takes the
     // window (benilla-horizon's update.c; benilla.env's WOWNX_UPDATE=0 turns it off).
     unsafe { wownx_update_start() };
+    // WOWNX_PROFILE=1: where the threads spend their time, every 30 s in sdmc:/wow-nx/samples.txt.
+    unsafe { wownx_sampler_start() };
     std::env::set_var("BEVY_ASSET_ROOT", "sdmc:/wow-nx");
     if std::env::var_os("WOW_DATA").is_none() {
         std::env::set_var("WOW_DATA", "sdmc:/wow-nx/Data");
