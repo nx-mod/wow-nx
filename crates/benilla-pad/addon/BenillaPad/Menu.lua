@@ -84,7 +84,7 @@ Menu.pages = {
             { label = "Bar height", desc = "How far above the bottom of the screen the bar sits.",
                 key = "offsetY", min = 40, max = 500, step = 10, fmt = whole },
             { label = "Button symbols", desc = "Auto follows the connected controller.", key = "symbols",
-                values = { { "auto", "Auto" }, { "xbox", "Xbox" }, { "playstation", "PlayStation" } } },
+                values = { { "auto", "Auto" }, { "xbox", "Xbox" }, { "playstation", "PlayStation" }, { "nintendo", "Nintendo" } } },
             { label = "Always show the bar", desc = "Show the gamepad bar even with no controller connected.", key = "alwaysShow" },
             { label = "Hide the stock bars", desc = "While the gamepad bar shows, the stock action bars, bags, XP bar and micro menu go (the window wheel opens everything). The pet bar stays.",
                 key = "hideStockBars" },
@@ -123,7 +123,6 @@ desc:SetJustifyH("LEFT")
 
 local hint = win:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
 hint:SetPoint("BOTTOM", win, "BOTTOM", 0, 20)
-hint:SetText("D-pad: move    Left / Right: change    A: choose    B: back")
 
 local rows = {}
 for i = 1, 10 do
@@ -316,6 +315,7 @@ function Menu.Open()
     if P.Binds and P.Binds.frame:IsVisible() then
         P.Binds.frame:Hide()
     end
+    hint:SetText(P.Hint("D-pad: move    Left / Right: change    A: choose    B: back"))
     Menu.page = "main"
     Menu.row = 1
     Menu.history = {}

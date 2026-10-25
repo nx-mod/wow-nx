@@ -47,7 +47,7 @@ P.DEFAULTS = {
     faceSpells = false,
     scale = 1.0,
     offsetY = 170,
-    -- "auto" follows the pad's vendor; else "xbox" or "playstation".
+    -- "auto" follows the pad's vendor; else "xbox", "playstation" or "nintendo".
     symbols = "auto",
     alwaysShow = false,
     -- The stock action bars, bags and micro menu go while the gamepad bar shows.
@@ -388,6 +388,29 @@ function P.Symbols()
         return P.style
     end
     return chosen
+end
+
+-- The buttons are named by place as an Xbox pad's are (A the bottom face button). A Nintendo pad's sit the other way
+-- round (B bottom, A right, Y left, X top), with L / R, ZL / ZR, the sticks pressed (LS / RS) and + / -.
+local NINTENDO_NAME = {
+    A = "B", B = "A", X = "Y", Y = "X", LB = "L", RB = "R", LT = "ZL", RT = "ZR", L3 = "LS", R3 = "RS",
+    Start = "+", Select = "-",
+}
+
+-- A button's name under the symbols drawn.
+function P.Name(name)
+    if P.Symbols() == "nintendo" then
+        return NINTENDO_NAME[name] or name
+    end
+    return name
+end
+
+-- A line of text with its button names as the symbols drawn name them.
+function P.Hint(text)
+    if P.Symbols() ~= "nintendo" then
+        return text
+    end
+    return (string.gsub(text, "(%w+)", function(word) return NINTENDO_NAME[word] or word end))
 end
 
 -- Put every setting back to its default.

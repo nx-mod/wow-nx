@@ -389,7 +389,7 @@ function Wheel.Fill()
         local page = WINDOW_PAGES[Wheel.page]
         Wheel.entries = page.entries
         pageTitle:SetText(page.title)
-        hint:SetText("Stick: point   A: open   LB / RB: page   B: close")
+        hint:SetText(P.Hint("Stick: point   A: open   LB / RB: page   B: close"))
         for i = 1, table.getn(dots) do
             if i <= table.getn(WINDOW_PAGES) then
                 dots[i]:Show()
@@ -413,9 +413,9 @@ function Wheel.Fill()
         Wheel.entries = consumableEntries()
         pageTitle:SetText("Consumables")
         if table.getn(Wheel.entries) == 0 then
-            hint:SetText("Nothing to use in your bags   B: close")
+            hint:SetText(P.Hint("Nothing to use in your bags   B: close"))
         else
-            hint:SetText("Stick: point   A: use   B: close")
+            hint:SetText(P.Hint("Stick: point   A: use   B: close"))
         end
         for i = 1, table.getn(dots) do
             dots[i]:Hide()

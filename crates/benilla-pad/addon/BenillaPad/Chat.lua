@@ -352,15 +352,15 @@ function Chat.Refresh()
         sendTo:SetText("Commands go to: |cffffd100" .. Bots.TargetLabel() .. "|r   (Y: change)")
         sendTo:Show()
         if Chat.focus == "list" then
-            hint:SetText("D-pad: choose a category   A / Right: open it   LB / RB: tab   B: close")
+            hint:SetText(P.Hint("D-pad: choose a category   A / Right: open it   LB / RB: tab   B: close"))
         elseif botCategories()[Chat.category].roster then
-            hint:SetText("A: log in / out (or run)   X: invite   Y: send to   LB / RB: tab   B: back")
+            hint:SetText(P.Hint("A: log in / out (or run)   X: invite   Y: send to   LB / RB: tab   B: back"))
         else
-            hint:SetText("A: send   X: add to / remove from the bot wheel (LT+RT+Y)   Y: send to   Start: type a command   B: back")
+            hint:SetText(P.Hint("A: send   X: add to / remove from the bot wheel (LT+RT+Y)   Y: send to   Start: type a command   B: back"))
         end
     else
         sendTo:Hide()
-        hint:SetText("A: send   X: edit tile   Y: type a message   LB / RB: tab   B: close")
+        hint:SetText(P.Hint("A: send   X: edit tile   Y: type a message   LB / RB: tab   B: close"))
     end
 end
 

@@ -21,6 +21,8 @@ local BADGE_COLOR = {
     X = { 0.20, 0.45, 0.90 }, Y = { 0.95, 0.75, 0.10 },
 }
 local PS_GLYPH = { A = "X", B = "O", X = "[]", Y = "/\\" }
+-- A Nintendo pad's face buttons are all one colour.
+local NINTENDO_COLOR = { 0.92, 0.92, 0.92 }
 
 -- Where each button sits, from the bar's centre.
 local DPAD_X, FACE_X, STEP = -150, 150, 46
@@ -209,11 +211,13 @@ local function setGlyph(b)
         local text = key
         if P.Symbols() == "playstation" then
             text = PS_GLYPH[key]
+        elseif P.Symbols() == "nintendo" then
+            text, color = P.Name(key), NINTENDO_COLOR
         end
         b.glyph:SetText(text)
         b.glyph:SetTextColor(color[1], color[2], color[3])
     else
-        b.glyph:SetText(key)
+        b.glyph:SetText(P.Name(key))
         b.glyph:SetTextColor(0.9, 0.9, 0.9)
     end
 end
@@ -377,7 +381,7 @@ function Bar.Refresh()
     if not frame:IsShown() then
         return
     end
-    layerText:SetText(P.LAYER_LABEL[P.layer] or "")
+    layerText:SetText(P.Hint(P.LAYER_LABEL[P.layer] or ""))
     for key, b in pairs(Bar.buttons) do
         Bar.UpdateButton(b)
     end
@@ -489,7 +493,7 @@ function Bar.UpdateCooldownRow()
                         end
                     end
                     if tex and left > 0 then
-                        table.insert(list, { tex = tex, left = left, layer = P.LAYER_LABEL[layer] })
+                        table.insert(list, { tex = tex, left = left, layer = P.Hint(P.LAYER_LABEL[layer]) })
                     end
                 end
             end

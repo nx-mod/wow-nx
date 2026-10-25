@@ -48,7 +48,6 @@ edit:SetScript("OnEscapePressed", function() Keyboard.Cancel() end)
 
 local hint = win:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
 hint:SetPoint("BOTTOM", win, "BOTTOM", 0, 18)
-hint:SetText("A: type   X: delete   Y: space   LB: shift   RB: 123   Start: send   B: cancel")
 
 Keyboard.page = 1
 Keyboard.shift = false
@@ -229,6 +228,7 @@ function Keyboard.Open(titleText, text, onDone)
     Keyboard.onDone = onDone
     Keyboard.page, Keyboard.shift, Keyboard.row, Keyboard.col = 1, false, 1, 1
     title:SetText(titleText or "Type")
+    hint:SetText(P.Hint("A: type   X: delete   Y: space   LB: shift   RB: 123   Start: send   B: cancel"))
     edit:SetText(text or "")
     win:Show()
     Keyboard.Refresh()

@@ -221,7 +221,7 @@ for i = 1, table.getn(P.LAYERS) do
     t.bg = bg
     local text = t:CreateFontString(nil, "ARTWORK", "GameFontNormal")
     text:SetPoint("CENTER", t, "CENTER", 0, 0)
-    text:SetText(LAYER_TITLE[layer])
+    text:SetText(P.Hint(LAYER_TITLE[layer]))
     t.text = text
     t.layer = layer
     t:SetScript("OnClick", function()
@@ -257,7 +257,7 @@ local function newCell(btn)
     c.sel = sel
     local glyph = c:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     glyph:SetPoint("BOTTOM", c, "TOP", 0, 3)
-    glyph:SetText(CELL_LABEL[btn])
+    glyph:SetText(P.Name(CELL_LABEL[btn]))
     c.glyph = glyph
     c:RegisterForClicks("LeftButtonUp", "RightButtonUp")
     c:RegisterForDrag("LeftButton")
@@ -311,7 +311,7 @@ function Binds.Refresh()
             t.text:SetTextColor(1, 0.82, 0)
         end
     end
-    layerText:SetText(LAYER_TITLE[layer])
+    layerText:SetText(P.Hint(LAYER_TITLE[layer]))
     for btn, c in pairs(Binds.cells) do
         local icon = Binds.Describe(btn, layer)
         c.icon:SetTexture(icon)
@@ -326,21 +326,21 @@ function Binds.Refresh()
     local _, name = Binds.Describe(Binds.selected, layer)
     local prefix = ""
     if layer ~= "bare" then
-        prefix = LAYER_TITLE[layer] .. " + "
+        prefix = P.Hint(LAYER_TITLE[layer]) .. " + "
     end
     local formNote = ""
     if layer ~= "bare" and P.FormKey() > 0 then
         formNote = "   |cff66bbff(" .. (P.FormName() or "this form") .. "'s own set)|r"
     end
-    described:SetText(prefix .. BUTTON_TITLE[Binds.selected] .. ":  " .. (name or "Empty") .. formNote)
+    described:SetText(prefix .. P.Hint(BUTTON_TITLE[Binds.selected]) .. ":  " .. (name or "Empty") .. formNote)
     if Binds.capture then
         hints:SetText("|cffffd100Press the combo|r to bind " .. Binds.capture.label
-            .. " (hold LT / RT for their layers).   Select: cancel")
+            .. P.Hint(" (hold LT / RT for their layers).   Select: cancel"))
     elseif Binds.picked then
-        hints:SetText("A: put it here (swaps)   B: cancel   D-pad: move")
+        hints:SetText(P.Hint("A: put it here (swaps)   B: cancel   D-pad: move"))
     else
-        hints:SetText("D-pad: move   A: pick up / put down   X: clear   Y: spell list   Start: default"
-            .. "   LB / RB: layer   Hold LT / RT: that layer   B: close")
+        hints:SetText(P.Hint("D-pad: move   A: pick up / put down   X: clear   Y: spell list   Start: default"
+            .. "   LB / RB: layer   Hold LT / RT: that layer   B: close"))
     end
 end
 
@@ -425,9 +425,9 @@ function Binds.capture_label_done(btn)
     local layer = P.layer or "bare"
     local prefix = ""
     if layer ~= "bare" then
-        prefix = LAYER_TITLE[layer] .. " + "
+        prefix = P.Hint(LAYER_TITLE[layer]) .. " + "
     end
-    return "to " .. prefix .. BUTTON_TITLE[btn]
+    return "to " .. prefix .. P.Hint(BUTTON_TITLE[btn])
 end
 
 -- Bind `entry` to the next combo pressed.
@@ -494,7 +494,6 @@ pickTitle:SetPoint("TOP", pick, "TOP", 0, -20)
 local pickHint = pick:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
 pickHint:SetPoint("BOTTOM", pick, "BOTTOM", 0, 20)
 pickHint:SetWidth(270)
-pickHint:SetText("A: bind to the selected button   X: bind to a combo   D-pad: move / list   B: back")
 
 Picker.lists = {}
 Picker.list = 1
@@ -611,6 +610,7 @@ function Picker.Refresh()
 end
 
 function Picker.Open()
+    pickHint:SetText(P.Hint("A: bind to the selected button   X: bind to a combo   D-pad: move / list   B: back"))
     Picker.Build()
     pick:Show()
     Picker.Refresh()
