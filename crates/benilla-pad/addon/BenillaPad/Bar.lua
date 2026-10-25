@@ -212,7 +212,7 @@ local function setGlyph(b)
         if P.Symbols() == "playstation" then
             text = PS_GLYPH[key]
         elseif P.Symbols() == "nintendo" then
-            text, color = P.Name(key), NINTENDO_COLOR
+            color = NINTENDO_COLOR
         end
         b.glyph:SetText(text)
         b.glyph:SetTextColor(color[1], color[2], color[3])
@@ -366,6 +366,12 @@ function Bar.Layout()
     frame:SetScale(P.Setting("scale"))
     frame:ClearAllPoints()
     frame:SetPoint("BOTTOM", UIParent, "BOTTOM", 0, P.Setting("offsetY"))
+    -- The face buttons where the symbols drawn put them.
+    for key, b in pairs(Bar.buttons) do
+        local at = PLACE[P.Spot(key)]
+        b:ClearAllPoints()
+        b:SetPoint("CENTER", frame, "CENTER", at[1], at[2])
+    end
 end
 
 function Bar.Refresh()
@@ -416,6 +422,13 @@ watcher:SetScript("OnEvent", function()
         Bar.Layout()
     end
     Bar.Refresh()
+end)
+
+-- The pad's style decides where the face buttons sit.
+P.Listen(function(event)
+    if event == "BENILLAPAD_CONNECTED" then
+        Bar.Layout()
+    end
 end)
 
 -- Range, power and countdowns move without events: ten times a second.

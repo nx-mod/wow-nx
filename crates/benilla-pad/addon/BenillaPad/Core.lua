@@ -390,12 +390,23 @@ function P.Symbols()
     return chosen
 end
 
--- The buttons are named by place as an Xbox pad's are (A the bottom face button). A Nintendo pad's sit the other way
--- round (B bottom, A right, Y left, X top), with L / R, ZL / ZR, the sticks pressed (LS / RS) and + / -.
+-- A Nintendo pad's face buttons arrive by their letters (wow-nx's Joy-Con layer reports the Switch's A as A), so only
+-- the rest is named its way: L / R, ZL / ZR, the sticks pressed (LS / RS) and + / -.
 local NINTENDO_NAME = {
-    A = "B", B = "A", X = "Y", Y = "X", LB = "L", RB = "R", LT = "ZL", RT = "ZR", L3 = "LS", R3 = "RS",
-    Start = "+", Select = "-",
+    LB = "L", RB = "R", LT = "ZL", RT = "ZR", L3 = "LS", R3 = "RS", Start = "+", Select = "-",
 }
+
+-- Where a face button sits, as the Xbox spot it takes: a Nintendo pad has A on the right, B at the bottom, X on top
+-- and Y on the left.
+local NINTENDO_SPOT = { A = "B", B = "A", X = "Y", Y = "X" }
+
+-- The spot to draw button `key` at, in a diagram laid out as an Xbox pad.
+function P.Spot(key)
+    if P.Symbols() == "nintendo" then
+        return NINTENDO_SPOT[key] or key
+    end
+    return key
+end
 
 -- A button's name under the symbols drawn.
 function P.Name(name)
