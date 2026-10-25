@@ -22,6 +22,10 @@ bevy_dynamic_linking = ["benilla-app/bevy_dynamic_linking"]
 # `default-features = false`, or `--no-default-features` here still builds benilla-app with `dev`.
 benilla-app = { path = "../benilla-app", default-features = false }
 
+# wow-nx: the Switch plays with the Joy-Con, through benilla-pad (lucasvallejodev/benilla-gamepad).
+[target.'cfg(target_os = "horizon")'.dependencies]
+benilla-pad = { path = "../benilla-pad", default-features = false }
+
 [build-dependencies]
 benilla-buildstamp = { path = "../benilla-buildstamp" }
 

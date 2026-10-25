@@ -92,6 +92,8 @@ benilla-horizon = { path = "../benilla-horizon" }
 # Our deko3d backend's hooks (the screen lock around the system keyboard, frame statistics); the version the
 # workspace patches in, features as wgpu asks for them.
 wgpu-hal = { version = "27", default-features = false }
+# The Joy-Con are bevy's gamepad (src/switch.rs), for benilla-pad: elsewhere gilrs, in default_platform, brings it.
+bevy = { workspace = true, features = ["gamepad"] }
 
 [target.'cfg(not(target_os = "horizon"))'.dependencies]
 arboard = "3"

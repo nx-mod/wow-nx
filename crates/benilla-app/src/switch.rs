@@ -10,7 +10,8 @@
 //!
 //! - Settings: `sdmc:/wow-nx/benilla.env`, `KEY=VALUE` lines read into the environment at start (`WOW_HOST`,
 //!   `WOW_USER`, `WOW_PASS`...), so the login can be filled without a keyboard.
-//! - Input ([`input`]): touch, a USB keyboard and mouse, and the Joy-Con, as the keyboard and mouse events winit sends.
+//! - Input ([`input`]): touch, a USB keyboard and mouse as the events winit sends, and the Joy-Con as the gamepad
+//!   gilrs reports elsewhere, which benilla-pad plays.
 
 // Links what libnx gives std (getrandom, sysconf) and the getrandom crates' backends.
 extern crate benilla_horizon;
@@ -32,6 +33,8 @@ pub(crate) fn prepare() {
         fn wownx_black_screen();
         /// benilla-horizon's net.c: 0, or the libnx result.
         fn wownx_network_init() -> u32;
+        /// benilla-horizon's update.c: the look for a newer release, on its own thread.
+        fn wownx_update_start();
     }
     unsafe { wownx_black_screen() };
     NETWORK.store(unsafe { wownx_network_init() }, std::sync::atomic::Ordering::Relaxed);
@@ -59,6 +62,9 @@ pub(crate) fn prepare() {
             }
         }
     }
+    // A release looks for a newer one on GitHub while the game loads, and offers it when the renderer takes the
+    // window (benilla-horizon's update.c; benilla.env's WOWNX_UPDATE=0 turns it off).
+    unsafe { wownx_update_start() };
     std::env::set_var("BEVY_ASSET_ROOT", "sdmc:/wow-nx");
     if std::env::var_os("WOW_DATA").is_none() {
         std::env::set_var("WOW_DATA", "sdmc:/wow-nx/Data");
@@ -199,21 +205,17 @@ fn run(mut app: App) -> AppExit {
     })
 }
 
-/// libnx's HID, as the events winit would send: a USB keyboard and mouse pass straight through; touch moves the
-/// cursor and taps the left button; the Joy-Con play the keys and the mouse.
-///
-/// | Joy-Con | as | | Joy-Con | as |
-/// |---|---|---|---|---|
-/// | left stick | W A S D | | right stick | the cursor; with ZL held, the camera (right-drag) |
-/// | ZR | left button | | ZL | right button |
-/// | A | Space | | B | Escape |
-/// | X | Tab | | Y | 1 |
-/// | L / R | Q / E | | + | Enter |
-/// | D-pad up, right, down, left | 2, 3, 4, 5 | | − | M |
-/// | right stick press | the system keyboard, for the focused text box | | both sticks pressed | the fps overlay |
+/// libnx's HID, as the events winit and gilrs would send: a USB keyboard and mouse pass straight through; touch moves
+/// the cursor and taps the left button; the Joy-Con are bevy's gamepad, which benilla-pad plays (its README has the
+/// layout; bevy names buttons by position, so the bottom face button, B, is its South, "A" on its Xbox prompts).
+/// `WOWNX_FPS=1` in benilla.env shows the fps overlay.
 ///
 /// A tap or click on a text box opens the system keyboard too ([`input::system_keyboard`]).
 mod input {
+    use bevy::input::gamepad::{
+        GamepadAxis, GamepadButton, GamepadConnection, GamepadConnectionEvent, RawGamepadAxisChangedEvent,
+        RawGamepadButtonChangedEvent, RawGamepadEvent,
+    };
     use bevy::input::keyboard::{Key, KeyCode, KeyboardInput, NativeKey};
     use bevy::input::mouse::{MouseButton, MouseButtonInput, MouseMotion, MouseScrollUnit, MouseWheel};
     use bevy::input::ButtonState;
@@ -306,40 +308,41 @@ mod input {
     const DOWN: u64 = 1 << 15;
     const STICK_L: u64 = 1 << 4;
     const STICK_R: u64 = 1 << 5;
-    /// Buttons that play a key.
-    const KEYS: [(u64, KeyCode); 10] = [
-        (A, KeyCode::Space),
-        (B, KeyCode::Escape),
-        (X, KeyCode::Tab),
-        (Y, KeyCode::Digit1),
-        (L, KeyCode::KeyQ),
-        (R, KeyCode::KeyE),
-        (PLUS, KeyCode::Enter),
-        (MINUS, KeyCode::KeyM),
-        (UP, KeyCode::Digit2),
-        (RIGHT, KeyCode::Digit3),
+    /// The Joy-Con's buttons as bevy's gamepad buttons, by position as bevy names them: B is the bottom (South).
+    const BUTTONS: [(u64, GamepadButton); 16] = [
+        (B, GamepadButton::South),
+        (A, GamepadButton::East),
+        (Y, GamepadButton::West),
+        (X, GamepadButton::North),
+        (L, GamepadButton::LeftTrigger),
+        (R, GamepadButton::RightTrigger),
+        (ZL, GamepadButton::LeftTrigger2),
+        (ZR, GamepadButton::RightTrigger2),
+        (PLUS, GamepadButton::Start),
+        (MINUS, GamepadButton::Select),
+        (STICK_L, GamepadButton::LeftThumb),
+        (STICK_R, GamepadButton::RightThumb),
+        (UP, GamepadButton::DPadUp),
+        (DOWN, GamepadButton::DPadDown),
+        (LEFT, GamepadButton::DPadLeft),
+        (RIGHT, GamepadButton::DPadRight),
     ];
-    const MORE_KEYS: [(u64, KeyCode); 2] = [(DOWN, KeyCode::Digit4), (LEFT, KeyCode::Digit5)];
-    /// A stick past this (of ±32767) is pressed.
-    const DEAD: i32 = 9000;
-    /// Cursor speed of the right stick at full tilt, logical px per second.
-    const CURSOR_SPEED: f32 = 900.0;
 
     /// What was down last frame, to send presses and releases as winit does.
     pub(super) struct Hid {
         pad: PadState,
         keys: [u64; 4],
         mouse_buttons: u32,
-        pad_keys: Vec<KeyCode>,
+        /// The Joy-Con's gamepad entity, once announced, and what it last reported.
+        gamepad: Option<Entity>,
         pad_buttons: u64,
+        pad_axes: [f32; 4],
         touching: bool,
         cursor: Vec2,
         last_mouse: (i32, i32),
-        /// A left press this frame (a tap, ZR, the mouse), and the right stick pressed in: either may open the
-        /// system keyboard.
+        /// A left press this frame (a tap, the mouse): it may open the system keyboard.
         tapped: bool,
-        keyboard_asked: bool,
-        /// The fps overlay ([`fps_overlay`]), both sticks pressed together.
+        /// The fps overlay ([`fps_overlay`]): `WOWNX_FPS=1` in benilla.env.
         pub(super) overlay: bool,
     }
 
@@ -358,14 +361,14 @@ mod input {
                 pad,
                 keys: [0; 4],
                 mouse_buttons: 0,
-                pad_keys: Vec::new(),
+                gamepad: None,
                 pad_buttons: 0,
+                pad_axes: [0.0; 4],
                 touching: false,
                 cursor: Vec2::new(640.0, 360.0),
                 last_mouse: (0, 0),
                 tapped: false,
-                keyboard_asked: false,
-                overlay: false,
+                overlay: std::env::var("WOWNX_FPS").is_ok_and(|v| v == "1"),
             }
         }
     }
@@ -373,7 +376,11 @@ mod input {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn read(
         mut hid: NonSendMut<Hid>,
-        time: Res<Time>,
+        mut commands: Commands,
+        mut connections: MessageWriter<GamepadConnectionEvent>,
+        mut gamepad_events: MessageWriter<RawGamepadEvent>,
+        mut button_events: MessageWriter<RawGamepadButtonChangedEvent>,
+        mut axis_events: MessageWriter<RawGamepadAxisChangedEvent>,
         mut windows: Query<(Entity, &mut Window), With<PrimaryWindow>>,
         mut keys: MessageWriter<KeyboardInput>,
         mut buttons: MessageWriter<MouseButtonInput>,
@@ -384,6 +391,10 @@ mod input {
         let Ok((window, mut win)) = windows.single_mut() else { return };
         let hid = &mut *hid;
         let size = Vec2::new(win.width(), win.height());
+        // benilla-pad moves the cursor through the window: the mouse and touch carry on from where it left it.
+        if let Some(at) = win.cursor_position() {
+            hid.cursor = at;
+        }
         let start = hid.cursor;
         let mut key = |code: KeyCode, pressed: bool, shift: bool| {
             let (logical, text) = logical(code, shift);
@@ -412,58 +423,45 @@ mod input {
             hid.keys = kb.keys;
         }
 
-        // Joy-Con.
+        // Joy-Con: bevy's gamepad, as bevy_gilrs reports one (connection, then raw button and axis changes); bevy's
+        // input pass turns them into the `Gamepad` benilla-pad reads.
         unsafe { padUpdate(&mut hid.pad) };
+        let gamepad = match hid.gamepad {
+            Some(g) => g,
+            None => {
+                let g = commands.spawn_empty().id();
+                let event = GamepadConnectionEvent::new(
+                    g,
+                    GamepadConnection::Connected { name: "Joy-Con".into(), vendor_id: Some(0x057e), product_id: None },
+                );
+                gamepad_events.write(event.clone().into());
+                connections.write(event);
+                hid.gamepad = Some(g);
+                g
+            }
+        };
         let held = hid.pad.buttons_cur;
-        let [ls, rs] = hid.pad.sticks;
-        let mut want: Vec<KeyCode> = KEYS.iter().chain(MORE_KEYS.iter()).filter(|(b, _)| held & b != 0).map(|(_, k)| *k).collect();
-        if ls[1] > DEAD {
-            want.push(KeyCode::KeyW);
-        }
-        if ls[1] < -DEAD {
-            want.push(KeyCode::KeyS);
-        }
-        if ls[0] < -DEAD {
-            want.push(KeyCode::KeyA);
-        }
-        if ls[0] > DEAD {
-            want.push(KeyCode::KeyD);
-        }
-        for k in hid.pad_keys.clone() {
-            if !want.contains(&k) {
-                key(k, false, false);
-            }
-        }
-        for k in &want {
-            if !hid.pad_keys.contains(k) {
-                key(*k, true, false);
-            }
-        }
-        hid.pad_keys = want;
-        for (bit, button) in [(ZR, MouseButton::Left), (ZL, MouseButton::Right)] {
+        for (bit, button) in BUTTONS {
             if (held ^ hid.pad_buttons) & bit != 0 {
-                let state = if held & bit != 0 { ButtonState::Pressed } else { ButtonState::Released };
-                buttons.write(MouseButtonInput { button, state, window });
+                let value = if held & bit != 0 { 1.0 } else { 0.0 };
+                gamepad_events.write(RawGamepadButtonChangedEvent::new(gamepad, button, value).into());
+                button_events.write(RawGamepadButtonChangedEvent::new(gamepad, button, value));
             }
-        }
-        let pressed = held & !hid.pad_buttons;
-        hid.tapped = pressed & ZR != 0;
-        let sticks = STICK_L | STICK_R;
-        if held & sticks == sticks && pressed & sticks != 0 {
-            hid.overlay = !hid.overlay;
-        } else {
-            hid.keyboard_asked = pressed & STICK_R != 0 && held & STICK_L == 0;
         }
         hid.pad_buttons = held;
-        let tilt = |v: i32| if v.abs() > DEAD / 2 { v as f32 / 32767.0 } else { 0.0 };
-        let (rx, ry) = (tilt(rs[0]), -tilt(rs[1]));
-        if rx != 0.0 || ry != 0.0 {
-            let step = Vec2::new(rx, ry) * CURSOR_SPEED * time.delta_secs();
-            if held & ZL != 0 {
-                // Right button held: the camera turns, the cursor stays.
-                motion.write(MouseMotion { delta: step });
-            } else {
-                hid.cursor = (hid.cursor + step).clamp(Vec2::ZERO, size);
+        let [ls, rs] = hid.pad.sticks;
+        let axes = [
+            (GamepadAxis::LeftStickX, ls[0]),
+            (GamepadAxis::LeftStickY, ls[1]),
+            (GamepadAxis::RightStickX, rs[0]),
+            (GamepadAxis::RightStickY, rs[1]),
+        ];
+        for (i, (axis, raw)) in axes.into_iter().enumerate() {
+            let value = (raw as f32 / 32767.0).clamp(-1.0, 1.0);
+            if value != hid.pad_axes[i] {
+                gamepad_events.write(RawGamepadAxisChangedEvent::new(gamepad, axis, value).into());
+                axis_events.write(RawGamepadAxisChangedEvent::new(gamepad, axis, value));
+                hid.pad_axes[i] = value;
             }
         }
 
@@ -525,21 +523,21 @@ mod input {
         fn wownx_keyboard(initial: *const core::ffi::c_char, password: i32, out: *mut u8, size: usize) -> i32;
     }
 
-    /// The system keyboard for the focused text box: on a tap on the box, after the UI pass has given it the focus,
-    /// or on the right stick pressed in. What the player typed replaces the box's text, typed in as a paste is, so
-    /// the box's own rules and events apply.
+    /// The system keyboard for a text box: on a tap or a click on the box (benilla-pad's cursor clicks too), after the
+    /// UI pass has given it the focus. What the player typed replaces the box's text, typed in as a paste is, so the
+    /// box's own rules and events apply.
     pub(super) fn system_keyboard(
         mut hid: NonSendMut<Hid>,
         script: Option<NonSendMut<benilla_ui::script::UiScript>>,
         hover: Res<crate::ui_script::PlayerUiHover>,
+        mouse: Res<ButtonInput<MouseButton>>,
     ) {
-        let (tapped, asked) = (core::mem::take(&mut hid.tapped), core::mem::take(&mut hid.keyboard_asked));
+        let tapped = core::mem::take(&mut hid.tapped) || mouse.just_pressed(MouseButton::Left);
         let Some(mut script) = script else { return };
-        if !tapped && !asked {
+        if !tapped {
             return;
         }
-        // A tap opens it over the box only; the stick, over whichever box has the focus.
-        let target = if tapped && !asked { hover.0 } else { script.focused_editbox_id() };
+        let target = hover.0;
         let Some((text, password)) = target.and_then(|id| script.focused_editbox_text(id)) else { return };
         let initial = std::ffi::CString::new(text).unwrap_or_default();
         let mut out = [0u8; 512];

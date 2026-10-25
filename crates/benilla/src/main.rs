@@ -4,7 +4,7 @@
 use benilla_app::BuildId;
 
 fn main() -> benilla_app::AppExit {
-    benilla_app::run(BuildId {
+    let build = BuildId {
         version: env!("CARGO_PKG_VERSION"),
         describe: env!("BENILLA_GIT_DESCRIBE"),
         sha: env!("BENILLA_GIT_SHA"),
@@ -13,5 +13,12 @@ fn main() -> benilla_app::AppExit {
         profile: env!("BENILLA_PROFILE"),
         project_dir: env!("BENILLA_PROJECT_DIR"),
         ..Default::default()
-    })
+    };
+    // wow-nx: the Switch plays with the Joy-Con, through benilla-pad.
+    #[cfg(target_os = "horizon")]
+    return benilla_app::run_with(build, |app| {
+        app.add_plugins(benilla_pad::PadPlugin);
+    });
+    #[cfg(not(target_os = "horizon"))]
+    benilla_app::run(build)
 }
