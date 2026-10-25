@@ -901,10 +901,15 @@ impl WorldSession {
     /// no new authentication. The cipher keeps the state each direction reached, and the reads
     /// wait with the handshake's bound again, as every park step awaits one reply.
     pub fn rejoin(reader: WorldReader, writer: WorldWriter) -> Result<Self> {
-        // The read half shares the write half's socket; dropped here, the writer holds the only handle.
+        // The read half shares the write half's socket; dropped here, the writer holds the only handle. Named and
+        // dropped by hand: a field left to `..` lives until the function returns, past the unwrap below.
         let WorldReader {
-            decrypter, link, ..
+            stream: read_stream,
+            decrypter,
+            link,
+            ..
         } = reader;
+        drop(read_stream);
         let stream = Arc::try_unwrap(writer.stream)
             .map_err(|_| anyhow!("rejoining the world session: its socket is still shared"))?;
         let session = WorldSession {
