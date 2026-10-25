@@ -33,10 +33,14 @@ void wownx_black_screen(void) {
     }
 }
 
-// The window, back for deko3d's swapchain: called by the backend before dkSwapchainCreate.
+void wownx_update_offer(void);
+
+// The window, back for deko3d's swapchain: called by the backend before dkSwapchainCreate. A newer release the updater
+// found meanwhile is offered first (update.c), on the window just freed.
 void wownx_release_start_screen(void) {
     if (fb_open) {
         framebufferClose(&fb);
         fb_open = false;
     }
+    wownx_update_offer();
 }
