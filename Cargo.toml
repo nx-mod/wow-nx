@@ -105,6 +105,16 @@ incremental = false
 [profile.switch.package."*"]
 codegen-units = 16
 
+# wow-nx: a release for the Switch (`WOWNX_SHIP=1 switch/build-benilla.sh`): `switch` with every dependency in one
+# codegen unit, so Bevy's small hot functions inline within their crates (the profile's top entries were parameter
+# checks and table lookups left as calls); upstream measured 16 units at +1.2 cpu_ms on desktop. Our crates stay at
+# 16: `benilla-app` in one unit does not fit the phone that builds it. Build it single-job.
+[profile.switch-ship]
+inherits = "switch"
+
+[profile.switch-ship.package."*"]
+codegen-units = 1
+
 [profile.ship]
 inherits = "release"
 lto = "fat"
