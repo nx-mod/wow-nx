@@ -211,6 +211,21 @@ pub use benilla_protocol::{messages::ObjectType, ObjectFields};
 pub use net::Objects;
 pub use target::Interact;
 
+/// wow-nx: the UI VM with benilla's call host lent, for a crate on top (benilla-pad): the Lua it runs, a binding
+/// command or an addon event, makes its calls into the engine inside the verb, as benilla's own systems' do; without
+/// the host such a call is refused ("no call host is lent").
+#[derive(bevy::ecs::system::SystemParam)]
+pub struct ScriptVm<'w, 's> {
+    vm: script_calls::HostedVm<'w, 's>,
+}
+
+impl ScriptVm<'_, '_> {
+    /// Run `f` on the VM with the host lent; `f` gets `None` before there is a VM.
+    pub fn run<R>(&mut self, f: impl FnOnce(Option<&mut benilla_ui::script::UiScript>) -> R) -> R {
+        self.vm.run(f)
+    }
+}
+
 /// Builds and runs the client app. `build` is the launcher's compile-time git stamp, passed in as
 /// data so the sha lives in the shim's fingerprint and a commit does not recompile this crate.
 pub fn run(build: BuildId) -> AppExit {

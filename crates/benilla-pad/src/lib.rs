@@ -45,8 +45,57 @@ impl Plugin for PadPlugin {
         app.insert_resource(PadSettings::from_env())
             .init_resource::<PadState>()
             .add_systems(Startup, addon::install_addon)
-            .add_systems(PreUpdate, drive_pad.after(InputSystems));
+            .add_systems(PreUpdate, (drive_pad, run_calls).chain().after(InputSystems));
     }
+}
+
+/// A Lua call a press makes: a binding command down or up, an addon event, a chunk.
+enum Call {
+    Binding(String, bool),
+    Event(String, Vec<ScriptValue>),
+    Chunk(String),
+}
+
+/// The frame's calls, in order. Upstream runs every script call with its call host lent, so a call into the engine
+/// (a target, a cast, mouselook) applies inside the verb; the host holds most of the game's state and cannot share a
+/// system with [`drive_pad`]'s window, mouse and keys, so the pad queues its calls and [`run_calls`] makes them
+/// right after, in the same frame. Reads (the addon's mode, a resolve, a snap) stay in place.
+static CALLS: std::sync::Mutex<Vec<Call>> = std::sync::Mutex::new(Vec::new());
+
+fn queue(call: Call) {
+    CALLS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(call);
+}
+
+/// Make the frame's queued calls on the VM, with the call host lent.
+fn run_calls(mut vm: benilla_app::ScriptVm) {
+    let calls = std::mem::take(&mut *CALLS.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+    if calls.is_empty() {
+        return;
+    }
+    vm.run(|script| {
+        let Some(script) = script else { return };
+        for call in calls {
+            match call {
+                Call::Binding(command, true) => match script.execute_binding(&command, true) {
+                    Ok(true) => {}
+                    Ok(false) => warn!("pad: no binding command {command}"),
+                    Err(e) => warn!("pad: {command} down failed: {e}"),
+                },
+                // `Ok(false)` is a command that is not `runOnUp`: nothing to run.
+                Call::Binding(command, false) => {
+                    if let Err(e) = script.execute_binding(&command, false) {
+                        warn!("pad: {command} up failed: {e}");
+                    }
+                }
+                Call::Event(event, args) => script.fire_event(&event, args),
+                Call::Chunk(lua) => {
+                    if let Err(e) = script.run(&lua) {
+                        warn!("pad: {lua} failed: {e}");
+                    }
+                }
+            }
+        }
+    });
 }
 
 /// Tuning. The addon's settings apply once it loads; an environment variable wins over both.
@@ -184,26 +233,20 @@ struct PadState {
 const INTERACT_RETRY_SECS: f32 = 0.3;
 const LOOT_SHIFT_SECS: f32 = 1.5;
 
-fn fire(script: &mut UiScript, event: &str, args: Vec<ScriptValue>) {
-    script.fire_event(event, args);
+// wow-nx: the three queue their call for [`run_calls`]; `_script` stays so the callers read as before.
+fn fire(_script: &mut UiScript, event: &str, args: Vec<ScriptValue>) {
+    queue(Call::Event(event.to_owned(), args));
 }
 
-fn press(script: &UiScript, command: &str) {
-    match script.execute_binding(command, true) {
-        Ok(true) => {}
-        Ok(false) => warn!("pad: no binding command {command}"),
-        Err(e) => warn!("pad: {command} down failed: {e}"),
-    }
+fn press(_script: &UiScript, command: &str) {
+    queue(Call::Binding(command.to_owned(), true));
 }
 
-fn release(script: &UiScript, command: &str) {
-    // `Ok(false)` is a command that is not `runOnUp`: nothing to run.
-    if let Err(e) = script.execute_binding(command, false) {
-        warn!("pad: {command} up failed: {e}");
-    }
+fn release(_script: &UiScript, command: &str) {
+    queue(Call::Binding(command.to_owned(), false));
 }
 
-fn set_look(script: &UiScript, state: &mut PadState, on: bool) {
+fn set_look(_script: &UiScript, state: &mut PadState, on: bool) {
     if state.looking == on {
         return;
     }
@@ -212,9 +255,7 @@ fn set_look(script: &UiScript, state: &mut PadState, on: bool) {
     } else {
         "MouselookStop()"
     };
-    if let Err(e) = script.run(lua) {
-        warn!("pad: {lua} failed: {e}");
-    }
+    queue(Call::Chunk(lua.to_owned()));
     state.looking = on;
 }
 
@@ -558,9 +599,7 @@ fn drive_pad(
         } else {
             "CameraZoomOut"
         };
-        if let Err(e) = script.run(&format!("{verb}({yards})")) {
-            warn!("pad: {verb} failed: {e}");
-        }
+        queue(Call::Chunk(format!("{verb}({yards})")));
     }
     set_look(
         &script,
