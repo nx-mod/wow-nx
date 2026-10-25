@@ -66,6 +66,18 @@ fn queue(call: Call) {
     CALLS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(call);
 }
 
+/// `value` as a Lua literal.
+fn lua_value(value: &ScriptValue) -> String {
+    match value {
+        ScriptValue::Nil => "nil".to_string(),
+        ScriptValue::Bool(b) => b.to_string(),
+        ScriptValue::Int(i) => i.to_string(),
+        ScriptValue::Number(n) if n.is_finite() => format!("{n:?}"),
+        ScriptValue::Number(_) => "0".to_string(),
+        ScriptValue::Str(s) => map::lua_str(s),
+    }
+}
+
 /// Make the frame's queued calls on the VM, with the call host lent.
 fn run_calls(mut vm: benilla_app::ScriptVm) {
     let calls = std::mem::take(&mut *CALLS.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
@@ -101,7 +113,20 @@ fn run_calls(mut vm: benilla_app::ScriptVm) {
                         warn!("pad: {command} up failed: {e}");
                     }
                 }
-                Call::Event(event, args) => script.fire_event(&event, args),
+                // wow-nx: the addon's own events reach it through BenillaPad_Event (its Core.lua): 1.12's
+                // RegisterEvent takes only the names in its event table, so a fired BENILLAPAD_* event reached no
+                // frame, and the addon never heard the pad connect or its menus a press.
+                Call::Event(event, args) => {
+                    let mut chunk = format!("if BenillaPad_Event then BenillaPad_Event({}", map::lua_str(&event));
+                    for arg in &args {
+                        chunk.push_str(", ");
+                        chunk.push_str(&lua_value(arg));
+                    }
+                    chunk.push_str(") end");
+                    if let Err(e) = script.run(&chunk) {
+                        warn!("pad: {event} failed: {e}");
+                    }
+                }
                 Call::Chunk(lua) => {
                     if let Err(e) = script.run(&lua) {
                         warn!("pad: {lua} failed: {e}");

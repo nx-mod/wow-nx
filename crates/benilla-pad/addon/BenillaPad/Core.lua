@@ -468,13 +468,10 @@ end
 
 local core = CreateFrame("Frame", "BenillaPadCore")
 core:RegisterEvent("ADDON_LOADED")
-core:RegisterEvent("BENILLAPAD_CONNECTED")
-core:RegisterEvent("BENILLAPAD_DISCONNECTED")
-core:RegisterEvent("BENILLAPAD_LAYER")
-core:RegisterEvent("BENILLAPAD_BUTTON")
-core:RegisterEvent("BENILLAPAD_NAV")
-core:RegisterEvent("BENILLAPAD_STICK")
-core:SetScript("OnEvent", function()
+
+-- wow-nx: the pad's own events (BENILLAPAD_*) come through BenillaPad_Event, below: 1.12's RegisterEvent registers
+-- only the names its event table has (benilla follows it), so a frame cannot register them.
+local function onEvent()
     if event == "ADDON_LOADED" then
         if arg1 ~= "BenillaPad" then
             return
@@ -503,7 +500,16 @@ core:SetScript("OnEvent", function()
             break
         end
     end
-end)
+end
+core:SetScript("OnEvent", onEvent)
+
+-- One of the pad's events, from the Rust side, with the globals an OnEvent handler reads.
+function BenillaPad_Event(name, a1, a2, a3, a4)
+    local saved = { event, arg1, arg2, arg3, arg4 }
+    event, arg1, arg2, arg3, arg4 = name, a1, a2, a3, a4
+    onEvent()
+    event, arg1, arg2, arg3, arg4 = saved[1], saved[2], saved[3], saved[4], saved[5]
+end
 
 -- The Key Bindings window's names for this addon's rows.
 BINDING_HEADER_BENILLAPAD = "BenillaPad (controller)"
