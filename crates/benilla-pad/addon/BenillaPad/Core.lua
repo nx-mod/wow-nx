@@ -34,6 +34,15 @@ local DEFAULT_ACTIONS = {
     ltrt = { A = "wheel", X = "consumables", B = "questitem", Y = "botwheel" },
 }
 
+-- wow-nx: a Nintendo pad's bare face buttons, named by place as above. A, Y and X (the right, left and top buttons) play
+-- action slots 1-3, the D-pad 4-7; B, the bottom one, jumps, and the right stick pressed interacts.
+local NINTENDO_INDEX = {
+    B = 1, X = 2, Y = 3, DUP = 4, DRIGHT = 5, DDOWN = 6, DLEFT = 7, A = 8, LB = 9, RB = 10, L3 = 11, R3 = 12,
+}
+local NINTENDO_ACTIONS = {
+    A = "jump", LB = "targetfriend", RB = "targetenemy", L3 = "autorun", R3 = "interact",
+}
+
 -- Start and Select on every layer.
 local SYSTEM_ACTIONS = { START = "wheel", SELECT = "menu" }
 
@@ -100,7 +109,7 @@ end
 
 -- The action slot a button owns on a layer; every button has one, whatever it is set to.
 function P.OwnSlot(btn, layer)
-    local index = SLOT_INDEX[btn]
+    local index = (P.style == "nintendo" and NINTENDO_INDEX or SLOT_INDEX)[btn]
     if not index or not SLOT_BASE[layer] then
         return nil
     end
@@ -237,7 +246,7 @@ function P.Binding(btn, layer)
         return "action", over.action
     end
     if not over and not (FACES[btn] and P.Setting("faceSpells")) then
-        local defaults = DEFAULT_ACTIONS[layer]
+        local defaults = (P.style == "nintendo" and layer == "bare") and NINTENDO_ACTIONS or DEFAULT_ACTIONS[layer]
         if defaults and defaults[btn] then
             return "action", defaults[btn]
         end
@@ -390,25 +399,18 @@ function P.Symbols()
     return chosen
 end
 
--- A Nintendo pad's face buttons arrive by their letters (wow-nx's Joy-Con layer reports the Switch's A as A), so only
--- the rest is named its way: L / R, ZL / ZR, the sticks pressed (LS / RS) and + / -.
-local NINTENDO_NAME = {
+-- A Nintendo pad names L / R, ZL / ZR, the sticks pressed (LS / RS) and + / - its way.
+local NINTENDO_HINT = {
     LB = "L", RB = "R", LT = "ZL", RT = "ZR", L3 = "LS", R3 = "RS", Start = "+", Select = "-",
 }
-
--- Where a face button sits, as the Xbox spot it takes: a Nintendo pad has A on the right, B at the bottom, X on top
--- and Y on the left.
-local NINTENDO_SPOT = { A = "B", B = "A", X = "Y", Y = "X" }
-
--- The spot to draw button `key` at, in a diagram laid out as an Xbox pad.
-function P.Spot(key)
-    if P.Symbols() == "nintendo" then
-        return NINTENDO_SPOT[key] or key
-    end
-    return key
+-- A pad button is named by its place as an Xbox pad's (A the bottom); a Nintendo pad prints other letters there
+-- (B at the bottom, A on the right, Y on the left, X on top).
+local NINTENDO_NAME = { A = "B", B = "A", X = "Y", Y = "X" }
+for k, v in pairs(NINTENDO_HINT) do
+    NINTENDO_NAME[k] = v
 end
 
--- A button's name under the symbols drawn.
+-- The letter printed on button `name` (a place's name) under the symbols drawn.
 function P.Name(name)
     if P.Symbols() == "nintendo" then
         return NINTENDO_NAME[name] or name
@@ -416,12 +418,14 @@ function P.Name(name)
     return name
 end
 
--- A line of text with its button names as the symbols drawn name them.
+-- A window's hint line with its button names as the symbols drawn name them. A window's A and B are already a
+-- Nintendo pad's printed A and B (wow-nx's pad layer hands the windows the letters, benilla-pad's `map::letter`), so
+-- only the rest is renamed.
 function P.Hint(text)
     if P.Symbols() ~= "nintendo" then
         return text
     end
-    return (string.gsub(text, "(%w+)", function(word) return NINTENDO_NAME[word] or word end))
+    return (string.gsub(text, "(%w+)", function(word) return NINTENDO_HINT[word] or word end))
 end
 
 -- Put every setting back to its default.

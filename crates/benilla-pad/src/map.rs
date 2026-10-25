@@ -22,6 +22,19 @@ pub const BUTTONS: [(GamepadButton, &str); 14] = [
     (GamepadButton::Select, "SELECT"),
 ];
 
+/// wow-nx: on a Nintendo pad, the name a face button goes by on the menus, the cursor and the login screens: its
+/// printed letter, which sits elsewhere than an Xbox pad's (A on the right, B at the bottom), so A confirms and B backs
+/// out there. In the world the buttons keep their places' names (the bottom one, B, jumps).
+pub fn letter(name: &'static str) -> &'static str {
+    match name {
+        "A" => "B",
+        "B" => "A",
+        "X" => "Y",
+        "Y" => "X",
+        other => other,
+    }
+}
+
 /// The layer the triggers hold, by the addon's name.
 pub fn layer(lt: bool, rt: bool) -> &'static str {
     match (lt, rt) {

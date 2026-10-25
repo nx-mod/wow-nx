@@ -388,6 +388,7 @@ fn drive_pad(
 
     // ── The addon: its mode and settings ──
     let addon = mode.is_some();
+    let nintendo = pad.is_some_and(|g| map::style(g.vendor_id()) == "nintendo");
     let mode = mode.unwrap_or_else(|| "world".to_string());
     let cursor = mode == "cursor";
     // The addon's own windows (menu, wheel, keybinds) take every button; the cursor mode plays on.
@@ -492,19 +493,21 @@ fn drive_pad(
                 "BENILLAPAD_BUTTON",
                 vec![ScriptValue::Str(name.to_string()), ScriptValue::Bool(true)],
             );
+            // wow-nx: the windows and the cursor take a Nintendo pad's printed letters, so A confirms there.
+            let letter = if nintendo { map::letter(name) } else { name };
             if !world {
                 fire(
                     &mut script,
                     "BENILLAPAD_NAV",
-                    vec![ScriptValue::Str(name.to_string()), ScriptValue::Bool(true)],
+                    vec![ScriptValue::Str(letter.to_string()), ScriptValue::Bool(true)],
                 );
-                state.buttons.push((button, name, Latched::Nav));
+                state.buttons.push((button, letter, Latched::Nav));
                 continue;
             }
             if cursor {
                 if let Some(latched) = cursor_press(
                     &script,
-                    name,
+                    letter,
                     window.as_deref_mut(),
                     &mut mouse,
                     &mut scroll,
@@ -641,10 +644,16 @@ enum GlueInput {
 /// (back, Cancel), the D-pad is the arrow keys (the character and realm lists), Y is Tab (the
 /// next box), X clicks, and the right stick moves the cursor. These are the keys the screens
 /// read (`login`, `realm_select`, `char_select`).
-fn glue_input(button: GamepadButton) -> Option<GlueInput> {
+fn glue_input(button: GamepadButton, nintendo: bool) -> Option<GlueInput> {
+    // A Nintendo pad confirms with A, its right face button, and backs out with B, its bottom one.
+    let (confirm, back) = if nintendo {
+        (GamepadButton::East, GamepadButton::South)
+    } else {
+        (GamepadButton::South, GamepadButton::East)
+    };
     Some(match button {
-        GamepadButton::South => GlueInput::Key(KeyCode::Enter),
-        GamepadButton::East => GlueInput::Key(KeyCode::Escape),
+        b if b == confirm => GlueInput::Key(KeyCode::Enter),
+        b if b == back => GlueInput::Key(KeyCode::Escape),
         GamepadButton::DPadUp => GlueInput::Key(KeyCode::ArrowUp),
         GamepadButton::DPadDown => GlueInput::Key(KeyCode::ArrowDown),
         GamepadButton::DPadLeft => GlueInput::Key(KeyCode::ArrowLeft),
@@ -718,11 +727,12 @@ fn drive_glue(
     let Some(pad) = pad else {
         return;
     };
+    let nintendo = map::style(pad.vendor_id()) == "nintendo";
     for (button, _) in map::BUTTONS {
         if !pad.just_pressed(button) {
             continue;
         }
-        if let Some(input) = glue_input(button) {
+        if let Some(input) = glue_input(button, nintendo) {
             match input {
                 GlueInput::Key(k) => glue_key(k, true, keys, events),
                 GlueInput::Mouse(b) => mouse.press(b),

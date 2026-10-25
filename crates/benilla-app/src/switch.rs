@@ -355,15 +355,14 @@ mod input {
     const DOWN: u64 = 1 << 15;
     const STICK_L: u64 = 1 << 4;
     const STICK_R: u64 = 1 << 5;
-    /// The Joy-Con's buttons as bevy's gamepad buttons. The face buttons go by their letters, not their places: bevy
-    /// names them by place as an Xbox pad's (South is its A), and benilla-pad gives each name its job (A confirms
-    /// and clicks, B backs out), so the Switch's A is reported as South and its B as East, X as West and Y as North.
-    /// The addon draws each letter where it sits on a Nintendo pad (its Bar.lua).
+    /// The Joy-Con's buttons as bevy's gamepad buttons, by place as bevy names them: the bottom face button, B, is
+    /// South. In the world benilla-pad plays by place (the bottom button jumps); on its menus, the cursor and the login
+    /// screens a Nintendo pad confirms with A and backs out with B (benilla-pad's `map::letter`).
     const BUTTONS: [(u64, GamepadButton); 16] = [
-        (A, GamepadButton::South),
-        (B, GamepadButton::East),
-        (X, GamepadButton::West),
-        (Y, GamepadButton::North),
+        (B, GamepadButton::South),
+        (A, GamepadButton::East),
+        (Y, GamepadButton::West),
+        (X, GamepadButton::North),
         (L, GamepadButton::LeftTrigger),
         (R, GamepadButton::RightTrigger),
         (ZL, GamepadButton::LeftTrigger2),

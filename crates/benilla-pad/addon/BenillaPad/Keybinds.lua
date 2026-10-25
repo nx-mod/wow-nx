@@ -235,7 +235,7 @@ local function newCell(btn)
     local c = CreateFrame("Button", "BenillaPadBindCell" .. btn, win)
     c:SetWidth(CELL)
     c:SetHeight(CELL)
-    c:SetPoint("CENTER", win, "CENTER", PLACE[P.Spot(btn)][1], PLACE[P.Spot(btn)][2])
+    c:SetPoint("CENTER", win, "CENTER", PLACE[btn][1], PLACE[btn][2])
     c.btn = btn
     local slot = c:CreateTexture(nil, "BACKGROUND")
     slot:SetTexture("Interface\\Buttons\\UI-Quickslot")
@@ -300,11 +300,6 @@ function Binds.Refresh()
     if not win:IsVisible() then
         return
     end
-    -- Each cell where its button sits on the pad drawn (a Nintendo pad's face letters sit elsewhere).
-    for btn, c in pairs(Binds.cells) do
-        c:ClearAllPoints()
-        c:SetPoint("CENTER", win, "CENTER", PLACE[P.Spot(btn)][1], PLACE[P.Spot(btn)][2])
-    end
     local layer = Binds.Layer()
     for i = 1, table.getn(tabs) do
         local t = tabs[i]
@@ -337,7 +332,7 @@ function Binds.Refresh()
     if layer ~= "bare" and P.FormKey() > 0 then
         formNote = "   |cff66bbff(" .. (P.FormName() or "this form") .. "'s own set)|r"
     end
-    described:SetText(prefix .. P.Hint(BUTTON_TITLE[Binds.selected]) .. ":  " .. (name or "Empty") .. formNote)
+    described:SetText(prefix .. P.Name(BUTTON_TITLE[Binds.selected]) .. ":  " .. (name or "Empty") .. formNote)
     if Binds.capture then
         hints:SetText("|cffffd100Press the combo|r to bind " .. Binds.capture.label
             .. P.Hint(" (hold LT / RT for their layers).   Select: cancel"))
@@ -351,10 +346,9 @@ end
 
 -- The nearest cell from `from` in a D-pad direction.
 local function step(from, dir)
-    local fx, fy = PLACE[P.Spot(from)][1], PLACE[P.Spot(from)][2]
+    local fx, fy = PLACE[from][1], PLACE[from][2]
     local best, bestScore
-    for btn in pairs(PLACE) do
-        local at = PLACE[P.Spot(btn)]
+    for btn, at in pairs(PLACE) do
         local dx, dy = at[1] - fx, at[2] - fy
         local along, across
         if dir == "DUP" then along, across = dy, dx
@@ -433,7 +427,7 @@ function Binds.capture_label_done(btn)
     if layer ~= "bare" then
         prefix = P.Hint(LAYER_TITLE[layer]) .. " + "
     end
-    return "to " .. prefix .. P.Hint(BUTTON_TITLE[btn])
+    return "to " .. prefix .. P.Name(BUTTON_TITLE[btn])
 end
 
 -- Bind `entry` to the next combo pressed.
