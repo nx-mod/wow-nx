@@ -1345,7 +1345,12 @@ impl crate::Device for Device {
         {
             maker.flags |= DkImageFlags_Usage2DEngine;
         }
-        maker.flags |= DkImageFlags_HwCompression;
+        // Hardware compression only where the GPU renders: a render target's writes go through the compressing raster
+        // path, but a sampled texture is filled by copy-engine transfers, and with the flag on one drew with chunks
+        // missing (status bars, a squeezed texture sampled from its lower mips).
+        if desc.usage.intersects(render_usage) {
+            maker.flags |= DkImageFlags_HwCompression;
+        }
 
         let mut layout = unsafe { core::mem::zeroed::<DkImageLayout>() };
         unsafe { dkImageLayoutInitialize(&mut layout, &maker) };
