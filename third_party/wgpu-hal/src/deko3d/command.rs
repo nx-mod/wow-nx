@@ -499,6 +499,10 @@ impl crate::CommandEncoder for CommandEncoder {
     {
         let c = self.cmd();
         let is_3d = src.is_3d();
+        // dkCmdBufCopyImage measures a compressed image in blocks and, unlike its buffer copies, does not convert a
+        // texel rect itself: a BC rect in texels copied 16 times the area, past the layer and the image's memory, and
+        // hung the GPU (static-gx gathers BC textures into arrays this way).
+        let (bw, bh) = src.format.block_dimensions();
         for r in regions {
             let layers = if is_3d { 1 } else { r.size.depth };
             for layer in 0..layers {
@@ -507,11 +511,11 @@ impl crate::CommandEncoder for CommandEncoder {
                 b.array_layer += layer;
                 let (va, vb) = (subresource_view(src, &a, is_3d), subresource_view(dst, &b, dst.is_3d()));
                 let rect = |o: wgt::Origin3d| DkImageRect {
-                    x: o.x,
-                    y: o.y,
+                    x: o.x / bw,
+                    y: o.y / bh,
                     z: if is_3d { o.z } else { 0 },
-                    width: r.size.width,
-                    height: r.size.height,
+                    width: r.size.width.div_ceil(bw),
+                    height: r.size.height.div_ceil(bh),
                     depth: if is_3d { r.size.depth } else { 1 },
                 };
                 let (ra, rb) = (rect(a.origin), rect(b.origin));
