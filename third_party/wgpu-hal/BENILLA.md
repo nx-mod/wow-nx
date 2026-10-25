@@ -1,5 +1,9 @@
 # benilla's `wgpu-hal` fork — what differs from upstream, and how to check
 
+> **wow-nx:** this tree is also the Switch's renderer. Besides upstream's Vulkan patch below, `src/deko3d/` is a
+> deko3d backend that stands in for `gles` on `target_os = "horizon"` (`src/lib.rs`, `build.rs` and `Cargo.toml` select
+> it there; elsewhere the crate is upstream's). Its design and the rules it keeps are in `docs/SWITCH-RENDER.md`.
+
 Upstream: [`gfx-rs/wgpu`](https://github.com/gfx-rs/wgpu) (`wgpu-hal`), MIT OR Apache-2.0, version
 `27.0.4`, the version the workspace lock resolves to. Wired in through `[patch.crates-io]` in the
 workspace root. The crate is copied from the cargo registry as published (`src/`, `build.rs`,

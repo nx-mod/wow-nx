@@ -1,49 +1,67 @@
 # wow-nx: the Switch port
 
-Status (2026-10-24): **the client runs on the console.** It reaches the login screen (EULA and Terms accepted and
-saved), draws through our deko3d wgpu-hal backend at 30–60 fps, plays the glue music, and types with the system
-keyboard. Next: logging in to a server and playing. `main` mirrors upstream untouched.
+Status (2026-10-25): **playable, in progress.** It logs in to a 1.12.1 server (Kronos), enters the world and plays
+with the Joy-Con through benilla-pad, touch, or a USB keyboard and mouse. Performance numbers wait for the first
+tested release. Upstream is
+merged to 0bd7d053. Open below: a crash while the world loads in the latest builds, status bars drawn with chunks
+missing, and the main thread's speed. `main` mirrors upstream untouched.
 
-## What stands in the way
+## How the port works
 
-| Piece | On the PC | On the Switch | Work |
-|---|---|---|---|
-| Rust `std` | yes | none upstream: `aarch64-nintendo-switch-freestanding` is no_std | a custom target with `target_os = "horizon"`, `target_env = "newlib"` (the code path the 3DS target already uses in `std`), built with `-Zbuild-std` and linked against devkitA64's newlib and libnx |
-| Rendering | Bevy on wgpu (Vulkan/Metal/DX12) | deko3d only (no Vulkan on our Switch projects) | a wgpu-hal backend over deko3d, or Bevy's renderer replaced; the largest piece |
-| Audio | cpal | audout / audren | a small cpal host, or our own output |
-| Windowing, input | winit | libnx applet, HID | a winit-like event source for Bevy |
-| Files | the WoW folder | `sdmc:/wow-nx/` beside the NRO | paths only |
-| Threads, memory | OS | libnx threads, ~3.2 GB in an application | Bevy's task pools sized to 3 cores |
+| Piece | On the PC | On the Switch |
+|---|---|---|
+| Rust `std` | yes | a custom target, `aarch64-nintendo-switch-newlib` (`target_os = "horizon"`, the code path the 3DS target uses in `std`), built with `-Zbuild-std` against devkitA64's newlib and libnx; `third_party/libc` has Horizon's 64-bit and socket layouts (`third_party/libc/WOW-NX.md`) |
+| Rendering | Bevy on wgpu (Vulkan, Metal, DX12) | Bevy on wgpu on our deko3d wgpu-hal backend, in wgpu's GL slot ([SWITCH-RENDER.md](SWITCH-RENDER.md)); shaders go naga → GLSL → uam, cached on the SD card |
+| Audio | kira on cpal | kira on audout, at 48 kHz |
+| Window, input | winit | `crates/benilla-app/src/switch.rs`: libnx's default window, the applet loop, HID (touch, USB keyboard and mouse, the Joy-Con as Bevy's gamepad), the system keyboard |
+| Controller play | — | benilla-pad (`crates/benilla-pad`), with Nintendo button names and a Switch layout |
+| Files | the WoW folder | `sdmc:/wow-nx/Data` (the user's client) and `sdmc:/wow-nx/benilla-config`; `sdmc:/wow-nx/benilla.env` sets the login and switches |
+| Threads, memory | OS | libnx threads spread over the 3 cores, a compute worker per core, and a thread-caching allocator in front of newlib's malloc (`crates/benilla-horizon`) |
+| Updates | — | a numbered release looks for a newer `build-<n>` on GitHub while it loads (`update.c`, `switch/release.sh`) |
 
-## Order
+## Steps taken
 
-1. **std on Horizon:** a Rust hello world as an NRO that prints, allocates, spawns a thread and reads a file
-   on the console. Nothing else moves until this runs (`switch/hello/`).
-2. **The non-graphics crates** (`benilla-mpq`, `-dbc`, `-blp`, `-adt`, `-m2`, `-wmo`, `-lua`...) build for the target and
-   pass a console smoke test that opens the user's MPQs.
-3. **Rendering:** decide between a deko3d wgpu-hal backend and a narrower renderer, after measuring what Bevy needs.
-4. Audio, input, the app.
+1. `std` on Horizon: a Rust hello world as an NRO (`switch/hello/`).
+2. The non-graphics crates on the target, opening the user's MPQs on the console.
+3. The deko3d wgpu-hal backend: a cleared screen, then shaders, pipelines and Bevy (`switch/clear/`, `switch/cube/`).
+4. benilla: the login screen, a server login (Kronos), the world.
+5. The Joy-Con (benilla-pad), the launch picture, the updater, and the speed work in Open work.
 
 ## Open work
 
-Speed, found by measuring on the console (the backend logs every 300 frames; `WOWNX_GPU_PIPELINES=1` in
-`sdmc:/wow-nx/benilla.env` times each pipeline):
+Measured on the console: the backend logs fps and GPU time per pass every 300 frames (`WOWNX_GPU_PIPELINES=1` adds
+each pipeline), and `WOWNX_PROFILE=1` samples every thread 250 times a second into `sdmc:/wow-nx/samples.txt`, which
+`switch/profile.py` names from the ELF, with the lock a blocked thread waits on.
 
-- **Start-up tables load one at a time.** Each Startup loader holds the MPQ chain's mutex through its read and its
-  parse. Planned: a lock-free shared chain (`lock_recover()` hands out a copy: a `Chain` is a few `Arc` handles and
-  reads are `&self`). The first frame spends ~10 s on them. (The compute pool now has a worker per core, and threads
-  spread over the cores: benilla-horizon's thread.c.)
-- **Which material the world's GPU time goes to.** In the world `pbr_opaque_mesh_pipeline` is ~10.8 of ~18 ms, but
-  Bevy gives terrain, models and the sky that one label (their materials extend `StandardMaterial`): label the
-  pipelines per material in the timing to see which to work on.
-- **The GPU is the frame limit at the login screen** (~19.5 ms a frame): Bevy's PBR fragment shader is 93 registers
-  after folding its dead shadow paths (from 104), so few warps are in flight. Next: what keeps the rest live
-  (`switch/shadercheck` prints registers and scratch), and whether the clustered lights read faster from uniform
-  buffers than from storage buffers (`max_storage_buffers_per_shader_stage < 3` switches Bevy to them).
-- `deko3d: N blocks made` stays at ~50 per 300 frames: something above the buffer pool's 1 MiB still makes and frees
-  memory blocks.
-- Pipelines built during the first frames (~200 ms for 27) are hidden behind a black start; a warm cache of
-  translated shaders would shorten it.
+Bugs:
+
+- **A GPU timeout while the world loads** (kickoff `0xd5c`) since the gamepad bar first showed; seen with and without
+  multi-threaded Update/PostUpdate. A deko3d debug build (`WOWNX_DEKO3D_DEBUG=1`) names the work that hangs.
+- **Status bars with chunks missing** (health, cast bars; many, not all): the bar texture comes out wrong, not the
+  bar logic. `WOW_NO_BC=1` (DXT decoded on the CPU) splits our compressed-texture path from the rest.
+- **The minimap's terrain picture** was drawn beside its frame while the UI camera kept 1600x900; check it again now
+  that the window size is announced.
+
+Speed (profiles from test builds; release numbers come with the first tested release). In the world the main
+thread is the frame (~88 % busy); the workers and the render thread idle. Done: Bevy's compute pool has a worker per
+core and threads spread over the cores (`thread.c`); a thread-caching allocator took the main thread's waits on
+newlib's malloc lock from ~21 % to ~3 % of its samples. Next:
+
+- **Inlining.** The profile's top entries are small Bevy functions (parameter checks, table and resource lookups) that
+  a full build inlines. `[profile.switch]` has no LTO and 16 codegen units so the phone that builds it does not run
+  out of memory; dependencies at one codegen unit each (upstream measured +1.2 cpu_ms at 16 on desktop) is the next
+  experiment, built single-job.
+- **The call host's parameter checks** (`Appliers::validate_param`, ~4 %): every system that lends the host validates
+  its ~70 parts each frame.
+- **Multi-threaded Update/PostUpdate** (`WOW_MT_UPDATE=1`, `WOW_MT_POSTUPDATE=1`): upstream's switches; on the first
+  try the world load crashed, which turned out to happen without them too. Measure again once the crash is fixed.
+- **Start-up tables load one at a time**: each Startup loader holds the MPQ chain's mutex through its read and parse;
+  a lock-free shared chain would let them run together. The first frame spends ~10 s on them.
+- **GPU:** `pbr_opaque_mesh_pipeline` is ~9–11 of ~14–18 ms in the world, but terrain, models and the sky share that
+  label (their materials extend `StandardMaterial`): label them apart to see which to work on. Bevy's PBR fragment
+  shader is 93 registers after folding its dead shadow paths (from 104).
+- Pipelines built in the first frames are hidden behind the loading picture; a warm cache of translated shaders would
+  shorten the start.
 - Upstream #2305 (zone events every frame) and #1865 (frame pacer) are CPU per frame; left to upstream.
 
 Play without an outside server (an idea, not started):
@@ -65,8 +83,10 @@ To test:
   merged here). deko3d stays the Switch's renderer; trying Vulkan against it is on the list.
 - **Releases and the updater** (`switch/release.sh`, `crates/benilla-horizon/update.c`): publish a build, then a newer
   one, and update from the first on the console.
-- **The Joy-Con through benilla-pad** (`crates/benilla-pad`, from lucasvallejodev/benilla-gamepad): its layout,
-  cursor and on-screen keyboard on the Switch.
+- **benilla-pad on the Switch** (`crates/benilla-pad`, from lucasvallejodev/benilla-gamepad): the gamepad bar and the
+  controller menu answer since the pad's events go through `BenillaPad_Event` (1.12's `RegisterEvent` takes only
+  its table's names, so `BENILLAPAD_*` registered nothing). Still to try: the wheels, the cursor in every window,
+  the on-screen keyboard and chat tiles.
 
 To finish:
 
