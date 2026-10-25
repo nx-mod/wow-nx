@@ -1,0 +1,62 @@
+<Bindings>
+	<Binding name="BENILLAPAD_ACTION1" runOnUp="true" header="BENILLAPAD">BenillaPad_ActionKey(1)</Binding>
+	<Binding name="BENILLAPAD_ACTION2" runOnUp="true">BenillaPad_ActionKey(2)</Binding>
+	<Binding name="BENILLAPAD_ACTION3" runOnUp="true">BenillaPad_ActionKey(3)</Binding>
+	<Binding name="BENILLAPAD_ACTION4" runOnUp="true">BenillaPad_ActionKey(4)</Binding>
+	<Binding name="BENILLAPAD_ACTION5" runOnUp="true">BenillaPad_ActionKey(5)</Binding>
+	<Binding name="BENILLAPAD_ACTION6" runOnUp="true">BenillaPad_ActionKey(6)</Binding>
+	<Binding name="BENILLAPAD_ACTION7" runOnUp="true">BenillaPad_ActionKey(7)</Binding>
+	<Binding name="BENILLAPAD_ACTION8" runOnUp="true">BenillaPad_ActionKey(8)</Binding>
+	<Binding name="BENILLAPAD_ACTION9" runOnUp="true">BenillaPad_ActionKey(9)</Binding>
+	<Binding name="BENILLAPAD_ACTION10" runOnUp="true">BenillaPad_ActionKey(10)</Binding>
+	<Binding name="BENILLAPAD_ACTION11" runOnUp="true">BenillaPad_ActionKey(11)</Binding>
+	<Binding name="BENILLAPAD_ACTION12" runOnUp="true">BenillaPad_ActionKey(12)</Binding>
+	<Binding name="BENILLAPAD_ACTION13" runOnUp="true">BenillaPad_ActionKey(13)</Binding>
+	<Binding name="BENILLAPAD_ACTION14" runOnUp="true">BenillaPad_ActionKey(14)</Binding>
+	<Binding name="BENILLAPAD_ACTION15" runOnUp="true">BenillaPad_ActionKey(15)</Binding>
+	<Binding name="BENILLAPAD_ACTION16" runOnUp="true">BenillaPad_ActionKey(16)</Binding>
+	<Binding name="BENILLAPAD_ACTION17" runOnUp="true">BenillaPad_ActionKey(17)</Binding>
+	<Binding name="BENILLAPAD_ACTION18" runOnUp="true">BenillaPad_ActionKey(18)</Binding>
+	<Binding name="BENILLAPAD_ACTION19" runOnUp="true">BenillaPad_ActionKey(19)</Binding>
+	<Binding name="BENILLAPAD_ACTION20" runOnUp="true">BenillaPad_ActionKey(20)</Binding>
+	<Binding name="BENILLAPAD_ACTION21" runOnUp="true">BenillaPad_ActionKey(21)</Binding>
+	<Binding name="BENILLAPAD_ACTION22" runOnUp="true">BenillaPad_ActionKey(22)</Binding>
+	<Binding name="BENILLAPAD_ACTION23" runOnUp="true">BenillaPad_ActionKey(23)</Binding>
+	<Binding name="BENILLAPAD_ACTION24" runOnUp="true">BenillaPad_ActionKey(24)</Binding>
+	<Binding name="BENILLAPAD_ACTION25" runOnUp="true">BenillaPad_ActionKey(25)</Binding>
+	<Binding name="BENILLAPAD_ACTION26" runOnUp="true">BenillaPad_ActionKey(26)</Binding>
+	<Binding name="BENILLAPAD_ACTION27" runOnUp="true">BenillaPad_ActionKey(27)</Binding>
+	<Binding name="BENILLAPAD_ACTION28" runOnUp="true">BenillaPad_ActionKey(28)</Binding>
+	<Binding name="BENILLAPAD_ACTION29" runOnUp="true">BenillaPad_ActionKey(29)</Binding>
+	<Binding name="BENILLAPAD_ACTION30" runOnUp="true">BenillaPad_ActionKey(30)</Binding>
+	<Binding name="BENILLAPAD_ACTION31" runOnUp="true">BenillaPad_ActionKey(31)</Binding>
+	<Binding name="BENILLAPAD_ACTION32" runOnUp="true">BenillaPad_ActionKey(32)</Binding>
+	<Binding name="BENILLAPAD_ACTION33" runOnUp="true">BenillaPad_ActionKey(33)</Binding>
+	<Binding name="BENILLAPAD_ACTION34" runOnUp="true">BenillaPad_ActionKey(34)</Binding>
+	<Binding name="BENILLAPAD_ACTION35" runOnUp="true">BenillaPad_ActionKey(35)</Binding>
+	<Binding name="BENILLAPAD_ACTION36" runOnUp="true">BenillaPad_ActionKey(36)</Binding>
+	<Binding name="BENILLAPAD_ACTION37" runOnUp="true">BenillaPad_ActionKey(37)</Binding>
+	<Binding name="BENILLAPAD_ACTION38" runOnUp="true">BenillaPad_ActionKey(38)</Binding>
+	<Binding name="BENILLAPAD_ACTION39" runOnUp="true">BenillaPad_ActionKey(39)</Binding>
+	<Binding name="BENILLAPAD_ACTION40" runOnUp="true">BenillaPad_ActionKey(40)</Binding>
+	<Binding name="BENILLAPAD_ACTION41" runOnUp="true">BenillaPad_ActionKey(41)</Binding>
+	<Binding name="BENILLAPAD_ACTION42" runOnUp="true">BenillaPad_ActionKey(42)</Binding>
+	<Binding name="BENILLAPAD_ACTION43" runOnUp="true">BenillaPad_ActionKey(43)</Binding>
+	<Binding name="BENILLAPAD_ACTION44" runOnUp="true">BenillaPad_ActionKey(44)</Binding>
+	<Binding name="BENILLAPAD_ACTION45" runOnUp="true">BenillaPad_ActionKey(45)</Binding>
+	<Binding name="BENILLAPAD_ACTION46" runOnUp="true">BenillaPad_ActionKey(46)</Binding>
+	<Binding name="BENILLAPAD_ACTION47" runOnUp="true">BenillaPad_ActionKey(47)</Binding>
+	<Binding name="BENILLAPAD_ACTION48" runOnUp="true">BenillaPad_ActionKey(48)</Binding>
+	<Binding name="BENILLAPAD_BACK">BenillaPad_Back()</Binding>
+	<Binding name="BENILLAPAD_INSPECT">BenillaPad_Inspect()</Binding>
+	<Binding name="BENILLAPAD_TARGETENEMY">TargetNearestEnemy()</Binding>
+	<Binding name="BENILLAPAD_TARGETFRIEND">TargetNearestFriend()</Binding>
+	<Binding name="BENILLAPAD_TARGETSELF">TargetUnit("player")</Binding>
+	<Binding name="BENILLAPAD_ATTACK">AttackTarget()</Binding>
+	<Binding name="BENILLAPAD_MENU">BenillaPad_Menu()</Binding>
+	<Binding name="BENILLAPAD_WHEEL">BenillaPad.Wheel.Toggle("windows")</Binding>
+	<Binding name="BENILLAPAD_CONSUMABLES">BenillaPad.Wheel.Toggle("consumables")</Binding>
+	<Binding name="BENILLAPAD_QUESTITEM">BenillaPad.Quest.Use()</Binding>
+	<Binding name="BENILLAPAD_BOTWHEEL">BenillaPad.Wheel.Toggle("bots")</Binding>
+	<Binding name="BENILLAPAD_CHAT">BenillaPad.Chat.Toggle()</Binding>
+</Bindings>

@@ -1,0 +1,29 @@
+[package]
+name = "benilla-pad"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Gamepad play on top of benilla: the pad in Rust, the gamepad bar as the BenillaPad addon, every press run as a 1.12 binding command"
+
+[lints]
+workspace = true
+
+[features]
+default = ["dev"]
+dev = ["benilla-app/dev"]
+
+[dependencies]
+benilla-app = { path = "../benilla-app", default-features = false }
+benilla-ui = { path = "../benilla-ui" }
+benilla-world = { path = "../benilla-world" }
+bevy.workspace = true
+# The BenillaPad addon, embedded and installed into benilla-config/AddOns.
+include_dir = "0.7"
+
+[build-dependencies]
+benilla-buildstamp = { path = "../benilla-buildstamp" }
+
+[[bin]]
+name = "benilla-pad"
+path = "src/main.rs"
+test = false

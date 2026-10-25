@@ -1,0 +1,18 @@
+## Interface: 11200
+## Title: BenillaPad
+## Notes: The gamepad action bar for benilla's controller support (benilla-pad).
+## Author: benilla
+## Version: 0.1.0
+## SavedVariables: BenillaPadDB
+## SavedVariablesPerCharacter: BenillaPadCharDB
+Core.lua
+Actions.lua
+Bar.lua
+XpBar.lua
+Keyboard.lua
+Keybinds.lua
+Menu.lua
+Wheel.lua
+Cursor.lua
+Bots.lua
+Chat.lua
