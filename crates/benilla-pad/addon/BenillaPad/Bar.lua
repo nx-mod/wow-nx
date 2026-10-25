@@ -120,8 +120,11 @@ local function newButton(key)
     end
 
     local cd = CreateFrame("Model", "BenillaPadButton" .. key .. "Cooldown", b, "CooldownFrameTemplate")
-    cd:SetWidth(size * 0.9)
-    cd:SetHeight(size * 0.9)
+    -- wow-nx: the sweep is the stock square model and 1.12 has no mask for it, so on a round button it is the
+    -- largest square inside the circle (the diameter over sqrt 2), never past its edge.
+    local sweep = size * (round and 0.7 or 0.9)
+    cd:SetWidth(sweep)
+    cd:SetHeight(sweep)
     cd:SetPoint("CENTER", b, "CENTER", 0, 0)
     b.cooldown = cd
 

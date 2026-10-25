@@ -18,4 +18,7 @@ From [lucasvallejodev/benilla-gamepad](https://github.com/lucasvallejodev/benill
 - **Tracing.** The first 40 calls are logged with whether a host was lent (to be removed once the pad is settled on
   the Switch).
 
+- **Cooldowns on round buttons** draw at the largest square inside the circle (0.7 of the button) instead of 0.9,
+  which poked past the round icon; true circles are in docs/SWITCH.md's to-do.
+
 Still in Xbox names: the controller menu's descriptions (`Menu.lua`).

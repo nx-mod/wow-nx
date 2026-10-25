@@ -94,6 +94,10 @@ To finish:
   L/R, ZL/ZR, LS/RS and +/− under the Nintendo symbols (`P.Name`, `P.Hint` in the BenillaPad addon's Core.lua). Still
   in Xbox names: the controller menu's descriptions (Menu.lua; a word-for-word swap would turn the article "A" into
   "B", so they need Nintendo wording of their own), the README's tables, and any other text that names a button.
+- **Round cooldown sweeps.** The gamepad bar's round buttons draw the stock square cooldown model at the largest
+  square inside the circle (benilla-pad's Bar.lua), because 1.12 has no mask for a model. True circles: let a Model
+  pane's quad take the circle mask the round portraits use (`circular` in the UI quad shader), and the addon mark its
+  cooldowns with it.
 
 Not done on purpose: no clock changes (stock CPU/GPU), no features turned off for speed.
 
