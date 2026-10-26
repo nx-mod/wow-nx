@@ -224,6 +224,7 @@ pub(crate) fn drive_policy(
     mut disconnects: MessageReader<DisconnectedMessage>,
     mut refusals: MessageWriter<LoginGuardRefused>,
     mut exit: MessageWriter<AppExit>,
+    script: Option<NonSend<benilla_ui::script::UiScript>>,
 ) {
     let now = time.elapsed_secs();
 
@@ -231,8 +232,11 @@ pub(crate) fn drive_policy(
     // default account. A driverless run exits non-zero ("login: FATAL") on a failure no resubmit
     // can change, as [`crate::run_mode::fatal_when_driverless`] decides.
     // wow-nx: not before the screen shows (crate::screen_shown): sent during the Switch's black start it was at
-    // character select before anything showed.
-    if !attempt.intent.env_read && crate::screen_shown() {
+    // character select before anything showed. Nor before the glue reaches its login screen: sent during the opening
+    // movie (a first boot's "movie" screen), it cut the movie off and left the login and the character list drawn
+    // together.
+    let at_login = script.as_ref().is_some_and(|s| s.glue_screen() == "login");
+    if !attempt.intent.env_read && crate::screen_shown() && at_login {
         attempt.intent.env_read = true;
         if crate::run_mode::env_login() {
             let user = std::env::var("WOW_USER").unwrap_or_default();
