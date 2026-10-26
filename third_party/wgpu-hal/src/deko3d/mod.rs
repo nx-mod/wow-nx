@@ -72,6 +72,7 @@ pub(super) mod stats {
     pub static SUBMITS: AtomicU64 = AtomicU64::new(0);
     pub static SUBMIT_TICKS: AtomicU64 = AtomicU64::new(0);
     pub static ACQUIRE_TICKS: AtomicU64 = AtomicU64::new(0);
+    pub static FRAME_WAIT_TICKS: AtomicU64 = AtomicU64::new(0);
     static PIPELINES: AtomicU64 = AtomicU64::new(0);
     static PIPELINE_TICKS: AtomicU64 = AtomicU64::new(0);
     static PRESENTS: AtomicU64 = AtomicU64::new(0);
@@ -139,10 +140,11 @@ pub(super) mod stats {
         let span = now - STARTED.swap(now, Relaxed);
         let frames = FRAMES as f64;
         log::info!(
-            "deko3d: {:.1} fps ({:.1} ms a frame): {:.1} ms acquiring, {:.1} ms submitting ({:.1} submits) a frame; {} blocks made, {} ring waits, {} pipelines made in {:.0} ms",
+            "deko3d: {:.1} fps ({:.1} ms a frame): {:.1} ms acquiring, {:.1} ms waiting for the frame before, {:.1} ms submitting ({:.1} submits) a frame; {} blocks made, {} ring waits, {} pipelines made in {:.0} ms",
             frames * 1000.0 / ms(span),
             ms(span) / frames,
             ms(ACQUIRE_TICKS.swap(0, Relaxed)) / frames,
+            ms(FRAME_WAIT_TICKS.swap(0, Relaxed)) / frames,
             ms(SUBMIT_TICKS.swap(0, Relaxed)) / frames,
             SUBMITS.swap(0, Relaxed) as f64 / frames,
             BLOCKS.swap(0, Relaxed),
@@ -367,6 +369,8 @@ struct Swapchain {
     size: wgt::Extent3d,
     /// The loading picture shown through the start's held frames, while they last.
     picture: Option<StartPicture>,
+    /// The fence after the last presented frame's work ([`crate::Queue::present`]).
+    last_frame: Option<Box<DkFence>>,
 }
 
 #[derive(Debug)]
@@ -1040,6 +1044,7 @@ impl crate::Surface for Surface {
             format: config.format,
             size: config.extent,
             picture,
+            last_frame: None,
         });
         Ok(())
     }
@@ -1265,8 +1270,8 @@ impl crate::Queue for Queue {
         Ok(())
     }
     unsafe fn present(&self, surface: &Surface, texture: Texture) -> Result<(), crate::SurfaceError> {
-        let guard = surface.swapchain.lock();
-        let c = guard.as_ref().ok_or(crate::SurfaceError::Outdated)?;
+        let mut guard = surface.swapchain.lock();
+        let c = guard.as_mut().ok_or(crate::SurfaceError::Outdated)?;
         let slot = texture.slot.ok_or(crate::SurfaceError::Other("not a surface texture"))?;
         let screen = SCREEN.lock();
         if START_HOLD.lock().holding() {
@@ -1277,8 +1282,21 @@ impl crate::Queue for Queue {
         let mut q = c._shared.lock_queue();
         q.add(FLUSH_ENTRIES);
         unsafe { dkQueuePresentImage(c.queue, c.dk, slot) };
+        // One frame in flight: this frame's work gets a fence, and the render thread waits for the frame before it to
+        // finish on the GPU. Nothing limited how far ahead the CPU ran (three swapchain images, and deko3d's command
+        // memory blocking a submission only once full), so where the GPU is the limit (the character screen, 21 ms of
+        // GPU a frame) frames queued up: an input showed several frames late, and the wait landed inside a submission.
+        q.add(FLUSH_ENTRIES);
+        let mut done = Box::new(unsafe { core::mem::zeroed::<DkFence>() });
+        unsafe { dkQueueSignalFence(c.queue, &mut *done, true) };
+        let before = c.last_frame.replace(done);
         drop(screen);
         drop(q);
+        if let Some(mut before) = before {
+            let started = stats::ticks();
+            unsafe { dkFenceWait(&mut *before, -1) };
+            stats::FRAME_WAIT_TICKS.fetch_add(stats::ticks() - started, core::sync::atomic::Ordering::Relaxed);
+        }
         c._shared.timing.lock().collect();
         stats::present(&c._shared);
         Ok(())
