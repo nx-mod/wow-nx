@@ -174,6 +174,7 @@ impl PluginGroup for GamePlugins {
             .add(crate::game_tip::GameTipPlugin)
             .add(crate::text_filter::TextFilterPlugin)
             .add(TutorialPlugin)
+            .add(crate::account_data::AccountDataPlugin)
             .add(crate::swing_refusal::SwingRefusalPlugin)
             .add(UiSummonPlugin)
             .add(UiGmTicketPlugin)
@@ -962,8 +963,6 @@ pub(crate) mod schedule_tests {
     /// - the fx attaches and `entities::update_display_models`/`attach_entity_visuals` against
     ///   the mat-anim tick over `MatAnimTable`/`UvAnimMaterials`: attach writes the rows a tick
     ///   would, off the same clock;
-    /// - `ui_session::feed_interact_npc` against `query_cache::release_on_enter::<MailOpen>`: the
-    ///   feed reads the mailbox's guid, and the release clears only the pending queries;
     /// - Click to Move's steer (`player::approach::steer_approach`) against what `steer_follow`
     ///   already pairs with: the steer is chained after follow's and writes the same `Player`
     ///   fields;
@@ -995,7 +994,7 @@ pub(crate) mod schedule_tests {
     /// Raising the ceiling is a claim that a new undeclared order is acceptable: make it with the
     /// reason read off the dump, or declare the order (`.after`, a set, a `chain`). A resource
     /// that commutes by construction belongs in [`Classes`].
-    const UPDATE_ACTIONABLE_CEILING: usize = 1_749;
+    const UPDATE_ACTIONABLE_CEILING: usize = 1_694;
     const UPDATE_ACTIONABLE_SLACK: usize = 40;
 
     fn ratchet(what: &str, n: usize, ceiling: usize, slack: usize) {
@@ -1098,8 +1097,16 @@ pub(crate) mod schedule_tests {
     /// VM pass's links ignore the deferred buffers between them
     /// ([`crate::vm_pass::order_the_pass`]), so a link's commands wait for the first barrier past
     /// the chain. The count may not rise past the ceiling, and the ceiling follows it down. Read
-    /// on the dev build, whose schedule holds every system the player build does.
-    const UPDATE_SYNC_POINT_CEILING: usize = 54;
+    /// on the dev build, whose schedule holds every system the player build does. Raised from 54
+    /// when the frame's input records moved ahead of the net drain: what their handlers queue
+    /// applies before the drain, as the reference's input acts inside its handlers; to 57 for the
+    /// input's CVar sync, whose observers must run before the look session reads their knobs; and
+    /// to 58 on the movie frame (#2398): `movie::upload_movie_pictures` runs after
+    /// `video::apply_present_mode` and `video::apply_window_mode` and before `paint_script`, which
+    /// puts the barrier between `video::drain_restart_gx` and those two applies on the paint's path
+    /// (its commands fire the `gx*` CVar events whose observer writes the `VideoConfig` they read).
+    /// Without those two edges the count is 57. `WOW_SYNC_DUMP=1` lists each barrier's neighbours.
+    const UPDATE_SYNC_POINT_CEILING: usize = 58;
     const UPDATE_SYNC_POINT_SLACK: usize = 4;
 
     #[test]
@@ -1121,6 +1128,36 @@ pub(crate) mod schedule_tests {
             "Update: {n} sync points (ceiling {UPDATE_SYNC_POINT_CEILING}, slack \
              {UPDATE_SYNC_POINT_SLACK})"
         );
+        // `WOW_SYNC_DUMP=1`: each barrier with the systems the build placed it after and before,
+        // sorted, so two dumps diff by text to name the pair a change added.
+        if std::env::var_os("WOW_SYNC_DUMP").is_some() {
+            let mut into: HashMap<SystemKey, Vec<&str>> = HashMap::new();
+            let mut out: HashMap<SystemKey, Vec<&str>> = HashMap::new();
+            for (a, b) in &update.built {
+                into.entry(*b).or_default().push(update.name(*a));
+                out.entry(*a).or_default().push(update.name(*b));
+            }
+            let mut rows: Vec<String> = update
+                .systems
+                .iter()
+                .filter(|(_, s)| is_sync_point(&s.name))
+                .map(|(k, _)| {
+                    let mut before = into.remove(k).unwrap_or_default();
+                    let mut after = out.remove(k).unwrap_or_default();
+                    before.sort();
+                    after.sort();
+                    format!(
+                        "  after {}\n      before {}",
+                        before.join(", "),
+                        after.join(", ")
+                    )
+                })
+                .collect();
+            rows.sort();
+            for r in rows {
+                eprintln!("{r}");
+            }
+        }
         assert!(
             n <= UPDATE_SYNC_POINT_CEILING,
             "{n} sync points in Update; the ceiling is {UPDATE_SYNC_POINT_CEILING}. A system with \
@@ -1312,6 +1349,11 @@ pub(crate) mod schedule_tests {
              tick), so the log files take the lines the verbs showed after the drain's own",
         ),
         (
+            "::player::camera::apply_late_look_calls",
+            "in the lanes' set after their drain, so it takes the look calls the packets' \
+             handlers made, ahead of the tick, whose `OnUpdate` calls wait for the next latch",
+        ),
+        (
             "::ui_unit::views::mark_frame_start",
             "a debug snapshot of what the frame starts from, ahead of the net stage by design: it \
              reads the units the resolver's last inputs name and pushes nothing",
@@ -1398,19 +1440,16 @@ pub(crate) mod schedule_tests {
          "level-driven: it writes the fade from the ghost flag every frame and re-reads self each time, so a frame with no self is overwritten by the next"),
         ("::tutorial::run_world_enter_cascade",
          "`armed` stays set until self exists, so the welcome and questgiver triggers wait for the tag rather than being spent, and the arrival's `Added<SelfPlayer>` is relative to this system's own last run, so a tag that lands after a run is still seen at the next"),
-        ("::ui_session::close_npc_session_out_of_range<",
-         "no self returns before anything changes, and a question open on an NPC needs a self that interacted; the leash is re-tested every frame"),
-        ("::ui_session::latch::watch_interaction_range",
-         "no self returns before anything changes, and a latch needs a self that interacted; the leash is re-tested every frame"),
-        ("::ui_unit::views::mark_frame_start",
-         "a debug snapshot of what the frame starts from, ahead of the net stage by design and with no change detection: a self the frame tags is in no snapshot, and the views' check skips it"),
     ];
 
     /// Every `Update` system that names `SelfPlayer` (reads it, or filters on it) is ordered after
-    /// `tag_self_player`, or argued in [`UNORDERED_AFTER_THE_SELF_TAG`]: a system that reads self
-    /// and uses change detection must run after the tag, or a frame that finds no self still
-    /// advances its change ticks and loses what changed. Fails an unordered user, a row for a
-    /// system that is ordered after all, and a stale row.
+    /// `tag_self_player`, or ahead of the net drain, or argued in
+    /// [`UNORDERED_AFTER_THE_SELF_TAG`]: a system that reads self and uses change detection must
+    /// not run between the drain's changes and the tag, or a frame that finds no self still
+    /// advances its change ticks and loses what changed. One ahead of the drain (the frame's input
+    /// records) reads the world as the last frame left it, and sees the tag and every change the
+    /// drain made at its next run. Fails an unordered user, a row for a system that is ordered
+    /// after all, and a stale row.
     #[test]
     fn every_system_that_names_self_runs_after_the_tag_or_argues_why_not() {
         let mut app = headless_client();
@@ -1446,6 +1485,30 @@ pub(crate) mod schedule_tests {
             seen
         };
         let after_tag = reach(tag);
+        let drain = {
+            let suffix = "::net::apply::apply_net_updates";
+            let mut hits = c.systems.iter().filter(|(_, s)| s.name.ends_with(suffix));
+            match (hits.next(), hits.next()) {
+                (Some((k, _)), None) => *k,
+                _ => panic!("exactly one system named `…{suffix}` in Update"),
+            }
+        };
+        let mut pred: HashMap<SystemKey, Vec<SystemKey>> = HashMap::new();
+        for (a, b) in &c.dependencies {
+            pred.entry(*b).or_default().push(*a);
+        }
+        let before_drain = {
+            let mut seen = HashSet::new();
+            let mut stack = vec![drain];
+            while let Some(n) = stack.pop() {
+                for m in pred.get(&n).into_iter().flatten() {
+                    if seen.insert(*m) {
+                        stack.push(*m);
+                    }
+                }
+            }
+            seen
+        };
         let mut users: Vec<SystemKey> = c.uses_self.iter().copied().filter(|k| *k != tag).collect();
         users.sort_by(|a, b| c.name(*a).cmp(c.name(*b)));
         let (mut ordered, mut argued) = (0, 0);
@@ -1456,10 +1519,10 @@ pub(crate) mod schedule_tests {
             let row = UNORDERED_AFTER_THE_SELF_TAG
                 .iter()
                 .find(|(part, _)| name.contains(part));
-            match (after_tag.contains(k), row.is_some()) {
+            match (after_tag.contains(k) || before_drain.contains(k), row.is_some()) {
                 (true, false) => ordered += 1,
                 (true, true) => stale.push(format!(
-                    "{name}: argued in UNORDERED_AFTER_THE_SELF_TAG but ordered after the tag — drop the row"
+                    "{name}: argued in UNORDERED_AFTER_THE_SELF_TAG but ordered after the tag or ahead of the drain — drop the row"
                 )),
                 (false, true) => argued += 1,
                 (false, false) => offenders.push(name.to_string()),
@@ -1473,13 +1536,13 @@ pub(crate) mod schedule_tests {
             }
         }
         eprintln!(
-            "SelfPlayer users in Update: {} — {ordered} after the tag, {argued} argued",
+            "SelfPlayer users in Update: {} — {ordered} after the tag or ahead of the drain, {argued} argued",
             users.len()
         );
         assert!(
             offenders.is_empty(),
             "these systems name `SelfPlayer` in `Update` with no declared order after \
-             `tag_self_player` — `.after(WorldStage::Net)`, or argue it in \
+             `tag_self_player` or ahead of the drain — `.after(WorldStage::Net)`, or argue it in \
              UNORDERED_AFTER_THE_SELF_TAG:\n  {}",
             offenders.join("\n  ")
         );
@@ -1537,6 +1600,52 @@ pub(crate) mod schedule_tests {
             runs_before(bind, interact),
             "the interact runs after the chain's bind"
         );
+    }
+
+    /// A command press cancels the cast inside `SetCommands` (`0x51512a` → `0x6e4940`), after the
+    /// press's verdict and before its tick (`0x5151a0`), so `CMSG_CANCEL_CAST` goes out ahead of
+    /// the start: the self-cancel sits between the press's two systems in the built graph.
+    #[test]
+    fn the_cast_cancel_runs_inside_the_press_ahead_of_its_tick() {
+        let mut app = headless_client();
+        let c = census(&mut app, Update, SyncPoints::Declared);
+        if !type_names_available(&c) {
+            eprintln!(
+                "skipped: this build carries no type names (bevy/debug rides with the dev feature)"
+            );
+            return;
+        }
+        let one = |suffix: &str| {
+            let mut hits = c.systems.iter().filter(|(_, s)| s.name.ends_with(suffix));
+            match (hits.next(), hits.next()) {
+                (Some((k, _)), None) => *k,
+                _ => panic!("exactly one system named `…{suffix}` in Update"),
+            }
+        };
+        let mut succ: HashMap<SystemKey, Vec<SystemKey>> = HashMap::new();
+        for (a, b) in &c.dependencies {
+            succ.entry(*a).or_default().push(*b);
+        }
+        let after = |from: SystemKey| {
+            let mut seen = HashSet::new();
+            let mut stack = vec![from];
+            while let Some(n) = stack.pop() {
+                for m in succ.get(&n).into_iter().flatten() {
+                    if seen.insert(*m) {
+                        stack.push(*m);
+                    }
+                }
+            }
+            seen
+        };
+        let verdict = one("::player::press::press_commands");
+        let cancel = one("::spell::inflight::local_self_cancel");
+        let tick = one("::player::press::press_tick");
+        assert!(
+            after(verdict).contains(&cancel),
+            "the verdict before the cancel"
+        );
+        assert!(after(cancel).contains(&tick), "the cancel before the tick");
     }
 
     /// The world click's trade leg runs ahead of its select (`0x4925d0`: the trade request at
@@ -1777,13 +1886,16 @@ pub(crate) mod schedule_tests {
         );
     }
 
+    /// The sets of the frame's input records, which run ahead of the net drain.
+    const INPUT_RECORD_SETS: &[&str] = &["UiInput", "WorldMouse", "WorldClicks"];
+
     /// The VM ticks once a frame (`extract::tick_script`, in `UiTick`): the window input rides
-    /// `UiInput` and a push the tick must see rides `UiFeed`, both chained after the net drain
-    /// and before the tick, the input first; a drain of what the tick produced is
-    /// `.after(UiTick)`. Read off the built graph. Fails a holder with no path to or from the
-    /// tick, one before the tick outside both phases and not argued in
-    /// [`OUTSIDE_THE_FEED_PHASE`], a member of either the graph does not place between the drain
-    /// and the tick, and a stale row.
+    /// the input records' sets ([`INPUT_RECORD_SETS`]) ahead of the net drain, and a push the tick
+    /// must see rides `UiFeed`, after the drain; both are before the tick, and a drain of what the
+    /// tick produced is `.after(UiTick)`. Read off the built graph. Fails a holder with no path to
+    /// or from the tick, one before the tick outside the phases and not argued in
+    /// [`OUTSIDE_THE_FEED_PHASE`], an input record the graph does not place before the drain and
+    /// the tick, a feed it does not place between them, and a stale row.
     #[test]
     fn every_vm_holder_in_update_declares_its_side_of_the_tick() {
         let mut app = headless_client();
@@ -1824,6 +1936,7 @@ pub(crate) mod schedule_tests {
         let before_tick = reach(tick, &pred);
         let after_tick = reach(tick, &succ);
         let after_drain = reach(drain, &succ);
+        let before_drain = reach(drain, &pred);
         let mut holders: Vec<SystemKey> = c.holds_vm.iter().copied().collect();
         holders.sort_by(|a, b| c.name(*a).cmp(c.name(*b)));
         let (mut input, mut feed, mut post, mut argued) = (0, 0, 0, 0);
@@ -1834,16 +1947,19 @@ pub(crate) mod schedule_tests {
                 continue;
             }
             let s = &c.systems[k];
-            let in_input = s.sets.iter().any(|set| set == "UiInput");
+            let in_input = s
+                .sets
+                .iter()
+                .any(|set| INPUT_RECORD_SETS.contains(&set.as_str()));
             let in_feed = s.sets.iter().any(|set| set == "UiFeed");
             let row = OUTSIDE_THE_FEED_PHASE
                 .iter()
                 .find(|(suffix, _)| s.name.ends_with(suffix));
             if in_input {
                 input += 1;
-                if !(after_drain.contains(k) && before_tick.contains(k)) {
+                if !(before_drain.contains(k) && before_tick.contains(k)) {
                     offenders.push(format!(
-                        "{}: in `UiInput`, but the graph does not place it after the net drain and before the tick",
+                        "{}: an input record, but the graph does not place it before the net drain and the tick",
                         s.name
                     ));
                 }
@@ -1863,7 +1979,7 @@ pub(crate) mod schedule_tests {
                     continue;
                 }
                 offenders.push(format!(
-                    "{}: ordered before the tick but in neither `UiInput` nor `UiFeed` — it may run before this frame's packets land; `.in_set(UiFeed)`",
+                    "{}: ordered before the tick but in neither the input records nor `UiFeed` — it may run before this frame's packets land; `.in_set(UiFeed)`",
                     s.name
                 ));
             } else {
@@ -1879,7 +1995,7 @@ pub(crate) mod schedule_tests {
                     "{}: argued in OUTSIDE_THE_FEED_PHASE but the graph places it {} — drop the row",
                     s.name,
                     if in_input {
-                        "in the input pass"
+                        "in the input records"
                     } else if in_feed {
                         "in the feed phase"
                     } else {
@@ -1902,7 +2018,7 @@ pub(crate) mod schedule_tests {
         assert!(
             offenders.is_empty(),
             "these systems hold the VM in `Update` without declaring their side of the tick \
-             (`UiInput` or `UiFeed` before it, or `.in_set(crate::ui_script::UiDrain)`):\n  {}",
+             (an input record or `UiFeed` before it, or `.in_set(crate::ui_script::UiDrain)`):\n  {}",
             offenders.join("\n  ")
         );
         assert!(stale.is_empty(), "stale rows:\n  {}", stale.join("\n  "));
@@ -1953,8 +2069,12 @@ pub(crate) mod schedule_tests {
          "the outcome chain starts with the VM's own `Screenshot()` call"),
         ("target/click.rs", "select_on_plate_click", Because::FilledByVm,
          "filled only by a nameplate frame's click, which a frameless VM has no plate to make"),
+        ("ui_action/cooldown_lane.rs", "fire_cooldowns", Because::Deliberate,
+         "a lane's firing, run only by the drain: `drop_cooldown_log`, gated on the interface being down, drops the log the frame it is written, so no signal fires into a later VM"),
         ("ui_action/drain.rs", "drain_click_casts", Because::FilledByVm,
          "filled only by a world right-click on a GameObject or a body; the drain sends casts to the wire"),
+        ("ui_action/recount.rs", "recount", Because::Deliberate,
+         "no system: the item lane's firing calls it per run (`item_lane::fire_run`), inside the lanes' drain, which runs only with the interface up (`ingame_ui_up`)"),
         ("ui_bank/mod.rs", "feed_bank", Because::PlayerRoundTrip,
          "`BankErrors` answers a `BuyBankSlot` click; the OPENED edge rides `VmMemo`s"),
         ("ui_battlefield.rs", "feed_battlefield", Because::SelfHealing,
@@ -1975,6 +2095,8 @@ pub(crate) mod schedule_tests {
          "`feed.vm: VmMemo<FollowFeedMemo>`; a fresh VM re-fires BEGIN for a follow in progress"),
         ("ui_gm_ticket.rs", "feed_gm_ticket", Because::MemoLatched,
          "`feed.vm: VmMemo<FedTicket>` counters restart per VM while `state.answers` keeps counting, so the latest answer is re-fired"),
+        ("ui_guild/lane.rs", "fire_guild", Because::Deliberate,
+         "a lane's firing, run only by the drain, which runs only with the interface up (`ingame_ui_up`): the lane holds what the packets queue until a drain fires it, so the login's message of the day, which lands ahead of the interface, fires into the VM that comes up"),
         ("ui_honor.rs", "feed_honor", Because::MemoLatched,
          "`state.vm: VmMemo<HonorFeedMemo>`; a fresh VM is pushed the block again and re-fires `INSPECT_HONOR_UPDATE` for a held reply"),
         ("ui_item_text.rs", "feed_item_text", Because::MemoLatched,
@@ -1999,12 +2121,14 @@ pub(crate) mod schedule_tests {
          "every line answers a charter action of ours; the window edges ride the `fed` memo"),
         ("ui_quest_share.rs", "feed_quest_share", Because::PlayerRoundTrip,
          "a verdict answers our own push and a confirm follows a party member's escort accept, both held until the name resolves (the confirm is another player's act: coincidence-only residual)"),
-        ("ui_reputation.rs", "feed_reputation", Because::SelfHealing,
-         "its take is the messages' list ops: a new VM's first push is the rebuild (`set_reputation` on an empty list), which lists every met slot the lost ops would have added, and the folds a lost sort leaves stand from the rebuild"),
         ("ui_script/glue_mgr.rs", "drive_glue_mgr", Because::Deliberate,
          "it acts only on a glue-kind VM (`script.filter(vm_kind() == Glue)`, documented at the fire sites), never the entry VM the window leaves frameless; news that arrives with no glue VM is held in `AddonInfoReply` for the next one"),
         ("ui_script/extract/mod.rs", "paint_script", Because::Deliberate,
          "per-frame paint and cost state, not a queue"),
+        ("ui_script/movie.rs", "feed_movie_audio", Because::SelfHealing,
+         "its takes are the sound side's stream reports, sent again every frame and keyed by a movie number only the VM that started the movie holds, and the VM's own audio starts, which only `StartMovie` leaves"),
+        ("ui_script/movie.rs", "upload_movie_pictures", Because::Deliberate,
+         "per-frame upload scratch, not a queue: it reads each playing movie's picture as it stands"),
         ("ui_social/feed.rs", "feed_social", Because::Deliberate,
          "its take is the handlers' list events and lines: those taken into the glue VM are lost there, and the in-game VM's first feed fires both list events again over the lists as they stand"),
         ("ui_stable/mod.rs", "feed_stable", Because::PlayerRoundTrip,

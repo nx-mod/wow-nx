@@ -13,15 +13,19 @@ use super::manifest::silenced_ui_load;
 use super::{load_ingame_ui, CursorPayloadHeld, PlayerUiHover, UiClock, UiKeyboardCapture};
 use crate::ui_script::addons;
 
+/// The startup's glue: built, then put up on the screen the `movie` CVar picks
+/// ([`super::glue::startup_screen`]).
 pub(crate) fn setup_script(world: &mut World) {
-    install_glue_side_vm(world, super::glue::GlueScreen::Login.key());
+    if !install_glue_vm(world, None) {
+        error!("ui_script: the glue VM did not come up with its character select screen");
+    }
 }
 
 /// Install the VM the world holds outside the world: the glue screens', put up on the screen
 /// named `screen`. A glue whose select screen did not load (logged as an error by [`new_vm`] or
 /// the load) asks for no roster, and nothing else does.
 pub(super) fn install_glue_side_vm(world: &mut World, screen: &str) {
-    if !install_glue_vm(world, screen) {
+    if !install_glue_vm(world, Some(screen)) {
         error!("ui_script: the glue VM did not come up with its character select screen");
     }
 }
@@ -45,11 +49,11 @@ pub(crate) fn strings_vm(world: &mut World) -> Option<UiScript> {
     Some(script)
 }
 
-/// Build the glue VM, load the stock GlueXML onto it, install it and put `screen` up: the glue
-/// builder `0x46a7b0` then `SET_GLUE_SCREEN` (`0x402b65` at startup, `0x402090` back from the
-/// world). It holds what the glue state holds and nothing of a boot VM's: no `GlobalStrings.lua`,
-/// no emote tokens.
-fn install_glue_vm(world: &mut World, screen: &str) -> bool {
+/// Build the glue VM, load the stock GlueXML onto it, install it and put `screen` up, or with
+/// `None` the startup's pick: the glue builder `0x46a7b0` then `SET_GLUE_SCREEN` (`0x402b65` at
+/// startup, `0x402090` back from the world). It holds what the glue state holds and nothing of a
+/// boot VM's: no `GlobalStrings.lua`, no emote tokens.
+fn install_glue_vm(world: &mut World, screen: Option<&str>) -> bool {
     let Some(mut script) = new_vm(world, UiScript::new_glue) else {
         return false;
     };
@@ -69,6 +73,12 @@ fn install_glue_vm(world: &mut World, screen: &str) -> bool {
     start_server_alert(world, &script);
     // What the glue carries across its rebuild, in place before the screen's `OnShow` reads it.
     super::glue_mgr::seat_glue_build(world, &mut script);
+    // The startup reads the `movie` CVar after the build (`0x402b3b`), its write reaching the
+    // VM's mirror with the next sync.
+    let screen = match screen {
+        Some(screen) => screen,
+        None => super::glue::startup_screen(world.get_resource_mut::<crate::cvars::Cvars>()),
+    };
     // `SetCurrentScreen`'s buffer is the client's (`[0xb41478]`) and outlives the Lua state: a
     // rebuild signals what it holds (`0x46b9a2`), and the screen's handler writes the same name.
     script.set_glue_screen_name(screen);
@@ -204,7 +214,7 @@ fn seed_game_time(world: &World, script: &mut UiScript) {
 /// authored size on an axis takes it from its art as the client's virtual size getters do. Each
 /// probe resolves through the store and the open its renderer reads (an interface texture's,
 /// [`LooseOpen::Index`], and a font face's, [`LooseOpen::BareNameFirst`]), so the answer is what
-/// draws; they test existence, not decode.
+/// draws; they test existence, not decode. The movie frame's reader rides along.
 fn install_addon_asset_resolvers(world: &mut World, script: &mut UiScript) {
     let Some(mut assets) = world.get_resource_mut::<benilla_assets::WorldAssets>() else {
         return;
@@ -218,6 +228,8 @@ fn install_addon_asset_resolvers(world: &mut World, script: &mut UiScript) {
     let cursor_loose = loose.clone();
     let font_chain = chain.clone();
     let font_loose = loose.clone();
+    let movie_chain = chain.clone();
+    let movie_loose = loose.clone();
     // `SetTexture` runs per frame in the addons that set an icon every `OnUpdate`: the probe
     // keeps what it read of a file.
     let probe = benilla_assets::SpriteProbe::default();
@@ -233,6 +245,15 @@ fn install_addon_asset_resolvers(world: &mut World, script: &mut UiScript) {
         let measured = benilla_assets::sprite_dimensions(&size_chain, &size_loose, path);
         sizes.borrow_mut().insert(path.to_string(), measured);
         measured
+    }));
+    // The movie frame's files: the `.avi` loose first (`0x78c39f`, flag 1), the `.sbt` from the
+    // archives alone (`0x6485f0`, flags 0).
+    script.set_movie_reader(Box::new(move |path, open| {
+        let open = match open {
+            benilla_ui::script::MovieOpen::LooseFirst => LooseOpen::Index,
+            benilla_ui::script::MovieOpen::Archives => LooseOpen::Archives,
+        };
+        benilla_assets::read_loose_or_chain(&movie_chain, &movie_loose, path, open)
     }));
     // `SetCursor`'s 32×32 test reads the picture the cursor code opens (`0x449610`), its `.blp`
     // alone, decoded each call as `0x523c98` waits on the load.
@@ -384,21 +405,27 @@ pub(crate) fn run_pending_entry_load(world: &mut World) {
 /// (`WorldMapFrame.lua:19-28`), which answer the root while `UIParent` is still at scale 1. With no
 /// atlas yet (it bakes on the first `Update`) the per-frame pass seats the measurer.
 fn seat_raster_seam_for_load(world: &mut World, script: &mut UiScript) {
-    let (w, h) = {
-        let mut q = world.query_filtered::<&Window, With<bevy::window::PrimaryWindow>>();
-        q.single(world)
-            .map_or((0.0, 0.0), |win| (win.width(), win.height()))
-    };
-    let s = super::seam_scale(h);
-    if w > 0.0 && h > 0.0 {
-        // The VM lives in a 768-tall root, `768·a` wide for the window's aspect `a`. No
+    let screen = interface_screen(world);
+    let s = super::seam_scale(screen.size.y);
+    if screen.size.x > 0.0 && screen.size.y > 0.0 {
+        // The VM lives in a 768-tall root, `768·a` wide for the interface's aspect `a`. No
         // `UIParent_ManageFramePositions` here, unlike `tick_script`: nothing is laid out yet.
-        script.set_window_size(w, h);
+        script.set_screen_aspect(screen.aspect);
     }
     let Some(atlas) = world.get_resource::<crate::ui_text::UiFontAtlas>() else {
         return;
     };
     super::extract::seat_text_measurer(script, atlas, s);
+}
+
+/// The interface's screen for the primary window ([`super::UiScreen`]), of no area with no window.
+fn interface_screen(world: &mut World) -> super::UiScreen {
+    let widescreen = world.get_resource::<crate::video::Widescreen>().copied();
+    let mut q = world.query_filtered::<&Window, With<bevy::window::PrimaryWindow>>();
+    q.single(world)
+        .map_or(super::UiScreen::of(Vec2::ZERO, true), |win| {
+            super::UiScreen::of_window(win, widescreen.as_ref())
+        })
 }
 
 /// Which `"player"` a UI load runs its files under, by the edge that runs it.
@@ -554,6 +581,9 @@ fn load_ingame_ui_seated(world: &mut World, seat: LoadSeat) {
     // The world map's continent and zone lists: static DBC data in the reference, read at file
     // scope (Astrolabe builds its whole zone table from `GetMapContinents`/`GetMapZones` there).
     crate::ui_world_map::seed_world_map_catalog(world, &mut script);
+    // The auction filter menus: `ItemClass.dbc` and `ItemSubClass.dbc` read inside the verbs, so a
+    // file-scope `GetAuctionItemClasses()` (and the stock `AuctionFrameBrowse_OnLoad`) sees them.
+    crate::ui_auction::seed_item_classes(world, &mut script);
     // Screen size and measurer before the first `<OnLoad>`: this VM is loaded before `tick_script`
     // seats either, and the load measures text (the stock tab template's `OnLoad` sizes from its
     // text width, `UIPanelTemplates.xml:370-373`), which answers 0 with no measurer.
@@ -608,12 +638,7 @@ fn load_ingame_ui_seated(world: &mut World, seat: LoadSeat) {
         // done, after the chat reader (`0x4900d6`) and before the `PLAYER_LOGIN` arm (`0x49011d`),
         // through the display handler (`0x49010e` → `0x492e90`). So every `OnLoad` sees `UIParent`
         // at scale 1 and the root's size.
-        let display = {
-            let mut q = world.query_filtered::<&Window, With<bevy::window::PrimaryWindow>>();
-            q.single(world).map_or((0, 0), |w| {
-                (w.width().round() as u32, w.height().round() as u32)
-            })
-        };
+        let display = interface_screen(world).display();
         let cached = world.get_resource::<super::UiAutoScaleCache>().map(|c| c.0);
         let mut cache = cached.flatten();
         crate::script_calls::lent_by_world(world, script, |script| {
@@ -967,6 +992,11 @@ fn close_ui_session(world: &mut World, root: ShutdownRoot) {
                 shutdown_ui_state(script, identity.as_ref());
             }
         });
+        // The shutdown's account-data writes (`0x490c55`-`0x490c79` through `0x5afed0`) arm
+        // their uploads, which a `/reload`, staying in the world, lets run.
+        if let Some(data) = world.get_resource::<crate::account_data::AccountData>() {
+            data.shut_down_ui();
+        }
     }
     if silenced {
         unsilence_ui_shutdown(world);
@@ -1006,8 +1036,9 @@ fn close_ui_session(world: &mut World, root: ShutdownRoot) {
     if let Some(mut minimap) = world.get_resource_mut::<crate::minimap::MinimapWidget>() {
         minimap.0 = None;
     }
-    // And the signals the frame's deaths parked in it, for the deaths lane.
+    // And the signals the frame's deaths and releases parked in it, for their lanes.
     crate::target::drop_parked_deaths(world);
+    crate::target::drop_parked_releases(world);
 }
 
 /// A `ReloadUI()` waiting to run: set when [`crate::ui_logout`] drains

@@ -3,16 +3,19 @@
 //! fire inside it (`0x465570` → `0x4655dc`), and `UnitHealth` reads the live object
 //! (`0x5174d0`, `[obj+0x110]+0x40` at `0x517553`), so a listener sees the state its own packet
 //! left, never a later packet's. The unit feed pushes the frame's last state, so here each update
-//! packet logs what it moved ([`ViewLog`]); the views lane rewinds the stores the tokens name to
-//! the frame's start and replays the log in stamp order among the other lanes, rebuilding the
-//! tokens' views once per gap between events ([`UnitViews`]).
+//! packet logs what it moved ([`ViewLog`]); the views lane rewinds the stores the tokens name and
+//! the group's records and roster cells to the frame's start and replays the log in stamp order
+//! among the other lanes, rebuilding the tokens' views once per gap between events
+//! ([`UnitViews`]).
 //!
 //! The unit of "as of" is the packet: the update handler `0x4651a0` runs both write passes over
 //! every block (`0x46520e`, `0x465222`) before its notify pass (`0x46522d`-`0x46528b`), so a
 //! watcher of one block already reads a later block of the same packet. A stats packet writes the
 //! member's group record before it signals (`0x5e5110`: `0x5e54c4`, `0x5e54d8`, then `0x5e54fa`),
-//! so the log holds the records too, and the views built over them: the group tokens, the pet,
-//! the units a `target` chain ends on and every unit's aura list ([`families`]).
+//! so the log holds the records too, and the roster cells a group list or ending writes (its party
+//! slots before its first signal `0x5e6c66`, its leader, loot and raid rows after), whole per
+//! packet; and the views built over them: the group tokens, the pet, the units a `target` chain
+//! ends on and every unit's aura list ([`families`]).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -26,6 +29,7 @@ use crate::lanes::{Stamp, Until};
 use crate::names::NameCache;
 use crate::net::{Guid, GuidIndex, NetCommands, ObjectStore, SelfPlayer};
 use crate::target::{RelationWorld, Selection};
+use crate::ui_party::RosterCells;
 
 mod families;
 
@@ -47,6 +51,9 @@ enum Change {
     /// The member's group record on the change's other side, `None` for none, as [`Self::Swap`]
     /// holds a store.
     Record(Option<PartyMemberStatsInfo>),
+    /// The group's roster cells on the change's other side ([`RosterCells`]), as
+    /// [`Self::Record`] holds a record. It names no guid.
+    Roster(Option<RosterCells>),
 }
 
 impl Change {
@@ -55,7 +62,7 @@ impl Change {
         match self {
             Self::Moved(moved) => put(store, moved.iter().map(|&(i, old, _)| (i, old))),
             Self::Swap(other) => std::mem::swap(store, other),
-            Self::Record(_) => {}
+            Self::Record(_) | Self::Roster(_) => {}
         }
     }
 
@@ -64,7 +71,7 @@ impl Change {
         match self {
             Self::Moved(moved) => put(store, moved.iter().map(|&(i, _, new)| (i, new))),
             Self::Swap(other) => std::mem::swap(store, other),
-            Self::Record(_) => {}
+            Self::Record(_) | Self::Roster(_) => {}
         }
     }
 }
@@ -149,6 +156,12 @@ impl ViewLog {
         self.change(guid, Change::Record(before));
     }
 
+    /// The group's roster cells were written: `before` is what the packet found. A packet whose
+    /// handler wrote them logs it once, ahead of the signals it raises (`0x5e6c66`).
+    pub(crate) fn roster(&mut self, before: RosterCells) {
+        self.change(0, Change::Roster(Some(before)));
+    }
+
     /// The group records went from `before` to `now`: each record that differs is logged.
     pub(crate) fn records(
         &mut self,
@@ -201,14 +214,15 @@ impl ViewLog {
 
 /// Each store a token can name as the frame began, with the entity it was read from, the group
 /// records, and how many entries the log held then (`mark`), for the check that the rewind lands
-/// on them: a write the log missed makes it land elsewhere. Taken ahead of the net stage, in
-/// debug builds.
+/// on them: a write the log missed makes it land elsewhere. Taken ahead of the frame's input
+/// records and the net stage, in debug builds.
 #[derive(Resource, Default)]
 pub(crate) struct FrameStart {
     epoch: u64,
     mark: usize,
     stores: HashMap<u64, (Option<Entity>, Option<ObjectStore>)>,
     records: Option<HashMap<u64, PartyMemberStatsInfo>>,
+    roster: Option<RosterCells>,
 }
 
 /// [`FrameStart`]'s snapshot, of the stores and records the lane's rewind starts from: the four
@@ -257,7 +271,8 @@ pub(crate) fn mark_frame_start(
         epoch: log.epoch,
         mark: log.entries.len(),
         stores,
-        records: group.map(|g| g.stats.clone()),
+        records: group.as_deref().map(|g| g.stats.clone()),
+        roster: group.as_deref().map(|g| g.cells().to_owned()),
     };
 }
 
@@ -271,6 +286,12 @@ pub(crate) struct UnitViews {
     scratch: HashMap<u64, (Option<Entity>, Option<ObjectStore>)>,
     /// Every group record as of the drain's place, while the frame changed any.
     records: Option<HashMap<u64, PartyMemberStatsInfo>>,
+    /// The group's roster cells as of the drain's place, while the frame changed them.
+    roster: Option<RosterCells>,
+    /// An entry the drain applied moved the roster cells since the views were last built.
+    roster_moved: bool,
+    /// The frame changed the roster cells.
+    roster_touched: bool,
     /// The guids whose store or record the frame changed, of those some view reads.
     touched: HashSet<u64>,
     /// The guids some view reads: every unit a token can name, its target's targets through the
@@ -328,6 +349,11 @@ impl UnitViews {
                 break;
             };
             for (guid, change) in &mut entry.changes {
+                if let Change::Roster(other) = change {
+                    std::mem::swap(&mut self.roster, other);
+                    self.roster_moved = true;
+                    continue;
+                }
                 if !benilla_protocol::guid::is_item(*guid) {
                     applied.insert(*guid);
                 }
@@ -349,6 +375,7 @@ impl UnitViews {
         &mut self,
         live: impl Fn(Entity) -> Option<&'a ObjectStore>,
         live_records: &HashMap<u64, PartyMemberStatsInfo>,
+        live_roster: crate::ui_party::Cells<'_>,
     ) {
         #[cfg(debug_assertions)]
         {
@@ -368,6 +395,12 @@ impl UnitViews {
                     "views: the group records replayed to a roster the live one is not"
                 );
             }
+            if let Some(roster) = &self.roster {
+                debug_assert!(
+                    roster.cells() == live_roster,
+                    "views: the roster cells replayed to cells the live ones are not"
+                );
+            }
         }
         self.clear();
     }
@@ -376,6 +409,9 @@ impl UnitViews {
         self.pending.clear();
         self.scratch.clear();
         self.records = None;
+        self.roster = None;
+        self.roster_moved = false;
+        self.roster_touched = false;
         self.touched.clear();
         self.readable = Readable::default();
         self.started = false;
@@ -412,6 +448,17 @@ pub(crate) struct ViewStores<'w, 's> {
     views: Option<Res<'w, UnitViews>>,
 }
 
+/// The objects an inventory walk reads as of the drain's place ([`ViewStores::item_objects`]).
+pub(crate) struct AsOfObjects<'a> {
+    by_guid: Box<dyn Fn(u64) -> Option<&'a ObjectStore> + 'a>,
+}
+
+impl crate::ui_items::ItemObjects for AsOfObjects<'_> {
+    fn object(&self, guid: u64) -> Option<&ObjectFields> {
+        (self.by_guid)(guid).map(|s| &s.0)
+    }
+}
+
 /// No store as of the drain's place: the entity holds none, or its object did not exist yet.
 #[derive(Debug)]
 pub(crate) struct NotHeld;
@@ -436,6 +483,51 @@ impl ViewStores<'_, '_> {
         match self.views.as_deref() {
             Some(views) => views.as_of(guid, live),
             None => live,
+        }
+    }
+
+    /// `guid`'s store as of the drain's place, `entity` the one the object manager holds it under
+    /// now ([`Self::by_guid`]): a unit a later packet of the frame destroys still reads as its
+    /// packet left it.
+    pub(crate) fn at(&self, guid: u64, entity: Option<Entity>) -> Option<&ObjectStore> {
+        let live = entity
+            .and_then(|e| self.live.get(e).ok())
+            .map(|(store, _)| store);
+        self.by_guid(guid, live)
+    }
+
+    /// The group records as of the drain's place, `live` the roster's now: while the drain replays
+    /// a frame that wrote any, as its packet left them.
+    pub(crate) fn records<'a>(
+        &'a self,
+        live: &'a HashMap<u64, PartyMemberStatsInfo>,
+    ) -> &'a HashMap<u64, PartyMemberStatsInfo> {
+        self.views
+            .as_deref()
+            .and_then(|v| v.records.as_ref())
+            .unwrap_or(live)
+    }
+
+    /// The group's roster cells as of the drain's place, `live` the roster's now: while the drain
+    /// replays a frame that wrote any, as its packet left them.
+    pub(crate) fn roster<'a>(
+        &'a self,
+        live: &'a crate::ui_party::GroupState,
+    ) -> crate::ui_party::Cells<'a> {
+        match self.views.as_deref().and_then(|v| v.roster.as_ref()) {
+            Some(cells) => cells.cells(),
+            None => live.cells(),
+        }
+    }
+
+    /// The item objects as of the drain's place, `objects` the live ones: an item the frame's
+    /// later packets destroy still reads to an earlier listener's walk.
+    pub(crate) fn item_objects<'a>(
+        &'a self,
+        objects: &'a crate::net::Objects<'_, '_>,
+    ) -> AsOfObjects<'a> {
+        AsOfObjects {
+            by_guid: Box::new(move |guid| self.by_guid(guid, objects.store(guid))),
         }
     }
 }
@@ -518,7 +610,16 @@ pub(super) fn token_views<'a>(
         .and_then(|(store, _)| store.0.unit_target())
         .filter(|guid| *guid != 0)
         .and_then(|guid| Some(held.state((stores.by_guid)(guid)?, guid)));
-    let npc = stores.npc.map(|(store, guid)| held.state(store, guid));
+    // Not a game object's or an item's: those exist for nobody (`0x515fee`), and are named live.
+    let npc = stores
+        .npc
+        .filter(|(store, _)| {
+            store
+                .0
+                .object_type_mask()
+                .is_none_or(|mask| mask & 0x8 != 0 || mask & 0x22 == 0)
+        })
+        .map(|(store, guid)| held.state(store, guid));
     [player, target, tot, npc]
 }
 
@@ -539,7 +640,9 @@ pub(super) fn add_unit_views_lane(app: &mut App) {
     #[cfg(debug_assertions)]
     app.add_systems(
         Update,
-        mark_frame_start.before(benilla_world::schedule::WorldStage::Net),
+        mark_frame_start
+            .before(crate::ui_script::UiInput)
+            .before(benilla_world::schedule::WorldStage::Net),
     );
 }
 
@@ -567,9 +670,10 @@ fn drop_unit_views(mut log: ResMut<ViewLog>, mut views: ResMut<UnitViews>) {
 /// the object manager holds it under.
 ///
 /// Each getter resolves its token at the call (`UnitHealth` calls `0x515970` at `0x517511`), so
-/// a listener for an earlier packet reads the unit the token named then. Not yet: the tokens name
-/// the frame's last selection, interaction and roster through the drain, and a token a call
-/// moves during it is left to that call's own seat, until those are versioned too (#2217).
+/// a listener for an earlier packet reads the unit the token named then. The group tokens name the
+/// roster as of the drain's place ([`ViewStores::roster`]); not yet: the selection and interaction
+/// through the drain are the frame's last, and a token a call moves during it is left to that
+/// call's own seat, until those are versioned too (#2217).
 struct Seats {
     me: Option<(u64, Option<Entity>)>,
     target: Option<(u64, Option<Entity>)>,
@@ -635,9 +739,22 @@ struct Readable {
     grouped: HashSet<u64>,
 }
 
-/// The 0-based weapon seats (`EQUIPMENT_SLOT_MAINHAND`, `_OFFHAND`, `_RANGED`), private fields
-/// only the active player's store carries.
-const WEAPON_SLOTS: [u8; 3] = [15, 16, 17];
+/// The items a store's seats name that the getters walk at mask 0 (`0x622420`): the active
+/// player's equipment and equipped bags (0-22), backpack and keyring, private fields only its store
+/// carries, whose weapons the stat getters read (`UnitAttackSpeed` `0x518f19`, `HasWandEquipped`
+/// `0x4c99c2`) and whose whole set the bar's worn and reagent walks read; and a container's slots.
+fn carried(f: &ObjectFields) -> Vec<Option<u64>> {
+    use benilla_protocol::messages::ObjectType;
+    match f.created_as() {
+        Some(ObjectType::Player) => (0..23)
+            .map(|i| f.player_inv_slot(i))
+            .chain((0..16).map(|i| f.player_pack_slot(i)))
+            .chain((0..32).map(|i| f.player_keyring_slot(i)))
+            .collect(),
+        Some(ObjectType::Container) => (0..36).map(|i| f.container_slot(i)).collect(),
+        _ => Vec::new(),
+    }
+}
 
 /// One guid's store from `live` back to the frame's start, undoing `entries`' changes to it in
 /// reverse, checked against the frame-start snapshot `start` when given; with every object it named
@@ -655,15 +772,10 @@ fn undo_frame(
         s.as_ref()
             .map(|s| {
                 let f = &s.0;
-                let [main, off, ranged] = WEAPON_SLOTS.map(|slot| f.player_inv_slot(slot));
-                [
-                    f.unit_target(),
-                    f.unit_charm(),
-                    f.unit_summon(),
-                    main,
-                    off,
-                    ranged,
-                ]
+                [f.unit_target(), f.unit_charm(), f.unit_summon()]
+                    .into_iter()
+                    .chain(carried(f))
+                    .collect::<Vec<_>>()
             })
             .into_iter()
             .flatten()
@@ -726,6 +838,36 @@ fn undo_records(
     records
 }
 
+/// The roster cells from `live` back to the frame's start, undoing `entries`' roster changes in
+/// reverse, checked against the frame-start snapshot `start` when given.
+fn undo_roster(
+    live: crate::ui_party::Cells<'_>,
+    entries: &mut [Entry],
+    start: Option<&FrameStart>,
+) -> RosterCells {
+    let mut cells = Some(live.to_owned());
+    let mark = start.map_or(0, |s| s.mark);
+    let mut at_mark = None;
+    for (i, entry) in entries.iter_mut().enumerate().rev() {
+        if start.is_some() && i + 1 == mark {
+            at_mark = Some(cells.clone());
+        }
+        for (_, change) in entry.changes.iter_mut().rev() {
+            if let Change::Roster(other) = change {
+                std::mem::swap(&mut cells, other);
+            }
+        }
+    }
+    if let Some(snapshot) = start.and_then(|s| s.roster.as_ref()) {
+        debug_assert!(
+            at_mark.as_ref().unwrap_or(&cells).as_ref() == Some(snapshot),
+            "views: the roster cells rewound to cells the frame did not start from: a write the \
+             log missed"
+        );
+    }
+    cells.unwrap_or_else(|| live.to_owned())
+}
+
 /// The drain's end, however it ended: one that stopped before this lane replayed all it took
 /// leaves no rewound store for a later read, and the VM back on the views it held.
 fn end_drain(world: &mut World) {
@@ -776,6 +918,7 @@ impl UnitViews {
         live: impl Fn(Entity) -> Option<ObjectStore>,
         by_guid: impl Fn(u64) -> Option<Entity>,
         live_records: &HashMap<u64, PartyMemberStatsInfo>,
+        live_roster: crate::ui_party::Cells<'_>,
         start: Option<&FrameStart>,
     ) {
         // The snapshot is checked against for each guid read from the entity it was taken from.
@@ -791,11 +934,15 @@ impl UnitViews {
         let mut touched = HashSet::new();
         let mut stores = Vec::new();
         let mut records = false;
+        let mut roster = false;
         for (guid, change) in entries.iter().flat_map(|e| &e.changes) {
-            if let Change::Record(_) = change {
-                records = true;
-            } else {
-                stores.push(*guid);
+            match change {
+                Change::Record(_) => records = true,
+                Change::Roster(_) => {
+                    roster = true;
+                    continue;
+                }
+                _ => stores.push(*guid),
             }
             touched.insert(*guid);
         }
@@ -813,8 +960,17 @@ impl UnitViews {
             }
         };
         for (_, change) in entries.iter().flat_map(|e| &e.changes) {
-            if let Change::Record(Some(record)) = change {
-                name(record.pet_guid.unwrap_or(0), &mut readable, &mut queue);
+            match change {
+                Change::Record(Some(record)) => {
+                    name(record.pet_guid.unwrap_or(0), &mut readable, &mut queue);
+                }
+                // A member the roster held through the frame, and no longer does.
+                Change::Roster(Some(cells)) => {
+                    for m in cells.cells().members {
+                        name(m.guid, &mut readable, &mut queue);
+                    }
+                }
+                _ => {}
             }
         }
         queue.extend(stores.iter().filter(|g| readable.all.contains(g)));
@@ -849,12 +1005,18 @@ impl UnitViews {
         let rewound =
             (records || checked_records).then(|| undo_records(live_records, &mut entries, start));
         self.records = rewound.filter(|_| records);
+        // The roster cells likewise.
+        let checked_roster = start.is_some_and(|s| s.roster.is_some());
+        let rewound =
+            (roster || checked_roster).then(|| undo_roster(live_roster, &mut entries, start));
+        self.roster = rewound.filter(|_| roster);
+        self.roster_touched = roster;
         self.pending = entries
             .into_iter()
             .filter_map(|mut entry| {
-                entry
-                    .changes
-                    .retain(|(g, c)| matches!(c, Change::Record(_)) || scratch.contains_key(g));
+                entry.changes.retain(|(g, c)| {
+                    matches!(c, Change::Record(_) | Change::Roster(_)) || scratch.contains_key(g)
+                });
                 (!entry.changes.is_empty()).then_some(entry)
             })
             .collect();
@@ -965,14 +1127,26 @@ fn fire_unit_views(
             let me = self_q.iter().next().and_then(|(e, _)| all.get(e).ok());
             let pet = crate::ui_unit::pet_token_guid(me);
             let readable = readable_guids(script, &seats, &group, pet, &live_store);
-            views.rewind(entries, seats, readable, live, by_guid, &group.stats, start);
+            views.rewind(
+                entries,
+                seats,
+                readable,
+                live,
+                by_guid,
+                &group.stats,
+                group.cells(),
+                start,
+            );
             views.started = true;
         }
         let applied = views.apply(until);
+        // The roster cells moved: the group tokens name other members.
+        let roster_moved = views.roster_moved || (first && views.roster_touched);
+        views.roster_moved = false;
         let last = views.pending.is_empty();
         let live_store = |e: Entity| all.get(e).ok();
         if first && last {
-            views.finish(live_store, &group.stats);
+            views.finish(live_store, &group.stats, group.cells());
             return;
         }
         let frozen = views.frozen(selection.guid, npc_seat.map(|(g, _)| g));
@@ -983,7 +1157,7 @@ fn fire_unit_views(
             {
                 views.pushes += _pushes;
             }
-            views.finish(live_store, &group.stats);
+            views.finish(live_store, &group.stats, group.cells());
             return;
         }
         let dirty = if first {
@@ -992,17 +1166,21 @@ fn fire_unit_views(
             applied
         };
         // A gap whose entries no view reads builds nothing.
-        if dirty.is_empty() {
+        if dirty.is_empty() && !roster_moved {
             return;
         }
         #[cfg(test)]
         {
             views.builds += 1;
         }
-        // The records as of here stand in the roster while the views are built.
+        // The records and the cells as of here stand in the roster while the views are built.
         let mut records = views.records.take();
         if let Some(records) = records.as_mut() {
             std::mem::swap(&mut group.bypass_change_detection().stats, records);
+        }
+        let mut roster = views.roster.take();
+        if let Some(roster) = roster.as_mut() {
+            group.bypass_change_detection().swap_cells(roster);
         }
         let UnitViews {
             scratch,
@@ -1074,6 +1252,7 @@ fn fire_unit_views(
                 .next()
                 .and_then(|(e, g)| Some((g.0, all.get(e).ok()?))),
             group: &group,
+            roster_moved,
             tables,
             names,
             commands,
@@ -1089,7 +1268,11 @@ fn fire_unit_views(
         if let Some(records) = records.as_mut() {
             std::mem::swap(&mut group.bypass_change_detection().stats, records);
         }
+        if let Some(roster) = roster.as_mut() {
+            group.bypass_change_detection().swap_cells(roster);
+        }
         views.records = records;
+        views.roster = roster;
         #[cfg(test)]
         {
             views.pushes += pushes;

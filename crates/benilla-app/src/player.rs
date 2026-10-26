@@ -60,6 +60,8 @@ pub(crate) mod land;
 mod move_trace;
 mod movement_net;
 mod posture;
+// A movement command's press or release, run inside the frame's input records.
+mod press;
 // `pub(crate)`: a remote mover's dead-reckon (`crate::net::motion::remote`) steps through the same
 // walk resolve, as the reference runs every mover through one controller.
 pub(crate) mod mover;
@@ -90,6 +92,7 @@ pub(crate) struct ControlRestore;
 // itself before it.
 pub(crate) use camera::apply_self_model_fade;
 use controller::control;
+pub(crate) use controller::LookSample;
 // The private camera and `state` items are re-imported for the modules beside this one, which
 // name them `super::X`.
 pub(crate) use camera::{head_height, CameraControl, CameraPivot};
@@ -277,6 +280,14 @@ pub(crate) struct WorldFocusSet;
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct PlayerControlSet;
 
+/// The world's mouse among the frame's input records, after the UI's ([`crate::ui_script::UiInput`],
+/// whose hover and press consumption it reads) and ahead of the net drain: which buttons the world
+/// owns, the right press's hook, and the look session with its click tests
+/// ([`controller::sample_look`]), as the reference's world-frame mouse handlers run in the window
+/// input (`0x423920` at `0x420d23`).
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct WorldMouse;
+
 /// The player and camera: spawns the camera and avatar resources, and runs the controller.
 pub(crate) struct PlayerPlugin;
 
@@ -418,26 +429,54 @@ impl Plugin for PlayerPlugin {
                 // Off in capture mode, where the camera is pinned.
                 .run_if(not(resource_exists::<crate::run_mode::CaptureMode>)),
         )
-        // Which mouse buttons the world owns, decoded ahead of its three readers: `/follow`'s
-        // both-button cancel, the look session and the camera's command word. Not in `control`:
-        // `steer_follow` runs before it and would read the latch a frame late.
+        // The cast bar's self-cancel inside the press, between its verdict and its tick, so
+        // `CMSG_CANCEL_CAST` goes out ahead of the start (`0x51512a` before `0x5151a0`).
+        .configure_sets(
+            Update,
+            crate::spell::LocalCancel
+                .after(press::press_commands)
+                .before(press::press_tick),
+        )
+        // The world's mouse input records, after the UI's and ahead of the packets.
+        .configure_sets(
+            Update,
+            WorldMouse
+                .after(crate::ui_script::UiInput)
+                .before(WorldStage::Net),
+        )
+        .init_resource::<LookSample>()
+        // Which mouse buttons the world owns, decoded ahead of its readers: the look session,
+        // `/follow`'s both-button cancel and the camera's command word.
         .add_systems(
             Update,
             camera::latch_world_mouse
-                .in_set(WorldStage::Input)
-                .before(control)
-                .before(follow::steer_follow)
+                .in_set(WorldMouse)
                 .in_set(crate::client_state::InWorldGated),
         )
-        // The world's right mouse-down, off that latch and ahead of `control`, the button's
-        // binding, as `0x483c40` runs its hook before `ExecuteBinding`; off in capture mode, like
-        // `control`.
+        // The look calls the packets' handlers made, after their events and ahead of the tick and
+        // the controller.
         .add_systems(
             Update,
-            camera::send_world_right_press
-                .in_set(WorldStage::Input)
+            camera::apply_late_look_calls
+                .in_set(crate::lanes::UiLanes)
+                .after(crate::lanes::fire_in_order)
+                .in_set(crate::client_state::InWorldGated),
+        )
+        // The world's right mouse-down, off that latch and ahead of the look session, as
+        // `0x483c40` runs its hook before `ExecuteBinding`; off in capture mode, like `control`.
+        // Then the look session, whose release settles the click tests, and the tick the frame's
+        // command presses and releases run (`0x515090` → `0x514640`), after the press's hand-off.
+        .add_systems(
+            Update,
+            (
+                camera::send_world_right_press,
+                controller::sample_look,
+                press::press_commands,
+                press::press_tick,
+            )
+                .chain()
+                .in_set(WorldMouse)
                 .after(camera::latch_world_mouse)
-                .before(control)
                 .run_if(not(resource_exists::<crate::run_mode::CaptureMode>))
                 .in_set(crate::client_state::InWorldGated),
         )

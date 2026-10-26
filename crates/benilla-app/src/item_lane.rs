@@ -66,12 +66,6 @@ impl ItemLane {
         self.1
     }
 
-    /// The notices queued, in stamp order: what the readers that push ahead of the lane read to
-    /// know the bags moved.
-    pub(crate) fn notices(&self) -> impl Iterator<Item = &ItemNotice> {
-        self.0.iter().filter_map(|(_, r, _)| r.notice.as_ref())
-    }
-
     /// Take every run waiting with its stamp, in order, unfired.
     #[cfg(test)]
     pub(crate) fn drain_stamped(&mut self) -> Vec<(Stamp, Run)> {
@@ -197,9 +191,9 @@ fn fire_run(vm: &mut RunVm, reads: &mut RunReads, run: Run, touch: Option<TradeT
         return;
     };
     let rebuild = rebuild_at(&notice);
-    vm.run(|script| {
+    let held = vm.run(|script| {
         let Some(script) = script else {
-            return;
+            return false;
         };
         fire_unlocks(script, unlocks);
         if rebuild == Some(Rebuild::BeforeRecount) {
@@ -207,6 +201,9 @@ fn fire_run(vm: &mut RunVm, reads: &mut RunReads, run: Run, touch: Option<TradeT
                 carried(&reads.me, &reads.trade.objects, entry)
             });
         }
+        true
+    });
+    if held {
         let counter = crate::ui_action::recount::Counter {
             store: reads.me.iter().next(),
             objects: &reads.trade.objects,
@@ -214,9 +211,9 @@ fn fire_run(vm: &mut RunVm, reads: &mut RunReads, run: Run, touch: Option<TradeT
             commands: &reads.trade.commands,
         };
         for entry in notice.recounts() {
-            crate::ui_action::recount::recount(script, &counter, entry);
+            crate::ui_action::recount::recount(vm, &counter, entry);
         }
-    });
+    }
     if let Some(touch) = touch {
         vm.turn(|script, (trade, _)| {
             if let (Some(script), Some(mut trade)) = (script, trade) {

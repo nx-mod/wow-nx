@@ -19,6 +19,7 @@
 #[global_allocator]
 static ALLOC: assert_no_alloc::AllocDisabler = assert_no_alloc::AllocDisabler;
 
+mod account_data;
 pub mod addon_harness;
 mod area;
 mod area_poi;
@@ -288,10 +289,21 @@ mod switch_marks {
     }
 }
 
+/// The main thread joins a single-threaded apartment before any window, as winit's `OleInitialize`
+/// for drag and drop needs; a hook that joined it to the MTA first would make window creation panic.
+#[cfg(windows)]
+fn main_apartment() {
+    use windows_sys::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+    // SAFETY: no pointers; never balanced, so the apartment lasts the process; cpal's thread has its own.
+    let _ = unsafe { CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32) };
+}
+
 /// The one body behind [`run`] and [`run_with`], not generic, so a launcher compiles none of it.
 fn launch(build: BuildId, extend: Option<Extension<'_>>) -> AppExit {
     #[cfg(target_os = "horizon")]
     switch::prepare();
+    #[cfg(windows)]
+    main_apartment();
     // `WOW_HOVER_LOG_REPORT=<csv>` and `WOW_CAPTURE=list` print and exit before any setup.
     if let Ok(path) = std::env::var("WOW_HOVER_LOG_REPORT") {
         dev::report_recorded_hover_log(&path);

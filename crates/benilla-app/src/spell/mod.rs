@@ -34,11 +34,14 @@ pub(crate) use cast_send::{
     UnitAttackOwed, UnitPress,
 };
 pub(crate) use cast_target::AutoSelfCast;
-pub(crate) use cooldowns::Cooldowns;
+pub(crate) use cooldowns::{CooldownLive, Cooldowns, Signal};
 pub(crate) use inflight::{
     ActiveChannel, AutoRepeatActive, CastState, LocalMoveStart, PendingCast, QueuedMeleeSpell,
     SelfCancel, SPELL_INTERRUPT_MOVEMENT,
 };
+// The command press's harness runs the self-cancel between its two systems.
+#[cfg(test)]
+pub(crate) use inflight::local_self_cancel;
 pub(crate) use mods::{
     CategoryPad, ModsDiff, SpellModifiers, OP_CAST_TIME, OP_COST, OP_GCD, OP_RADIUS,
 };
@@ -96,15 +99,21 @@ impl Plugin for SpellPlugin {
             .add_systems(
                 Update,
                 (
+                    // Inside the command press, among the input records (`player::press`).
                     inflight::local_self_cancel
-                        .in_set(UnitFeed)
-                        .in_set(LocalCancel),
+                        .in_set(LocalCancel)
+                        .run_if(crate::ui_script::ingame_ui_up),
                     mods::track_class_family
                         .in_set(crate::ui_script::UiFeed)
                         .before(UnitFeed),
-                    // The state push runs before the input pass's `ToggleGameMenu`, whose
-                    // `SpellStopTargeting` applies inside its call. After the aura feed, whose
-                    // resolver inputs list the units the hover verdict is asked for.
+                    // The state push ahead of the input records, whose `ToggleGameMenu` reads
+                    // the word and whose `SpellStopTargeting` applies inside its call.
+                    targeting::feed_targeting_to_input
+                        .in_set(crate::ui_script::UiInputViews)
+                        .run_if(crate::ui_script::ingame_ui_up),
+                    // And after the packets and the clicks, for the handlers and the tick. After
+                    // the aura feed, whose resolver inputs list the units the hover verdict is
+                    // asked for.
                     targeting::feed_targeting_to_vm
                         .in_set(UnitFeed)
                         .after(LocalCancel)

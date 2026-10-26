@@ -13,12 +13,24 @@
 //!
 //! `source` is always nil, and only the player's auras carry a duration: the 1.12 wire has no aura
 //! caster and sends durations for the player alone, so the stock target frame shows no timers.
+//!
+//! The unit walks read the unit's slots as the call runs, through the lent host ([`read`]); the
+//! pushed lists answer only with no host to ask. The `GetPlayerBuff` family reads no object: the
+//! cache it reads is the client's own, rebuilt at each packet that moves the aura fields
+//! (`0x4e4140` → `0x4e4170`), and its timers the expiry array the duration packet writes
+//! (`0x4e4390` into `0xbc5f68`).
 
 use mlua::{Lua, MultiValue, Value};
 
 use super::Model;
 
 mod player_buff;
+mod read;
+
+pub use player_buff::PlayerBuffExpiry;
+pub(crate) use player_buff::{expiry_of, until_cancelled_of};
+pub(crate) use read::{aura_unit, nth_kept, read_auras_of};
+pub use read::{AuraListRead, AuraRead};
 
 /// One aura on one unit, as the app's feed pushes it ([`crate::script::UiScript::set_unit_auras`],
 /// [`crate::script::UiScript::set_player_auras`]).
@@ -26,6 +38,9 @@ mod player_buff;
 pub struct AuraState {
     /// `Spell.dbc` id, what `CMSG_CANCEL_AURA` names and the app's icon lookup keys on.
     pub spell_id: u32,
+    /// The descriptor slot the aura sits in, the cache record's `+0x0`: what the expiry array
+    /// (`0xbc5f68`) is indexed by (`0x4e4450`).
+    pub slot: u8,
     /// The spell's name; `None` when the catalog lacks the id.
     pub name: Option<String>,
     /// The icon's extensionless MPQ path (`Interface\Icons\…`).
@@ -39,8 +54,11 @@ pub struct AuraState {
     /// `"Magic"`, `"Curse"`, `"Disease"`, `"Poison"` or `None`; the debuff border tints by it.
     pub debuff_type: Option<String>,
     /// Seconds, from the last apply or refresh; 0 when permanent or on a unit not the player.
+    /// The player's list carries none: the getters read it through the lent host
+    /// ([`PlayerBuffExpiry`]).
     pub duration: f64,
-    /// The `GetTime()` instant it runs out; 0 when [`Self::duration`] is 0.
+    /// The `GetTime()` instant it runs out; 0 when [`Self::duration`] is 0. The snapshot's, which
+    /// the getters read only with no host to ask ([`PlayerBuffExpiry`]).
     pub expiration_time: f64,
     /// A buff rather than a debuff: the `HELPFUL`/`HARMFUL` filter's test.
     pub helpful: bool,
@@ -50,6 +68,9 @@ pub struct AuraState {
     /// from the spell (`0x4e452e`-`0x4e45c5`), not from `expiration_time`, so it holds before any
     /// `SMSG_UPDATE_AURA_DURATION` and a permanent aura never shows a `0 s` timer.
     pub until_cancelled: bool,
+    /// The spell is not in the catalog, so the record's flag is not known: the call reads it as
+    /// `expiry == 0` ([`until_cancelled_of`]).
+    pub until_cancelled_unknown: bool,
     /// `AttributesEx & 0x4` (`SPELL_ATTR_EX_IS_CHANNELED`), [`cancel_authorized`]'s second arm.
     pub channeled: bool,
     /// Kept by a set `raidFilter`: a buff the player could cast (`0x4b3870`), a debuff whose
@@ -123,17 +144,16 @@ fn returns(lua: &Lua, a: &AuraState, with_dispel_type: bool) -> mlua::Result<Mul
     Ok(MultiValue::from_vec(out))
 }
 
-/// The list of the unit `token` names, through the resolver (`0x515970`, which `UnitBuff` calls at
-/// `0x519542`), the player's by slot as any unit's; `None` for nobody or a unit with no list. A
-/// token the resolver does not recognise raises `Unknown unit name`.
-pub(crate) fn auras_of<'m>(
-    model: &'m Model,
-    token: &str,
-) -> mlua::Result<Option<&'m UnitAuraList>> {
-    Ok(model
+/// The list of the unit `token` names off the snapshots, for a reader outside any call: the pushed
+/// resolver inputs (`0x515970`, which `UnitBuff` calls at `0x519542`), the player's by slot as any
+/// unit's; `None` for nobody, a unit with no list, and a token the resolver does not recognise.
+pub(crate) fn auras_of<'m>(model: &'m Model, token: &str) -> Option<&'m UnitAuraList> {
+    model
         .unit_guids
-        .guid_of(token)?
-        .and_then(|g| model.unit_auras.get(&g)))
+        .resolve(token)
+        .ok()
+        .flatten()
+        .and_then(|g| model.unit_auras.get(&g))
 }
 
 /// `UnitBuff`'s and `UnitDebuff`'s walk over `list`: the half the verb names, the buffs only
@@ -152,9 +172,11 @@ pub(crate) fn raid_filter_arg(v: Option<&Value>) -> bool {
     crate::script::binding_abi::flag_or_default(v, 0) != 0
 }
 
-/// The `index`-th (1-based) buff (`helpful`) or debuff of `token`, in pushed order, counting only
-/// the `raid_listed` ones under `raid`; out of range answers one nil on every miss leg
-/// (`0x5195fe`, `0x5197d4`, `0x519a51`), the loop terminator.
+/// The `index`-th (1-based) buff (`helpful`) or debuff of `token`, in slot order, counting only
+/// the `raid_listed` ones under `raid`, read off the unit as the call runs ([`read_auras_of`]);
+/// out of range answers one nil on every miss leg (`0x5195fe`, `0x5197d4`, `0x519a51`), the loop
+/// terminator. The buffs only through the unit gate ([`UnitAuraList::buffs_visible`]), read before
+/// any slot (`0x5195aa`), and both halves past the vision test ([`AuraState::vision_hidden`]).
 fn nth_aura(
     lua: &Lua,
     token: &Option<String>,
@@ -164,20 +186,19 @@ fn nth_aura(
 ) -> mlua::Result<MultiValue> {
     // The token resolves before the index is read (`0x519542`, then `0x51957a`), so a bad token
     // raises at any index.
-    let hit = {
-        let model = lua.app_data_ref::<Model>().expect("model app_data");
-        match token {
-            Some(t) => auras_of(&model, t)?
-                .filter(|_| index >= 1)
-                .and_then(|list| {
-                    listed(list, helpful)
-                        .filter(|a| !raid || a.raid_listed)
-                        .nth((index - 1) as usize)
-                        .cloned()
-                }),
-            None => None,
-        }
+    let guid = match token {
+        Some(t) => aura_unit(lua, t)?,
+        None => None,
     };
+    let hit = read_auras_of(lua, guid, |list| {
+        let list = list.filter(|_| index >= 1)?;
+        if helpful && !list.buffs_visible() {
+            return None;
+        }
+        nth_kept(list, (index - 1) as usize, |a| {
+            a.helpful() == helpful && !a.vision_hidden() && (!raid || a.raid_listed())
+        })
+    });
     match hit {
         Some(a) => returns(lua, &a, !helpful),
         None => Ok(MultiValue::from_vec(vec![Value::Nil])),
@@ -246,8 +267,6 @@ impl super::UiScript {
     pub fn aura_spell_ids(&self, token: &str, helpful: bool) -> Vec<u32> {
         let model = self.model_ref();
         auras_of(&model, token)
-            .ok()
-            .flatten()
             .map(|list| listed(list, helpful).map(|a| a.spell_id).collect())
             .unwrap_or_default()
     }
@@ -383,6 +402,8 @@ mod tests {
             until_cancelled: false,
             channeled: false,
             raid_listed: false,
+            slot: 0,
+            until_cancelled_unknown: false,
             vision_hidden: false,
         }
     }

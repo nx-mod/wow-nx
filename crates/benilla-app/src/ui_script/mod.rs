@@ -24,10 +24,15 @@ pub(crate) mod glue_create;
 pub(crate) mod glue_mgr;
 pub(crate) mod glue_scene;
 mod input;
+mod movie;
+mod records;
 /// The server alert's fetch and `LaunchURL`'s browser, for the stock glue screens.
 pub(crate) mod server_alert;
 #[cfg(test)]
 pub(crate) use input::feed_keys;
+#[cfg(test)]
+pub(crate) use records::records_from_planes;
+pub(crate) use records::{collect_input_records, InputRecord, InputRecords, Record};
 // Test-only: the bindings tests run the UI's wheel sweep ahead of the dispatch pass.
 #[cfg(test)]
 pub(crate) use input::feed_wheel;
@@ -149,6 +154,24 @@ pub(crate) struct PlayerUiClickConsumed(pub(crate) bool);
 #[derive(Resource, Default)]
 pub(crate) struct PlayerUiPressConsumed(pub(crate) bool);
 
+/// Who this frame's button presses went to, as the records dispatched them: `(button, over_ui)`
+/// per press, `over_ui` when a frame was hovered, the interface consumed it or the dev overlay held
+/// the pointer. The world frame's binding and the world's mouse latch both read it, so they agree
+/// on who owns a press; a button no record pressed this frame is absent.
+#[derive(Resource, Default)]
+pub(crate) struct WorldPresses(pub(crate) Vec<(MouseButton, bool)>);
+
+impl WorldPresses {
+    /// Whether the frame's last press of `button` was the interface's, `None` with no press.
+    pub(crate) fn over_ui(&self, button: MouseButton) -> Option<bool> {
+        self.0
+            .iter()
+            .rev()
+            .find(|(b, _)| *b == button)
+            .map(|(_, over)| *over)
+    }
+}
+
 /// Whether the cursor carries a payload, a `Send` mirror. A click on sky with one held never
 /// deselects: the reference gates its nothing-leg `SetSelection(0,0)` on no payload (`0x492d30`).
 #[derive(Resource, Default)]
@@ -171,11 +194,12 @@ pub(crate) struct UiPassState {
     pub(crate) derives_before: u64,
 }
 
-/// The player-UI feed phase, after [`WorldStage::Net`] and the input pass and ungated (`UnitFeed`
+/// The player-UI feed phase, after the input pass and [`WorldStage::Net`] and ungated (`UnitFeed`
 /// is the gated sub-phase): every push this frame's tick must see, as in the reference's tick,
 /// where the packets (category 6, `0x420d55`) follow the window input and precede the frame pass's
-/// `OnUpdate`. Every VM holder in `Update` is in [`UiInput`], in this set or `.after(UiTick)`, as
-/// `game_plugins::schedule_tests` checks.
+/// `OnUpdate`. Every VM holder in `Update` is in the frame's input records ([`UiInput`],
+/// [`crate::player::WorldMouse`], [`crate::target::WorldClicks`]), in this set or
+/// `.after(UiTick)`, as `game_plugins::schedule_tests` checks.
 #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct UiFeed;
 
@@ -189,13 +213,20 @@ pub(crate) struct UiDrain;
 #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct UiPaint;
 
-/// The player-UI input pass (hit test, handlers, then the bindings): the frame's window input
-/// records, which the reference runs ahead of its packets (`0x423920` at `0x420d23`), so ahead of
-/// [`UiFeed`]; and before [`WorldStage::Input`], so its [`PlayerUiHover`] reaches `PointerOverUi`
-/// before `player::control` reads it. It follows the net drain, as the pass's start does
-/// ([`crate::vm_pass::VmPass::Start`]).
+/// The player-UI input pass: the frame's window input records ([`InputRecords`]), each whole
+/// through the interface's walk and the world frame's binding before the next, which the reference
+/// runs ahead of its packets (`0x423920` at `0x420d23`), so ahead of the net drain
+/// ([`WorldStage::Net`]) and [`UiFeed`]: a handler and the calls it makes read the world as the
+/// last frame left it. First of the frame's input records, so its [`PlayerUiHover`] reaches
+/// `PointerOverUi` before the world's mouse reads it.
 #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct UiInput;
+
+/// The VM's views the input records read pushed ahead of them, at the head of [`UiInput`]: what an
+/// engine writer outside the calls moved after the last frame's feeds (the targeting cursor's
+/// word).
+#[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct UiInputViews;
 
 /// The tick: the `OnUpdate` walk of the frame pass (category 0x11 at `0x420d6a`, `0x764330` →
 /// `0x765650`), after the input pass and the feeds, so a handler reads this frame's input and
@@ -286,11 +317,94 @@ pub(crate) fn seam_scale(window_h: f32) -> f32 {
     }
 }
 
+/// The interface's own screen on the window. Its cells take the aspect `0x4901e0` (in glue
+/// `0x46ab40`) answers, the window's while `widescreen` is on and 4/3 when it is 0, through
+/// `0x41ad10` (`0x48fe1e`, `0x46a81c`), and the layout always spans the whole window. So with
+/// `widescreen` 0 the interface lays out 4:3, `4/3` of the window's height across, and is drawn
+/// stretched across the window, as 1.12.1 does on any other shape.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct UiScreen {
+    /// The interface's screen in its own px: the window's height, and its width or `4/3` of it.
+    pub(crate) size: Vec2,
+    /// Window px per interface px across; 1 unless stretched.
+    pub(crate) stretch: f32,
+    /// The display aspect the cells and the automatic scale take (`0x4901e0`, stored at
+    /// `0x48fe1e`): the window's `RN24(w/h)`, or exactly `RN24(4/3)` with `widescreen` 0, never
+    /// derived from a rounded size.
+    pub(crate) aspect: f32,
+    /// The window in logical px, the display size the automatic scale is keyed on (`0x492f70`).
+    pub(crate) window: Vec2,
+}
+
+impl UiScreen {
+    /// The screen for a window of `window` logical px.
+    pub(crate) fn of(window: Vec2, widescreen: bool) -> Self {
+        if window.x <= 0.0 || window.y <= 0.0 {
+            return Self {
+                size: window,
+                stretch: 1.0,
+                aspect: 4.0 / 3.0,
+                window,
+            };
+        }
+        if widescreen {
+            return Self {
+                size: window,
+                stretch: 1.0,
+                aspect: window.x / window.y,
+                window,
+            };
+        }
+        let size = Vec2::new(window.y * (4.0 / 3.0), window.y);
+        Self {
+            size,
+            stretch: window.x / size.x,
+            aspect: 4.0 / 3.0,
+            window,
+        }
+    }
+
+    /// The display size in whole logical px, as the automatic scale takes it (`0x492f70`).
+    pub(crate) fn display(self) -> (u32, u32) {
+        (self.window.x.round() as u32, self.window.y.round() as u32)
+    }
+
+    /// The screen for `window` under the `widescreen` the CVar holds (on when absent).
+    pub(crate) fn of_window(
+        window: &bevy::window::Window,
+        widescreen: Option<&crate::video::Widescreen>,
+    ) -> Self {
+        Self::of(
+            Vec2::new(window.width(), window.height()),
+            widescreen.is_none_or(|w| w.0),
+        )
+    }
+
+    /// A window point (logical px) in the interface's px.
+    pub(crate) fn point(self, window_px: Vec2) -> Vec2 {
+        Vec2::new(window_px.x / self.stretch, window_px.y)
+    }
+
+    /// [`Self::point`]'s inverse: an interface point in window px.
+    pub(crate) fn window_point(self, ui_px: Vec2) -> Vec2 {
+        Vec2::new(ui_px.x * self.stretch, ui_px.y)
+    }
+}
+
+/// [`window_to_ui`]'s inverse: a point in the VM's root units as a window cursor.
+pub(crate) fn ui_to_window(screen: UiScreen, at: Vec2) -> Vec2 {
+    let h = screen.size.y;
+    let s = seam_scale(h);
+    screen.window_point(Vec2::new(at.x * s, h - at.y * s))
+}
+
 /// A window cursor (logical px, y-down from the top left) in the VM's root units, y up: what the
 /// pointer feed hands the engine and `GetCursorPosition` answers (`0x48b820`, no scale divided out).
-pub(crate) fn window_to_ui(window_h: f32, cursor: Vec2) -> Vec2 {
-    let s = seam_scale(window_h);
-    Vec2::new(cursor.x / s, (window_h - cursor.y) / s)
+pub(crate) fn window_to_ui(screen: UiScreen, cursor: Vec2) -> Vec2 {
+    let h = screen.size.y;
+    let s = seam_scale(h);
+    let p = screen.point(cursor);
+    Vec2::new(p.x / s, (h - p.y) / s)
 }
 
 /// The Lua UI host (a `NonSend` resource: an mlua VM is `!Send`) and its per-frame passes.
@@ -352,6 +466,7 @@ impl Plugin for UiScriptPlugin {
             .init_resource::<UiKeyboardCapture>()
             .init_resource::<PlayerUiClickConsumed>()
             .init_resource::<PlayerUiPressConsumed>()
+            .init_resource::<WorldPresses>()
             .init_resource::<CursorPayloadHeld>()
             .init_resource::<UiClock>()
             .init_resource::<benilla_world::frame_pace::FrameStep>()
@@ -410,22 +525,26 @@ impl Plugin for UiScriptPlugin {
                     .chain(),
             )
             // The UI phases in the reference's tick order (`core/loop`, "What one tick runs"): the
-            // window input records (`0x423920` at `0x420d23`), then the feeds of the packets
-            // (category 6, `0x420d55`), then the tick, the frame pass's `OnUpdate` walk (category
-            // 0x11, `0x420d6a`), and the paint; the drains of what the Lua asked after the tick,
-            // and after every later host the VM pass can put them behind, before the paint
-            // (`crate::vm_pass`).
+            // window input records (`0x423920` at `0x420d23`) ahead of the net drain, then the
+            // feeds of the packets it applied (category 6, `0x420d55`), then the tick, the frame
+            // pass's `OnUpdate` walk (category 0x11, `0x420d6a`), and the paint; the drains of
+            // what the Lua asked after the tick, and after every later host the VM pass can put
+            // them behind, before the paint (`crate::vm_pass`).
             .configure_sets(
                 Update,
                 (
-                    UiInput.after(WorldStage::Net),
-                    UiFeed,
+                    UiInput.before(WorldStage::Net),
+                    UiFeed.after(WorldStage::Net),
                     UiTick.before(WorldStage::Input),
                     UiPaint,
                 )
                     .chain(),
             )
             .configure_sets(Update, UiDrain.after(UiTick))
+            .configure_sets(
+                Update,
+                UiInputViews.in_set(UiInput).before(input::feed_ui_input),
+            )
             // `GetFramerate()`'s ring, a static of the client's that no reload or logout
             // resets: the feed hands a new VM its rate before the tick, and each world frame's
             // step joins the ring after its paint, standing for `CGWorldFrame::OnRender`
@@ -443,6 +562,20 @@ impl Plugin for UiScriptPlugin {
             // records meet the rects its last frame pass drained (`0x7656ba`, `0x765799`), and runs
             // in-world only or on the stock glue screens.
             .init_resource::<UiPassState>()
+            // The frame's window input records, read first, ungated, so no frame dispatches a
+            // stale one.
+            .init_resource::<InputRecords>()
+            .add_message::<bevy::window::WindowEvent>()
+            .add_systems(
+                Update,
+                collect_input_records
+                    .in_set(UiInput)
+                    .before(UiInputViews)
+                    .before(crate::bindings::BindingHead),
+            )
+            // In `Last`, after a look session's end has put the cursor back, so the next frame's
+            // records start from where the pointer is.
+            .add_systems(Last, records::note_frame_end_cursor)
             .add_systems(
                 Update,
                 (
@@ -455,8 +588,9 @@ impl Plugin for UiScriptPlugin {
                 )
                     .chain()
                     .in_set(UiInput)
-                    // So a key a focused box consumed never also fires a binding.
-                    .before(crate::bindings::BindingSet),
+                    // Each record's binding runs inside its walk, between the pass's head and tail.
+                    .after(crate::bindings::BindingHead)
+                    .before(crate::bindings::BindingTail),
             )
             .add_systems(
                 Update,
@@ -471,6 +605,28 @@ impl Plugin for UiScriptPlugin {
             )
             // After the plate driver seats this frame's nameplates, and before the append lane
             // fills the widget slot this pass parks.
+            // A scripted run's startup movie skipped before its first tick.
+            .add_systems(Update, glue::skip_unattended_startup_movie.in_set(UiInput))
+            // The movie audio's play times, a feed of the tick whose clock reads them.
+            // After the tutorial's selection judge, which reads the same VM.
+            .add_systems(
+                Update,
+                movie::feed_movie_audio
+                    .in_set(UiFeed)
+                    .after(crate::tutorial::judge_selections),
+            )
+            // The movie pictures the tick showed, ahead of the paint that draws them.
+            .init_resource::<movie::MovieScreen>()
+            .add_systems(
+                Update,
+                // After the frame's window and present modes apply, so the aspect is the
+                // window's this frame.
+                movie::upload_movie_pictures
+                    .in_set(UiPaint)
+                    .after(crate::video::apply_present_mode)
+                    .after(crate::video::apply_window_mode)
+                    .before(extract::paint_script),
+            )
             .add_systems(
                 Update,
                 extract::paint_script
@@ -478,12 +634,14 @@ impl Plugin for UiScriptPlugin {
                     .after(crate::vplates::VPlateSet)
                     .before(crate::ui_pass::UiQuadAppend),
             )
-            // After the hover is known and before gameplay reads `PointerOverUi`.
+            // After the hover is known and before gameplay reads `PointerOverUi`: the world's
+            // mouse among the input records, so a press the cursor brings onto a frame is the
+            // frame's alone.
             .add_systems(
                 Update,
                 arbitrate_pointer_over_ui
                     .after(UiInput)
-                    .before(WorldStage::Input),
+                    .before(crate::player::WorldMouse),
             )
             .add_message::<server_alert::LaunchUrl>()
             .add_message::<server_alert::LaunchAddonUrl>()
@@ -516,11 +674,12 @@ impl Plugin for UiScriptPlugin {
     }
 }
 
-/// The mouse and key feed once, for a test over the whole client: the input pass's Lua, with the
-/// call host the world lends.
+/// The mouse and key feed once, for a test over the whole client: the input pass's Lua over the
+/// records the test's planes and key messages make, with the call host the world lends.
 #[cfg(test)]
 pub(crate) fn feed_input_once(world: &mut World) {
     use bevy::ecs::system::RunSystemOnce;
+    records_from_planes(world);
     world
         .run_system_once(input::feed_ui_input)
         .expect("the input feeds");
@@ -873,7 +1032,18 @@ mod glue_input_tests;
 #[cfg(test)]
 mod key_walk_tests;
 #[cfg(test)]
+mod record_order_tests;
+#[cfg(test)]
 mod tick_order_tests;
+
+/// Whether `Update` declares `system` before the tick, the frame pass's `OnUpdate` walk.
+#[cfg(test)]
+pub(crate) fn tick_runs_after<M>(
+    app: &mut App,
+    system: impl bevy::ecs::system::IntoSystem<(), (), M>,
+) -> bool {
+    crate::test_support::runs_before(app, system, extract::tick_script)
+}
 
 #[cfg(test)]
 mod cast_tests;
@@ -1194,7 +1364,7 @@ mod world_map_tests;
 
 #[cfg(test)]
 mod seam_scale_tests {
-    use super::{seam_scale, window_to_ui};
+    use super::{seam_scale, ui_to_window, window_to_ui, UiScreen};
     use bevy::math::Vec2;
 
     #[test]
@@ -1210,10 +1380,34 @@ mod seam_scale_tests {
     /// is 0 and its top 768, its middle column `768·a/2`.
     #[test]
     fn the_cursor_reaches_the_vm_in_root_units() {
-        let at = window_to_ui(1080.0, Vec2::new(960.0, 108.0));
+        let screen = UiScreen::of(Vec2::new(1920.0, 1080.0), true);
+        let at = window_to_ui(screen, Vec2::new(960.0, 108.0));
         assert!((at.x - 960.0 * 768.0 / 1080.0).abs() < 1e-3, "{at}");
         assert!((at.y - 972.0 * 768.0 / 1080.0).abs() < 1e-3, "{at}");
-        assert_eq!(window_to_ui(1080.0, Vec2::new(0.0, 1080.0)), Vec2::ZERO);
+        assert_eq!(window_to_ui(screen, Vec2::new(0.0, 1080.0)), Vec2::ZERO);
+        // With `widescreen` 0 the 4:3 root spans the window: its middle column is 512, its right
+        // edge 1024.
+        let stretched = UiScreen::of(Vec2::new(1920.0, 1080.0), false);
+        let mid = window_to_ui(stretched, Vec2::new(960.0, 540.0));
+        assert!((mid - Vec2::new(512.0, 384.0)).length() < 1e-3, "{mid}");
+        let edge = window_to_ui(stretched, Vec2::new(1920.0, 0.0));
+        assert!((edge - Vec2::new(1024.0, 768.0)).length() < 1e-3, "{edge}");
+    }
+
+    /// [`ui_to_window`] undoes [`window_to_ui`], stretched or not.
+    #[test]
+    fn a_root_point_goes_to_the_window_and_back() {
+        for widescreen in [true, false] {
+            let screen = UiScreen::of(Vec2::new(1920.0, 1080.0), widescreen);
+            for p in [
+                Vec2::ZERO,
+                Vec2::new(512.0, 384.0),
+                Vec2::new(1000.0, 700.0),
+            ] {
+                let back = window_to_ui(screen, ui_to_window(screen, p));
+                assert!((back - p).length() < 1e-3, "{widescreen}: {p} -> {back}");
+            }
+        }
     }
 }
 

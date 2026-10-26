@@ -47,6 +47,12 @@ enum Row {
 const NOT_YET_ON_A_LANE: &[(Row, &str, &str)] = &[
     (
         Row::Queue,
+        "::account_data::AccountData",
+        "the account-data sections a download replaced, whose readers (the binding sets, the \
+         macros, the layout) run again off it; the chat setup's fires on its lane",
+    ),
+    (
+        Row::Queue,
         "::ui_action::errors::UiErrorKeys",
         "the refusals the handlers push, which the action feed shows",
     ),
@@ -127,12 +133,6 @@ const NOT_YET_ON_A_LANE: &[(Row, &str, &str)] = &[
     ),
     (
         Row::HostHeld,
-        "::ui_guild::GuildLocal",
-        "the held guild invitation, which `feed_guild` fires from; the guild verbs, acting in \
-         their calls, hold it in the host",
-    ),
-    (
-        Row::HostHeld,
         "::ui_mail::MailOpen",
         "the mailbox's list and results, the send result's equip refusal line among them, which \
          `feed_mail` fires from; the mail verbs, acting in their calls, hold it in the host",
@@ -161,13 +161,6 @@ const NOT_YET_ON_A_LANE: &[(Row, &str, &str)] = &[
     ),
     (
         Row::Queue,
-        "::ui_guild::GuildState",
-        "the guild state, which `feed_guild` fires from; the guild verbs, acting in their calls, \
-         read it in the host, and `GetGuildInfo` leaves its waiters there through `&self`, which \
-         the query response's handler spends onto the notice lane",
-    ),
-    (
-        Row::Queue,
         "::ui_logout::SessionPosts",
         "the exit and the cinematic stop a session verb posts, which nothing the script reads \
          waits on",
@@ -192,11 +185,6 @@ const NOT_YET_ON_A_LANE: &[(Row, &str, &str)] = &[
         "::ui_petition::PetitionState",
         "the petition state, which `feed_petition` fires from; the charter verbs, acting in their \
          calls, hold it in the host",
-    ),
-    (
-        Row::Queue,
-        "::ui_quest_log::QuestLog",
-        "the quest packets' log state",
     ),
     (
         Row::Queue,
@@ -335,12 +323,6 @@ const NOT_YET_ON_A_LANE: &[(Row, &str, &str)] = &[
     ),
     (
         Row::Edge,
-        "::ui_party::feed::feed_party",
-        "the ready check, the saved instances and the members' presence, found by comparing \
-         the group's state",
-    ),
-    (
-        Row::Edge,
         "::ui_items::locks::apply_item_releases",
         "the item source's two unlocks a loot close owes (`0x48f2bd`, `0x4c1d36`) and the copier's \
          ending's (`0x5ebc35` → `0x4c1d36`), taken off the loot session, a lane's type the queue \
@@ -356,14 +338,11 @@ const NOT_YET_ON_A_LANE: &[(Row, &str, &str)] = &[
         Row::Edge,
         "::ui_action::state::fire_action_events",
         "the usable refresh `0x4b31c0` (`ACTIONBAR_UPDATE_USABLE`, `SPELL_ACTIVE`, \
-         `SPELL_UPDATE_USABLE`), which the reference runs inside each caller's packet: the form \
-         and combo watchers (`0x5de011`, `0x5ddff0`), the unit-flags, health, power and \
-         aura-state watchers, the selection and the cooldowns. Here it is one pass a frame over \
-         the bar's 120 slots and the reactive list, diffed against the usable cache, so one \
-         caller's run cannot be cut out to fire at its own notice. It also fires \
-         `SMSG_ITEM_COOLDOWN`'s `BAG_UPDATE_COOLDOWN` (`0x6e965b`), which the reference signals \
-         inside that packet's handler and which reaches here through the cooldowns' flush, a \
-         queue the call host holds and so no row of its own shows",
+         `SPELL_UPDATE_USABLE`) of the callers outside the field watchers and the cooldown list, \
+         which refresh on their lanes: the selection's select and release where no call made \
+         them (`0x493892`, `0x493a69`) and the control flag (`0x4958fc`, `0x495910`), one pass \
+         a frame over the bar's 120 slots and the reactive list, diffed against the usable \
+         cache",
     ),
 ];
 
@@ -378,16 +357,15 @@ const HOST_HELD_UNREAD: &[&str] = &[
     "::creature_anim::PlaySeq",
     "::items::Items",
     "::net::GuidIndex",
-    // Read, and quiet: the feeds that hold it fire nothing off it, as the reputation messages'
-    // `UPDATE_FACTION` and `UNIT_FACTION` go on the notice lane at their packets.
-    "::net::reputations::Reputations",
     "::net::SelfGuid",
+    // Read by the quest log getters through the host (`QuestClock`), and quiet: the time
+    // response's `QUEST_LOG_UPDATE` fires on the quest log lane.
+    "::net::ServerWallClock",
     "::net::game_time::ServerTime",
     "::spell::cast_send::HeldForPick",
     "::spell::cast_send::ScriptCastPermit",
     "::spell::cast_send::unit_caster::PetGcdsOwed",
     "::spell::cast_send::unit_caster::UnitAttackOwed",
-    "::spell::cooldowns::Cooldowns",
     "::spell::inflight::ActiveChannel",
     "::spell::inflight::AutoRepeatActive",
     "::spell::inflight::PendingCast",
@@ -398,13 +376,15 @@ const HOST_HELD_UNREAD: &[&str] = &[
     "::target::Selection",
     "::ui_action::PlayerActions",
     "::ui_auction::AuctionOpen",
+    // Read, and quiet: the buff timers read the stamps through the host and no feed fires off
+    // them; the aura fields' watcher raises `PLAYER_AURAS_CHANGED`.
+    "::ui_aura::AuraDurations",
     // Read, and quiet: `feed_dialog_verbs` pushes the deadline the time packet stores and fires
     // nothing off it, as the packet's `AREA_SPIRIT_HEALER_IN_RANGE` goes on the notice lane.
     "::ui_dialog_verbs::AreaSpiritHealer",
     "::ui_loot::AutoLootByte",
     "::ui_loot::LootLatch",
     "::ui_merchant::MerchantOpen",
-    "::ui_pet::PetBar",
     "::ui_petition::GuildRegistrarState",
     "::ui_petition::PetitionRecords",
     "::ui_session::latch::InteractLatch",
@@ -421,7 +401,7 @@ const HOST_HELD_UNREAD: &[&str] = &[
 /// feed goes once a log versions what it reads ([`crate::ui_unit::views`]), a new one fails, and
 /// a row whose feed or inputs moved fails until it matches.
 #[rustfmt::skip]
-const READS_FRAME_FINAL: &[(&str, &[&str])] = &[
+pub(super) const READS_FRAME_FINAL: &[(&str, &[&str])] = &[
     ("::player::net::feed_player_skinned", &["player::net::SkinnedFeed"]),
     ("::death::feed_death", &["Transform", "death::DeathNet", "items::Countdowns", "items::Items",
         "names::NameCache", "net::GuidIndex", "net::NetStatus", "net::ObjectStore",
@@ -456,9 +436,10 @@ const READS_FRAME_FINAL: &[(&str, &[&str])] = &[
         "net::ObjectStore", "net::SelfGuid", "net::reputations::Reputations"]),
     ("::ui_unit::feed_default_language", &["net::ObjectStore"]),
     ("::ui_unit::feed_known_languages", &["net::ObjectStore", "ui_action::PlayerActions"]),
-    // The party and raid tokens read the members' stores and records as of the drain's place
-    // (`ui_unit::views`); the roster `GetRaidRosterInfo` reads, the slots' presence edges and
-    // every snapshot's names, relations and roster read as the frame left them.
+    // The party and raid tokens read the members' stores, records and the roster's cells as of
+    // the drain's place (`ui_unit::views`), and the group getters read the cells through the host;
+    // the roster push is their no-host fallback, and every snapshot's names and relations read as
+    // the frame left them.
     ("::ui_party::feed::feed_party", &["names::NameCache", "net::GuidIndex", "net::ObjectStore",
         "net::SelfGuid", "net::reputations::Reputations", "ui_guild::GuildState",
         "ui_party::GroupState"]),
@@ -486,8 +467,6 @@ const READS_FRAME_FINAL: &[(&str, &[&str])] = &[
     // The engine's follow transitions, which a `FollowUnit` a handler's listener makes arms.
     ("::ui_follow::feed_follow", &["player::follow::FollowState", "ui_follow::FollowFeed"]),
     ("::ui_social::feed::feed_social", &["names::NameCache", "ui_social::SocialState"]),
-    ("::ui_guild::feed::feed_guild", &["net::ObjectStore", "ui_guild::GuildLocal",
-        "ui_guild::GuildState"]),
     ("::ui_petition::feed::feed_petition", &["names::NameCache", "net::ObjectStore",
         "net::SelfGuid", "ui_petition::GuildRegistrarState", "ui_petition::PetitionRecords",
         "ui_petition::PetitionState"]),
@@ -504,7 +483,6 @@ const READS_FRAME_FINAL: &[(&str, &[&str])] = &[
     ("::ui_char::feed_char", &["items::Countdowns", "items::Items", "names::NameCache",
         "net::GuidIndex", "net::ObjectStore", "ui_char::AmmoRecordHits"]),
     ("::ui_char::feed_skills", &["net::ObjectStore"]),
-    ("::ui_reputation::feed_reputation", &["net::ObjectStore", "net::reputations::Reputations"]),
     ("::ui_inspect::feed_inspect", &["items::Items", "names::NameCache", "net::GuidIndex",
         "net::ObjectStore", "net::SelfGuid"]),
     ("::ui_honor::feed_honor", &["net::ObjectStore", "target::Selection", "ui_honor::InspectHonor",
@@ -528,20 +506,12 @@ const READS_FRAME_FINAL: &[(&str, &[&str])] = &[
         "net::GuidIndex", "net::ObjectStore", "net::UnitSpeeds", "net::motion::modes::UnitMoveModes",
         "net::motion::remote::RemoteMotion", "net::reputations::Reputations",
         "spell::mods::SpellModifiers", "spell::targeting::SpellTargeting", "ui_party::GroupState"]),
-    // The engine's selection writers signal in place (`0x493540`), reading the selection, the
-    // attack and loot state and the stores as the frame left them.
-    ("::target::track::follow_selection_object", &["creature_anim::AttackStopInFlight",
-        "net::GuidIndex", "net::ObjectStore", "net::SelfGuid", "spell::inflight::AutoRepeatActive",
-        "spell::inflight::PendingCast", "spell::inflight::QueuedMeleeSpell",
-        "spell::targeting::SpellTargeting", "target::Selection", "ui_loot::LootLatch",
-        "ui_loot::LootState", "ui_party::GroupState", "ui_pet::PetAttackLatch"]),
     // Each unit's list reads its store and record as of the drain's place (`ui_unit::views`), and
     // the buff cache is rebuilt at each packet's watcher; the resolver's inputs, the unit gate's
     // relations and the world entry's rebuild read as the frame left them.
     ("::ui_aura::feed_auras", &["names::NameCache", "net::GuidIndex", "net::ObjectStore",
         "net::SelfGuid", "net::reputations::Reputations", "target::Selection",
-        "ui_action::PlayerActions", "ui_aura::AuraDurations", "ui_party::GroupState",
-        "ui_pet::PetBar"]),
+        "ui_action::PlayerActions", "ui_party::GroupState", "ui_pet::PetBar"]),
     ("::ui_spellbook::feed_spellbook", &["items::Countdowns", "items::Items", "net::GuidIndex",
         "net::ObjectStore", "spell::cooldowns::Cooldowns", "ui_action::PlayerActions",
         "ui_spellbook::LearnedInTab"]),
@@ -558,7 +528,6 @@ const READS_FRAME_FINAL: &[(&str, &[&str])] = &[
         "spell::mods::SpellModifiers", "target::Selection", "ui_action::PlayerActions"]),
     ("::ui_pet::bar::feed_pet_bar", &["net::GuidIndex", "net::ObjectStore", "net::SelfGuid",
         "ui_pet::PetAttackLatch", "ui_pet::PetBar"]),
-    ("::ui_pet::bar::fire_pet_cooldown_events", &["ui_pet::PetBar"]),
     // The pet's snapshot reads its store as of the drain's place (`ui_unit::views`); its name
     // reads as the frame left it.
     ("::ui_pet::unit::feed_pet_unit", &["names::NameCache", "net::GuidIndex", "net::ObjectStore",
@@ -644,10 +613,9 @@ const READS_FRAME_FINAL: &[(&str, &[&str])] = &[
     ("::ui_quest::feed_quest", &["go_templates::GameObjectTemplates", "items::Countdowns",
         "items::Items", "names::NameCache", "net::GuidIndex", "net::ObjectStore",
         "ui_quest::QuestGiver", "world_state::WorldStates"]),
-    ("::ui_quest_log::feed_quest_log", &["items::Countdowns", "names::NameCache", "net::GuidIndex",
-        "net::ObjectStore", "ui_quest::QuestGiver", "ui_quest::lines::QuestLines",
-        "ui_quest_log::QuestLog", "world_state::WorldStates"]),
-    ("::ui_quest_log::feed_server_clock", &["net::ServerWallClock"]),
+    ("::ui_quest_log::feed_quest_log", &["names::NameCache", "net::ObjectStore",
+        "ui_quest::QuestGiver", "ui_quest::lines::QuestLines", "ui_quest_log::QuestLog",
+        "world_state::WorldStates"]),
     ("::ui_quest_share::feed_quest_share", &["names::NameCache", "ui_quest_share::QuestShare"]),
     ("::ui_chat::broadcast::feed_broadcasts", &["ui_chat::edit::ChannelState"]),
     ("::ui_chat::channels::seed_channels", &["ui_chat::edit::ChannelState"]),
@@ -659,15 +627,14 @@ const READS_FRAME_FINAL: &[(&str, &[&str])] = &[
 /// counts a window's core adds to and what a session verb posts. The lanes and the host's two
 /// other sinks (the message sounds and the unit edits, which raise no event) are not queues here.
 const FILLED_THROUGH_A_READ: &[&str] = &[
+    // The account-data sections, which the download's handler stores through `&self`.
+    "::account_data::AccountData",
     "::ui_action::errors::UiErrorKeys",
     // The far-sight machine the call host's buff cancel runs (`0x6e70ad`).
     "::player::view_subject::FarSight",
     "::tutorial::Tutorials",
     "::ui_session::latch::LatchCloses",
     "::ui_logout::SessionPosts",
-    // The guild cache's waiters, which `GetGuildInfo` leaves inside its call through `&self`
-    // (`0x4c93d2`).
-    "::ui_guild::GuildState",
 ];
 
 /// Every other resource a handler reads and does not write: state, tables and caches it
@@ -677,12 +644,16 @@ const FILLED_THROUGH_A_READ: &[&str] = &[
 /// in system order, or a system that pushes onto a lane off it at its own place, passes every
 /// check here unseen.
 const READ_ONLY_TO_HANDLERS: &[&str] = &[
+    // The login pick, which names the character the account-data sections belong to.
+    "::glue_session::roster::Roster",
     "::ui_chat::edit::ChannelState",
     // The console's registry, which a `ConsoleExec` a listener makes reads.
     "::console::ConsoleCommands",
     // The creature families the cast send's pet learn rung reads (`0x60c7c0`).
     "::ui_pet_stats::PetFamilyTables",
     "::AreaTableRes",
+    // The server clock the quest log getters read in the host.
+    "::ServerWallClock",
     "::DamageTextGates",
     "::EnvDamageTable",
     "::SpellVisuals",
@@ -699,15 +670,14 @@ const READ_ONLY_TO_HANDLERS: &[&str] = &[
     "::RacePvpTeams",
     "::MacroBoundSpells",
     "::NameCache",
+    // The Video menus' lists the host's resolution and multisample verbs read (`0x48bc90`, `0x48c3e0`).
+    "::video::Widescreen",
+    "::view::MsaaFormats",
     "::ServerTime",
     "::GuidIndex",
     // The bag cache the open-container handler numbers its `BAG_OPEN`s from.
     "::BagCache",
     "::NetCommands",
-    // Read-only to the handlers that only judge relations (the combat log's, the cast result's
-    // and the loot response's): the reputation handlers write it, and so does every handler that
-    // lends the call host, whose reputation verbs write the slots.
-    "::Reputations",
     "::SelfGuid",
     "::OwnControlLost",
     "::Player",
@@ -762,8 +732,6 @@ const READ_ONLY_TO_HANDLERS: &[&str] = &[
     "::BattlefieldQueue",
     "::DuelState",
     "::SummonState",
-    "::PetBar",
-    "::QuestLog",
     "::UiClock",
     "::InteractNpc",
     "::SocialState",
@@ -775,13 +743,21 @@ const READ_ONLY_TO_HANDLERS: &[&str] = &[
     "bevy_time::time::Time<bevy_time::real::Real>",
     // The stores as of the drain's place, which the call host's token lookups read.
     "::ui_unit::views::UnitViews",
+    // The area under the player, which the host's raid rows read for our own zone (`0xb4e314`).
+    "::CurrentArea",
+    // The `raidFilter` books the call host's aura walk reads (`0x4b3870`, `0x4b3920`), which
+    // only the aura feed writes.
+    "::ui_aura::AuraFeedMemory",
+    // The duration packet's stamps (`0x4e4390`), which the call host's buff timers read at the
+    // call (`0x4e4450`); a hosted handler reads them, the packet's handler writes them.
+    "::ui_aura::AuraDurations",
     // The host's two sinks that raise no event.
     "::sound::message::MessageSounds",
     "::creature_anim::edits::UnitEdits",
 ];
 
 /// Every lane's queue, by type: what a handler fills there fires in the packets' order.
-fn lane_types() -> [TypeId; 14] {
+fn lane_types() -> [TypeId; 21] {
     [
         TypeId::of::<crate::ui_items::feed::BagView>(),
         // The views lane: what each packet changed in the stores.
@@ -801,14 +777,29 @@ fn lane_types() -> [TypeId; 14] {
         TypeId::of::<crate::ui_tradeskill::ListRebuilds>(),
         // The deaths lane: the signals each death's legs parked, stamped under its health edge.
         TypeId::of::<crate::target::Deaths>(),
+        // The release lane: the signals each selection teardown parked, stamped under its release.
+        TypeId::of::<crate::target::Releases>(),
         // The item-text lane: the page-text packets' reads, stamped at their packets.
         TypeId::of::<crate::ui_item_text::ItemTextLane>(),
+        // The cooldown lanes: the player's list and the pet's, which log their writes and flushes
+        // at their places.
+        TypeId::of::<crate::spell::Cooldowns>(),
+        TypeId::of::<crate::ui_pet::PetBar>(),
+        // The reputation lane: the store's writes and the pane's list operations, at their places.
+        TypeId::of::<crate::net::Reputations>(),
+        // The quest log lane: the templates, toasts, rank moves and time syncs, at their packets.
+        TypeId::of::<crate::ui_quest_log::QuestLog>(),
+        // The cast views lane: the view each packet left, stamped ahead of the packet.
+        TypeId::of::<crate::ui_cast::CastViews>(),
+        // The guild lane: the roster, event and invitation packets' signals, each with the
+        // version of the guild state its packet left.
+        TypeId::of::<crate::ui_guild::GuildState>(),
     ]
 }
 
 /// [`lane_types`] by the lane that drains each: a queue is stripped only from its own lane's row,
 /// so another lane's read of the same type shows as the state it is.
-fn lane_queue_owners() -> [(&'static str, TypeId); 14] {
+fn lane_queue_owners() -> [(&'static str, TypeId); 21] {
     [
         ("bag view", TypeId::of::<crate::ui_items::feed::BagView>()),
         ("unit views", TypeId::of::<crate::ui_unit::views::ViewLog>()),
@@ -832,10 +823,20 @@ fn lane_queue_owners() -> [(&'static str, TypeId); 14] {
             TypeId::of::<crate::ui_tradeskill::ListRebuilds>(),
         ),
         ("deaths", TypeId::of::<crate::target::Deaths>()),
+        ("releases", TypeId::of::<crate::target::Releases>()),
         (
             "item text",
             TypeId::of::<crate::ui_item_text::ItemTextLane>(),
         ),
+        ("cooldowns", TypeId::of::<crate::spell::Cooldowns>()),
+        ("pet cooldowns", TypeId::of::<crate::ui_pet::PetBar>()),
+        ("reputation", TypeId::of::<crate::net::Reputations>()),
+        (
+            "quest events",
+            TypeId::of::<crate::ui_quest_log::QuestLog>(),
+        ),
+        ("cast views", TypeId::of::<crate::ui_cast::CastViews>()),
+        ("guild", TypeId::of::<crate::ui_guild::GuildState>()),
     ]
 }
 
@@ -844,7 +845,7 @@ fn is_messages(world: &World, id: ComponentId) -> bool {
     name(world, id).contains("Messages<")
 }
 
-fn name(world: &World, id: ComponentId) -> String {
+pub(super) fn name(world: &World, id: ComponentId) -> String {
     world
         .components()
         .get_name(id)
@@ -990,15 +991,23 @@ fn the_drain_runs_after_the_feeds_and_before_the_tick() {
             "auction house",
             "bag view",
             "cast reports",
+            "cast views",
             "chat",
+            "chat setup arrivals",
+            "cooldowns",
             "deaths",
             "equip errors",
             "field notices",
+            "guild",
             "item text",
             "item watchers",
             "list rebuilds",
             "loot",
             "party",
+            "pet cooldowns",
+            "quest events",
+            "releases",
+            "reputation",
             "unit views"
         ]
     );
@@ -1244,6 +1253,16 @@ const AT_THEIR_OWN_PLACE: &[(&str, &str)] = &[
     (
         "::ui_chat::channels::end_session_channels_on_disconnect",
         "a dead socket ends the channel session, and no packet follows it",
+    ),
+    (
+        "::query_cache::release_on_enter<benilla_app::ui_guild::GuildState>",
+        "the world entry forgets the guild cache's in-flight asks, so each is asked again \
+         (`0x5557c0`): it queues nothing",
+    ),
+    (
+        "::query_cache::release_on_enter<benilla_app::ui_quest_log::QuestLog>",
+        "the world entry forgets the quest cache's in-flight asks, so each is asked again \
+         (`0x5557c0`): it queues nothing",
     ),
 ];
 
@@ -1501,6 +1520,7 @@ const QUEUES_NOT_VIEWS: &[&str] = &[
     "item_lane::ItemLane",
     "ui_chat::ChatLog",
     "ui_cast::CastReports",
+    "ui_cast::views::CastViews",
     "ui_auction::net::HouseLane",
     "ui_party::feed::PartyLane",
     "ui_items::EquipErrors",
@@ -1510,7 +1530,7 @@ const QUEUES_NOT_VIEWS: &[&str] = &[
 
 /// A type's name as [`READS_FRAME_FINAL`] spells it: the crate's own by its path in the crate, an
 /// engine type by its own name.
-fn short_name(full: &str) -> String {
+pub(super) fn short_name(full: &str) -> String {
     match full.strip_prefix("benilla_app::") {
         Some(rest) => rest.to_string(),
         None => full.rsplit("::").next().unwrap_or(full).to_string(),
@@ -1641,6 +1661,12 @@ fn every_view_push_of_what_a_handler_writes_is_listed() {
     assert!(stale.is_empty(), "stale rows: {stale:?}");
 }
 
+/// The lanes' own state that every firing of the drain reads as of its place, not as the frame left
+/// it: the lane replays it packet by packet in stamp order among the others, so a firing between
+/// two of its writes sees the first alone. A feed, which runs ahead of the drain, still reads it
+/// as the frame left it, and its row says so.
+const VERSIONED_FOR_THE_DRAIN: &[&str] = &["net::reputations::Reputations"];
+
 /// The lane firings that read what a handler writes as the frame left it, by lane, beside
 /// [`READS_FRAME_FINAL`]'s feeds: what a firing reads past the call host's own reads and its own
 /// lane's queues ([`lane_queue_owners`]), the field watchers' callbacks among them (the notice lane's). A listener fired
@@ -1649,22 +1675,26 @@ fn every_view_push_of_what_a_handler_writes_is_listed() {
 /// longer matches its firing fails.
 #[rustfmt::skip]
 const LANE_READS_FRAME_FINAL: &[(&str, &[&str])] = &[
-    // The watchers' callbacks: the drunk line's name, the quest log's slots, the skill line's race
-    // and class and the bonus bar's form off our live descriptor, and the aura watcher's join of
-    // the durations the duration packet writes (`0x4e4390` into `0xbc5f68`), as the frame left them
-    // (#2217); the aura watcher's own store is the one its packet left. `SetPetGuid`'s trainer
-    // refresh reads the open trainer, and its `PET_UI_CLOSE` the new pet's object and ours, as
-    // the frame left them.
-    ("field notices", &["names::NameCache", "net::GuidIndex", "net::ObjectStore",
-        "ui_aura::AuraDurations", "ui_trainer::TrainerOpen"]),
-    // The views lane reads the stores and records it rewinds as of each packet; the names, the
-    // relations' stores and reputations, the selection and the guild as the frame left them
-    // (#2217).
-    // The roster too: the members its party and raid tokens and readable guids come from, past
-    // the records it rewinds, as the frame left it (#2217).
+    // The chat setup's restore reads the channel rows its shortcuts and auto-joins come from as
+    // the frame left them, past the notices of the packets after the section's.
+    ("chat setup arrivals", &["ui_chat::edit::ChannelState"]),
+    // The watchers' callbacks: the quest log's slots, the skill line's race and class and the
+    // bonus bar's form off our live descriptor, as the frame left them (#2217); the aura
+    // watcher's own store is the one its packet left, and the buff timers read the duration
+    // packet's stamps through the call host. The drunk line's name is read through the host.
+    // `SetPetGuid`'s trainer refresh reads the open trainer, and its `PET_UI_CLOSE` the new
+    // pet's object and ours, as the frame left them.
+    ("field notices", &["net::GuidIndex", "net::ObjectStore", "ui_trainer::TrainerOpen"]),
+    // The views lane reads the stores, records and roster cells it rewinds as of each packet, and
+    // the reputations as the reputation lane replays them; the names, the relations' stores, the
+    // selection and the guild as the frame left them (#2217).
+    // The roster's cells and records it rewinds and seats while it builds; the rest as the frame
+    // left it.
     ("unit views", &["names::NameCache", "net::GuidIndex", "net::ObjectStore", "net::SelfGuid",
-        "net::reputations::Reputations", "target::Selection", "ui_guild::GuildState",
-        "ui_party::GroupState"]),
+        "target::Selection", "ui_guild::GuildState", "ui_party::GroupState"]),
+    // A landing's record expands its text's macros against the player's name and the world states
+    // as the frame left them, as the quest log's feed expands the held ones (#2217).
+    ("quest events", &["names::NameCache", "net::ObjectStore", "world_state::WorldStates"]),
     ("cast reports", &["items::Countdowns", "items::Items", "net::GuidIndex", "net::ObjectStore",
         "ui_action::cast_lines::CastFailRedisplays"]),
     ("item watchers", &["items::Countdowns", "items::Items", "names::NameCache", "net::GuidIndex",
@@ -1786,6 +1816,7 @@ fn every_lane_reads_of_what_a_handler_writes_is_listed() {
         }
         inputs.retain(|n| {
             !QUEUES_NOT_VIEWS.contains(&n.as_str())
+                && !VERSIONED_FOR_THE_DRAIN.contains(&n.as_str())
                 && !lane_queues.iter().any(|(l, q)| *l == lane && q == n)
         });
         found.push((lane, inputs));

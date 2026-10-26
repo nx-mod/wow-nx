@@ -10,7 +10,6 @@ use bevy::prelude::*;
 use benilla_formats::SpellCatalog;
 use benilla_protocol::messages::ActionButton;
 
-use crate::ui_script::UiTick;
 use crate::ui_unit::UnitFeed;
 use benilla_assets::{AssetSet, LockRecover, WorldAssets};
 
@@ -19,11 +18,12 @@ mod cast_lines;
 pub(crate) use cast_lines::{CastFailLines, CastFailRedisplays};
 mod drain;
 // A `UseAction` press, applied in call order by `crate::script_calls`.
-pub(crate) use drain::{attack_nearest_probe, use_action, ActionPress, AttackPress, UseOutcome};
+pub(crate) use drain::{
+    attack_nearest_probe, drain_arrival_casts, use_action, ActionPress, AttackPress, UseOutcome,
+};
 // The bar's sends and slot writes inside their calls.
 pub(crate) use drain::ActionBarSteps;
-// The right-click casts' drain, which the click's tests run after the click.
-#[cfg(test)]
+// The right-click casts' drain, which the world's clicks run inside the click.
 pub(crate) use drain::drain_click_casts;
 #[cfg(test)]
 mod drain_tests;
@@ -39,20 +39,21 @@ mod net;
 mod ranks;
 // The rank pass, which the macro load orders itself ahead of: it rewrites a bar word, too.
 pub(crate) use ranks::normalize_action_ranks;
+mod cooldown_lane;
+#[cfg(test)]
+pub(crate) use cooldown_lane::fire_cooldown_lane;
 mod reactive;
 #[cfg(test)]
 mod reactive_tests;
 pub(crate) mod recount;
 mod state;
-pub(crate) use state::{ActionStates, EnterUsable};
+pub(crate) use state::{wears_entry, ActionStateMemory, ActionStates, EnterUsable};
 pub(crate) mod toggle;
 mod unlearn;
 mod weapon_icon;
 
-/// Every feed that pushes cooldown triples runs `.before` this set: [`state::fire_action_events`]
-/// fires the cooldown events synchronously, so a triple pushed later goes unread until the next
-/// cooldown change. The pet list's flush, `ui_pet::bar::fire_pet_cooldown_events`, runs `.after`
-/// it on the same rule.
+/// Every feed that pushes cooldown triples runs `.before` this set. Both lists' flushes fire on
+/// their cooldown lanes, after every feed ([`cooldown_lane`]).
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct CooldownEvents;
 
@@ -281,6 +282,21 @@ pub(crate) fn run_feed_action_state_once(world: &mut World) {
         .expect("the action-state feed runs as a one-shot system");
 }
 
+/// A field watcher's usable refresh (`0x4b31c0`), as its notice runs it inside the drain
+/// ([`crate::field_watch::FieldNotice::UsableRefresh`]), for a test with no notice lane.
+#[cfg(test)]
+pub(crate) fn run_watcher_refresh_once(world: &mut World) {
+    use bevy::ecs::system::RunSystemOnce;
+    world
+        .run_system_once(
+            |mut states: state::ActionStates,
+             mut script: NonSendMut<benilla_ui::script::UiScript>| {
+                states.usable_refresh(&mut script).fire(&mut script);
+            },
+        )
+        .expect("the watcher's refresh runs as a one-shot system");
+}
+
 /// One pass of the action-state feed and the events it owes, for a test that hears them.
 #[cfg(test)]
 pub(crate) fn run_action_events_once(world: &mut World) {
@@ -395,6 +411,7 @@ pub(crate) struct UiActionPlugin;
 impl Plugin for UiActionPlugin {
     fn build(&self, app: &mut App) {
         net::register(app);
+        cooldown_lane::add_cooldown_lane(app);
         // A UI-only harness has no net stack; declaring a message twice is idempotent.
         app.add_message::<crate::net::FieldChanged>()
             .init_resource::<state::ActionEvents>()
@@ -465,10 +482,6 @@ impl Plugin for UiActionPlugin {
                         .after(state::feed_action_state)
                         .after(crate::ui_unit::UnitSnapshots)
                         .before(crate::ui_cast::feed_cast_reports),
-                    // The target chain queues the right-click casts earlier in the frame.
-                    drain::drain_click_casts
-                        .after(UiTick)
-                        .after(crate::target::TargetUpdate),
                     // The latches must be current before the target chain's cursor reads them.
                     track_learned_abilities
                         .in_set(UnitFeed)

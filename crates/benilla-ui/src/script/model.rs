@@ -156,6 +156,8 @@ pub(crate) struct Model {
     /// 1 for a non-empty path: without a font backend nothing failed, and addons revert their font
     /// on a nil.
     pub(crate) font_probe: Option<FontProbe>,
+    /// The movie frames' reader, subtitle flags and playing movies ([`super::movieframe`]).
+    pub(crate) movies: super::movieframe::Movies,
     /// Saved-variables folders, one `<Addon>.lua` each: the account's, then this character's.
     pub(crate) addons_saved_account: Option<std::path::PathBuf>,
     pub(crate) addons_saved_character: Option<std::path::PathBuf>,
@@ -905,7 +907,7 @@ pub(crate) struct Model {
     /// first push, and the auction calls. `auction_selected` is each list's selected auction id, 0
     /// for none (`0x4cfda0`/`0x4cfec0`); `auction_can_query` is the 5 s throttle.
     pub(crate) auction: Option<auction::AuctionState>,
-    /// The Browse tab's class tree, pushed once per login.
+    /// The Browse tab's class tree, seeded once per VM.
     pub(crate) auction_item_classes: Vec<auction::AuctionCategory>,
     pub(crate) auction_selected: [u32; 3],
     pub(crate) auction_can_query: bool,
@@ -1268,11 +1270,51 @@ impl Model {
         self.warnings.push(msg);
     }
 
-    /// The state of the unit `token` names, as the `Unit*` getters read it: the snapshot the app
-    /// pushed under the token, else, for a token with a `target` hop or for `target` itself, what
-    /// the getters read for the guid it resolves to.
-    pub(crate) fn unit(&self, token: &str) -> Option<&UnitState> {
+    /// The state of the unit `token` names off the snapshots alone: the snapshot the app pushed
+    /// under the token, else, for a token with a `target` hop or for `target` itself, what the
+    /// getters read for the guid the pushed resolver inputs name. A getter reads it through
+    /// [`super::unit::view`], which resolves at the call.
+    pub(crate) fn snapshot_unit(&self, token: &str) -> Option<&UnitState> {
         self.pushed_unit(token).or_else(|| self.chained_unit(token))
+    }
+
+    /// What the getters read for `guid`, the unit a token names at the call where its own push
+    /// names another (the resolver's guid, then each getter's lookup, `0x468460`): while it is
+    /// `held`, a chain end's snapshot, else a token's push of it, else its by-name candidate's,
+    /// else the unit as its guid alone; with no object, the group row naming it, whose push
+    /// carries its records (`0x496400`, `0x496420`), else the app's no-object entry, else its guid
+    /// alone, whose name the name cache answers (`0x5171eb`).
+    pub(crate) fn unit_of_guid(&self, guid: u64, held: bool) -> std::borrow::Cow<'_, UnitState> {
+        use std::borrow::Cow;
+        let found = if held {
+            self.units_by_guid
+                .get(&guid)
+                .filter(|u| u.has_object)
+                .or_else(|| {
+                    // Of several tokens naming the unit, the first by name.
+                    self.units_by_lower
+                        .iter()
+                        .filter(|(_, u)| u.guid == guid && u.has_object)
+                        .min_by(|a, b| a.0.cmp(b.0))
+                        .map(|(_, u)| u)
+                })
+                .or_else(|| self.name_candidates.get(&guid).map(|c| &c.state))
+        } else {
+            self.unit_guids
+                .roster_token(guid)
+                .and_then(|t| self.pushed_unit(&t))
+                .or_else(|| self.units_by_guid.get(&guid))
+        };
+        match found {
+            Some(u) => Cow::Borrowed(u),
+            None => Cow::Owned(UnitState {
+                exists: held,
+                has_object: held,
+                is_connected: held,
+                guid,
+                ..Default::default()
+            }),
+        }
     }
 
     /// The snapshot pushed under `token` itself, folded as 1.12's resolver `0x515970` folds
@@ -1330,6 +1372,7 @@ impl Model {
             texture_size_probe: None,
             cursor_size_probe: None,
             font_probe: None,
+            movies: Default::default(),
             addons_saved_account: None,
             addons_saved_character: None,
             framexml_templates: Default::default(),

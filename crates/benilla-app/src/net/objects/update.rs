@@ -664,6 +664,7 @@ fn respawn(sc: &mut Scene, guid: u64, body: Body, store: ObjectFields, pose: Opt
             }
             let e = entity.id();
             sc.index.0.insert(guid, e);
+            crate::target::object_held(sc.selection.as_mut(), guid, e);
         }
     }
     sc.pass.reactivated.push(guid);
@@ -819,6 +820,21 @@ fn deactivate(sc: &mut Scene, guid: u64, script: Option<&UiScript>) {
     if sc.group.stats.get(&guid) != before.as_ref() {
         sc.view_log.record(guid, before);
     }
+    // `CGUnit_C::Release` (`0x5fbb60`, after the player's roster legs, `0x5e9b61`): the
+    // selection's teardown (`0x5fbbe5`), unless a group row holds the guid (`0x5fbbcd`). Its run
+    // waits for the packet's end, so in one out-of-range list its sends follow a later member's
+    // `0x27f`.
+    {
+        let held = |g: u64| held(g).map(|s| &s.0);
+        let me = sc.self_guid.0;
+        let group = &sc.group;
+        crate::target::unit_released(
+            sc.selection.as_mut(),
+            sc.owed_releases.as_deref_mut(),
+            guid,
+            || crate::target::raid_member_or_pet(group, guid, me, &held),
+        );
+    }
     // The release's `PARTY_MEMBER_DISABLE` for a party slot's player (`0x5e9b78`).
     if held(guid).is_some_and(|s| s.0.created_as() == Some(ObjectType::Player)) {
         sc.group.member_object(guid, false);
@@ -931,6 +947,7 @@ fn on_update_end(In(ev): In<SessionEvent>, mut sc: Scene, script: Option<NonSend
     for guid in reactivated {
         reactivated_end(&mut sc, guid, script.as_deref());
     }
+    mirror_guild(&mut sc);
     sc.view_log.close();
 }
 
@@ -984,6 +1001,7 @@ fn notify(sc: &mut Scene, guid: u64, block: Notified, bridged: bool) {
     };
     let around = crate::field_watch::Around {
         me,
+        target: sc.selection.as_deref().and_then(|s| s.guid),
         // An entry of 0 has no key (`0x556aad`).
         creature_lookup: &|entry| {
             names
@@ -1090,6 +1108,29 @@ fn notify(sc: &mut Scene, guid: u64, block: Notified, bridged: bool) {
     }
     if let Some(((guild_id, stamp), guilds)) = stamp.zip(sc.guilds.as_mut()) {
         guilds.stamp_changed(guild_id, stamp, &sc.net);
+    }
+}
+
+/// Our guild id and rank as the packet left them in our descriptor (fields 191 and 192), which the
+/// guild mirror keeps ([`crate::ui_guild::GuildState::mirror_self`]). Mirrored only while the avatar
+/// is streamed: the frames between a logout's despawn and the teardown must not read as leaving
+/// the guild.
+fn mirror_guild(sc: &mut Scene) {
+    let Some(guilds) = sc.guilds.as_mut() else {
+        return;
+    };
+    let Some(store) = sc
+        .self_guid
+        .0
+        .and_then(|guid| sc.index.0.get(&guid))
+        .and_then(|&e| sc.stores.get(e).ok())
+    else {
+        return;
+    };
+    let (id, rank) = (store.0.player_guild_id(), store.0.player_guild_rank());
+    // A write only on a move: a packet that leaves the guild alone marks it unchanged.
+    if !guilds.mirrors(id, rank) {
+        guilds.mirror_self(id, rank);
     }
 }
 

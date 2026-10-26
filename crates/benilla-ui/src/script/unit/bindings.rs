@@ -8,12 +8,13 @@ use mlua::{Lua, Value};
 use super::super::binding_abi::flag;
 use super::super::calls::{submit, ScriptCall};
 use super::super::protected::select_may_cast;
+use super::super::roster_read;
 use super::super::stat_read::read_self;
 use super::super::Model;
 use super::{
-    check_unit_token, classification_word, grey_band, level_is_hidden_at, object_predicate,
-    read_object, unit_is_grey, unit_predicate, unknownobject, with_object, with_unit, PlayerRecord,
-    SelectionRequest,
+    check_unit_token, classification_word, grey_band, level_is_hidden_at, names_self,
+    object_predicate, read_identity, read_object, read_record, unit_is_grey, unit_predicate,
+    unknownobject, with_object, with_unit, PlayerRecord, SelectionRequest,
 };
 
 /// The `"player"` fast path of `UnitName`, `UnitRace`, `UnitClass` and `UnitSex`, never
@@ -112,7 +113,8 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
                 .and_then(|t| read_object(lua, t, |u, o| (o.group_leader(), u.guid)))
                 .unwrap_or((false, 0));
             let model = lua.app_data_ref::<Model>().expect("model app_data");
-            Ok(flag(by_flag || guid == model.party.leader_guid))
+            let leader = roster_read::cells(lua, &model.party).leader_guid;
+            Ok(flag(by_flag || guid == leader))
         })?,
     )?;
 
@@ -139,9 +141,29 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
                 };
                 return Ok((name, Value::Nil));
             }
-            let name = with_unit(lua, &token, None, |u| {
-                Some((u.name.clone(), u.has_object, u.guid))
-            })?;
+            check_unit_token(&token)?;
+            // An object held that is no unit: a game object's or an item's name (`0x517146`).
+            let guid = {
+                let model = lua.app_data_ref::<Model>().expect("model app_data");
+                token
+                    .as_deref()
+                    .map(|t| super::guid_of(lua, &model, t))
+                    .transpose()?
+                    .flatten()
+            };
+            if let Some(name) =
+                guid.and_then(|g| crate::script::live::ask(lua, &super::ObjectNameQuery(g)))
+            {
+                let name = match name {
+                    Some(n) => lua.create_string(&n)?,
+                    None => unknownobject(lua)?,
+                };
+                return Ok((Value::String(name), Value::Nil));
+            }
+            // A held unit is named off its object as the call runs ([`read_identity`]).
+            let name = token
+                .as_deref()
+                .and_then(|t| read_identity(lua, t, |u, id| (id.name(), u.has_object, u.guid)));
             let name = match name {
                 None => Value::Nil,
                 Some((Some(n), _, _)) => Value::String(lua.create_string(&n)?),
@@ -200,10 +222,15 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
                 .expect("model app_data")
                 .player_req
                 .level;
+            // The rank is the creature record's, read off the name cache as the call runs.
+            let rank = token
+                .as_deref()
+                .and_then(|t| read_record(lua, t, |_, r| r.rank))
+                .unwrap_or(0);
             let Some((hidden, level, has_object, guid)) = token.as_deref().and_then(|t| {
                 read_object(lua, t, |u, o| {
                     let level = o.level();
-                    let hidden = level_is_hidden_at(u, level, player_level);
+                    let hidden = level_is_hidden_at(u, level, rank, player_level);
                     (hidden, level, u.has_object, u.guid)
                 })
             }) else {
@@ -334,9 +361,12 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
                 .expect("model app_data")
                 .player_req
                 .level;
+            // The record's civilian flag is read off the name cache as the call runs.
             Ok(flag(unit.is_some_and(|t| {
-                read_object(lua, &t, |u, o| super::civilian_kill_of(u, o, player_level))
-                    == Some(true)
+                let civilian = read_record(lua, &t, |_, r| r.civilian).unwrap_or(false);
+                read_object(lua, &t, |u, o| {
+                    super::civilian_kill_of(u, civilian, o, player_level)
+                }) == Some(true)
             })))
         })?,
     )?;
@@ -393,10 +423,12 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
             // Both go through the resolver, so either one unrecognised raises.
             check_unit_token(&a)?;
             check_unit_token(&b)?;
+            // Each token's guid as the resolver names it at the call (`0x5160e8`, `0x5160f4`),
+            // an object that is no unit's included: nonzero and equal.
             let model = lua.app_data_ref::<Model>().expect("model app_data");
             let guid = |t: &Option<String>| {
                 t.as_deref()
-                    .and_then(|t| model.unit(t))
+                    .and_then(|t| super::view(lua, &model, t))
                     .map_or(0, |u| u.guid)
             };
             let (ga, gb) = (guid(&a), guid(&b));
@@ -432,9 +464,11 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
         })?,
     )?;
 
-    // UnitPlayerOrPetInParty/InRaid(unit): the unit or its owner (`UnitState::owner`) is in the
-    // group. The reference's predicate behind `0x5162f0`/`0x5163b0` is untraced; the owner reading
-    // is benilla's.
+    // UnitPlayerOrPetInParty/InRaid(unit) (`0x5162f0`, `0x5163b0`): the token's guid (`0x515970`,
+    // none checked, none needing an object) against the party slots (`0x4e8fa0`, which loops the
+    // `0x4e86d0` count and never matches the player) or the raid roster (`0x4bafd0`): a member's
+    // own guid, or its pet's, read live. With no host to ask, the pushed rows' pets and the unit
+    // snapshot's owner stand in.
     for (name, raid) in [
         ("UnitPlayerOrPetInParty", false),
         ("UnitPlayerOrPetInRaid", true),
@@ -443,6 +477,14 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
             name,
             lua.create_function(move |lua, token: Option<String>| {
                 check_unit_token(&token)?;
+                let model = lua.app_data_ref::<Model>().expect("model app_data");
+                let guid = match token.as_deref() {
+                    Some(t) => super::guid_of(lua, &model, t)?.unwrap_or(0),
+                    None => 0,
+                };
+                if let Some(hit) = roster_read::live_member_or_pet(lua, guid, raid) {
+                    return Ok(flag(hit));
+                }
                 let Some((exists, guid, owner)) = token
                     .as_deref()
                     .and_then(|t| read_object(lua, t, |u, o| (u.exists, u.guid, o.owner())))
@@ -452,23 +494,23 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
                 if !exists || guid == 0 {
                     return Ok(Value::Nil);
                 }
-                let model = lua.app_data_ref::<Model>().expect("model app_data");
-                let me = model.unit("player").map(|p| p.guid).unwrap_or(0);
                 let in_group = |guid: u64| {
                     guid != 0
                         && if raid {
                             model.party.raid.iter().any(|m| m.guid == guid)
                         } else {
-                            guid == me || model.party.members.iter().any(|m| m.guid == guid)
+                            model.party.members.iter().any(|m| m.guid == guid)
                         }
                 };
-                let grouped = if raid {
-                    !model.party.raid.is_empty()
+                // The pets the last push resolved for the rows, else the owner's.
+                let pets = if raid {
+                    &model.unit_guids.raid_pets[..]
                 } else {
-                    !model.party.members.is_empty()
+                    &model.unit_guids.party_pets[..]
                 };
-                let hit = grouped && (in_group(guid) || in_group(owner));
-                Ok(flag(hit))
+                Ok(flag(
+                    in_group(guid) || pets.contains(&guid) || in_group(owner),
+                ))
             })?,
         )?;
     }
@@ -483,14 +525,15 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
             let model = lua.app_data_ref::<Model>().expect("model app_data");
             let hit = token
                 .as_ref()
-                .and_then(|t| model.unit(t))
+                .and_then(|t| super::view(lua, &model, t))
                 .filter(|u| u.exists && u.guid != 0)
-                .is_some_and(|u| {
-                    model
+                .is_some_and(|u| match roster_read::live_membership(lua, u.guid) {
+                    Some(m) => m.raid,
+                    None => model
                         .party
                         .raid
                         .iter()
-                        .any(|m| m.guid != 0 && m.guid == u.guid)
+                        .any(|m| m.guid != 0 && m.guid == u.guid),
                 });
             Ok(flag(hit))
         })?,
@@ -505,14 +548,16 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
         "UnitInParty",
         lua.create_function(|lua, token: Option<String>| {
             let model = lua.app_data_ref::<Model>().expect("model app_data");
-            let guids = &model.unit_guids;
             let guid = match token.as_deref() {
-                Some(t) => guids.guid_of(t)?.unwrap_or(0),
+                Some(t) => super::guid_of(lua, &model, t)?.unwrap_or(0),
                 None => 0,
             };
-            Ok(flag(
-                guid != 0 && (guid == guids.player || guids.party.contains(&guid)),
-            ))
+            let guids = &model.unit_guids;
+            let member = match roster_read::live_membership(lua, guid) {
+                Some(m) => m.party,
+                None => guid != 0 && (guid == guids.player || guids.party.contains(&guid)),
+            };
+            Ok(flag(member))
         })?,
     )?;
 
@@ -617,9 +662,12 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
                     None => Ok((Value::Nil, Value::Nil)),
                 };
             }
-            let pair = with_unit(lua, &token, None, |u| {
-                u.race.clone().zip(u.race_file.clone())
-            })?;
+            // A held unit's race byte, read off its object as the call runs ([`read_identity`]).
+            check_unit_token(&token)?;
+            let pair = token
+                .as_deref()
+                .and_then(|t| read_identity(lua, t, |_, id| id.race()))
+                .flatten();
             match pair {
                 Some((loc, file)) => Ok((
                     Value::String(lua.create_string(&loc)?),
@@ -648,9 +696,12 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
                     None => Ok((Value::Nil, Value::Nil)),
                 };
             }
-            let pair = with_unit(lua, &token, None, |u| {
-                u.class.clone().zip(u.class_file.clone())
-            })?;
+            // A held unit's class byte, read off its object as the call runs ([`read_identity`]).
+            check_unit_token(&token)?;
+            let pair = token
+                .as_deref()
+                .and_then(|t| read_identity(lua, t, |_, id| id.class()))
+                .flatten();
             match pair {
                 Some((loc, file)) => Ok((
                     Value::String(lua.create_string(&loc)?),
@@ -727,7 +778,11 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
                 Value::Number(_) | Value::Integer(_) => Some(String::new()),
                 _ => return Err(mlua::Error::runtime("Usage: UnitCreatureType(\"unit\")")),
             };
-            let word = with_unit(lua, &token, None, |u| u.creature_type_name.clone())?;
+            check_unit_token(&token)?;
+            let word = token
+                .as_deref()
+                .and_then(|t| read_record(lua, t, |_, r| r.creature_type.clone()))
+                .flatten();
             match word {
                 Some(w) => Ok(Value::String(lua.create_string(&w)?)),
                 None => Ok(Value::Nil),
@@ -740,7 +795,11 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
     g.set(
         "UnitClassification",
         lua.create_function(|lua, token: Option<String>| {
-            let rank = with_unit(lua, &token, 0u32, |u| u.rank)?;
+            check_unit_token(&token)?;
+            let rank = token
+                .as_deref()
+                .and_then(|t| read_record(lua, t, |_, r| r.rank))
+                .unwrap_or(0);
             Ok(classification_word(rank).to_string())
         })?,
     )?;
@@ -789,11 +848,6 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
     // UnitXP/UnitXPMax(unit): the token resolved (`0x51738e`), then the active player's private
     // `PLAYER_XP` pair for its object by whatever token names it (`0x5173ad`-`0x5173c9`), read
     // off the object as the call runs ([`read_self`]), 0 for any other unit or none.
-    fn names_self(model: &Model, token: &str) -> bool {
-        token.eq_ignore_ascii_case("player")
-            || (model.unit_guids.player != 0
-                && model.unit_guids.resolve(token).ok().flatten() == Some(model.unit_guids.player))
-    }
     g.set(
         "UnitXP",
         lua.create_function(|lua, token: Value| {
@@ -801,7 +855,7 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
                 crate::script::binding_abi::string_arg(lua, token, r#"Usage: UnitXP("unit")"#)?;
             check_unit_token(&Some(token.clone()))?;
             let model = lua.app_data_ref::<Model>().expect("model app_data");
-            Ok(if names_self(&model, &token) {
+            Ok(if names_self(lua, &model, &token) {
                 i64::from(read_self(lua, |own| own.xp()))
             } else {
                 0
@@ -815,7 +869,7 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
                 crate::script::binding_abi::string_arg(lua, token, r#"Usage: UnitXPMax("unit")"#)?;
             check_unit_token(&Some(token.clone()))?;
             let model = lua.app_data_ref::<Model>().expect("model app_data");
-            Ok(if names_self(&model, &token) {
+            Ok(if names_self(lua, &model, &token) {
                 i64::from(read_self(lua, |own| own.next_level_xp()))
             } else {
                 0
@@ -851,7 +905,7 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
             if class != CLASS_ROGUE && class != CLASS_DRUID {
                 return Ok(0_i64);
             }
-            let target = model.unit("target").map_or(0, |u| u.guid);
+            let target = super::view(lua, &model, "target").map_or(0, |u| u.guid);
             if model.combo_target != target {
                 return Ok(0_i64);
             }
@@ -1076,7 +1130,7 @@ pub(in crate::script) fn install(lua: &Lua) -> mlua::Result<()> {
         lua.create_function(|lua, ()| {
             let had = {
                 let model = lua.app_data_ref::<Model>().expect("model app_data");
-                model.unit("target").is_some_and(|u| u.exists)
+                super::view(lua, &model, "target").is_some_and(|u| u.exists)
             };
             submit(lua, ScriptCall::ClearTarget)?;
             Ok(flag(had))

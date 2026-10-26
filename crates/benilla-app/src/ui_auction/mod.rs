@@ -183,6 +183,89 @@ pub(crate) struct AuctionOpen {
     pub(crate) wire: AuctionWireLog,
 }
 
+/// What the list-request verbs read and write (`GetOwnerAuctionItems 0x4cec80`,
+/// `GetBidderAuctionItems 0x4cecd0`, through `0x4cd680` and `0x4cd720`): the session they test,
+/// the one-shot flags, the saved offsets and the outbid list, as a line found them
+/// ([`AuctionOpen::line`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Requests {
+    auctioneer: Option<u64>,
+    house_id: u32,
+    owner_armed: bool,
+    bidder_armed: bool,
+    owner_offset: u32,
+    bidder_offset: u32,
+    outbid: Vec<(u32, u32)>,
+}
+
+/// What the verbs a line's listeners called moved in the [`Requests`] they read: each flag and
+/// offset they wrote, and each outbid pair they removed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RequestsMoved {
+    owner_armed: Option<bool>,
+    bidder_armed: Option<bool>,
+    owner_offset: Option<u32>,
+    bidder_offset: Option<u32>,
+    removed: Vec<(u32, u32)>,
+}
+
+impl RequestsMoved {
+    /// What moved between `before` and `after`, a line's listeners' work.
+    pub(crate) fn between(before: &Requests, after: &Requests) -> Self {
+        let mut left = after.outbid.clone();
+        let mut removed = Vec::new();
+        for pair in &before.outbid {
+            match left.iter().position(|p| p == pair) {
+                Some(i) => {
+                    left.remove(i);
+                }
+                None => removed.push(*pair),
+            }
+        }
+        fn moved<T: PartialEq>(a: T, b: T) -> Option<T> {
+            (a != b).then_some(b)
+        }
+        Self {
+            owner_armed: moved(before.owner_armed, after.owner_armed),
+            bidder_armed: moved(before.bidder_armed, after.bidder_armed),
+            owner_offset: moved(before.owner_offset, after.owner_offset),
+            bidder_offset: moved(before.bidder_offset, after.bidder_offset),
+            removed,
+        }
+    }
+
+    /// `other`'s moves on top of these.
+    pub(crate) fn absorb(&mut self, other: Self) {
+        self.owner_armed = other.owner_armed.or(self.owner_armed);
+        self.bidder_armed = other.bidder_armed.or(self.bidder_armed);
+        self.owner_offset = other.owner_offset.or(self.owner_offset);
+        self.bidder_offset = other.bidder_offset.or(self.bidder_offset);
+        self.removed.extend(other.removed);
+    }
+
+    /// `requests` with these moves made: each written field as written, each removed pair's first
+    /// copy gone.
+    pub(crate) fn apply(&self, requests: &mut Requests) {
+        if let Some(v) = self.owner_armed {
+            requests.owner_armed = v;
+        }
+        if let Some(v) = self.bidder_armed {
+            requests.bidder_armed = v;
+        }
+        if let Some(v) = self.owner_offset {
+            requests.owner_offset = v;
+        }
+        if let Some(v) = self.bidder_offset {
+            requests.bidder_offset = v;
+        }
+        for pair in &self.removed {
+            if let Some(i) = requests.outbid.iter().position(|p| p == pair) {
+                requests.outbid.remove(i);
+            }
+        }
+    }
+}
+
 /// How far past the tick a bid notice pushes a deadline at least (`0x15f90`, `0x4cc5a2`).
 const DEADLINE_FLOOR_MS: u32 = 90_000;
 
@@ -204,8 +287,8 @@ pub(crate) struct RowPatch {
 /// lines and signal each list as they go, so the VM's half of each step is done before the next.
 #[derive(Debug, Clone)]
 pub(crate) enum HouseEffect {
-    /// A line shown (`0x496720`).
-    Line(AuctionMessage),
+    /// A line shown (`0x496720`), with the [`Requests`] as it found them.
+    Line(AuctionMessage, Requests),
     /// `list`'s row for the auction took a bid ([`AuctionOpen::patch_row`]).
     Edit { list: usize, auction_id: u32 },
     /// The auction left the lists, each on the page it held it on ([`AuctionOpen::remove_auction`]).
@@ -300,9 +383,37 @@ impl AuctionOpen {
         slot.awaiting = Some(slot.entries.iter().map(|e| e.item_entry).collect());
     }
 
-    /// A line the handler shows, in its order ([`HouseEffect::Line`]).
+    /// A line the handler shows, in its order ([`HouseEffect::Line`]), with the [`Requests`] as it
+    /// finds them, which the line's listeners' verbs read: `0x4cc460` shows a start's or a placed
+    /// bid's line (`0x4cc4c7`, `0x4cc507`) before it removes the pair, arms the flag and sends
+    /// (`0x4cc517`-`0x4cc528`), which the handler here does in its body.
     pub(crate) fn line(&mut self, msg: AuctionMessage) {
-        self.effects.push(HouseEffect::Line(msg));
+        let requests = self.requests();
+        self.effects.push(HouseEffect::Line(msg, requests));
+    }
+
+    /// The [`Requests`] as they stand.
+    pub(crate) fn requests(&self) -> Requests {
+        Requests {
+            auctioneer: self.auctioneer,
+            house_id: self.house_id,
+            owner_armed: self.owner_armed,
+            bidder_armed: self.bidder_armed,
+            owner_offset: self.owner_offset,
+            bidder_offset: self.bidder_offset,
+            outbid: self.outbid.clone(),
+        }
+    }
+
+    /// `requests` put in place of the house's own.
+    pub(crate) fn set_requests(&mut self, requests: Requests) {
+        self.auctioneer = requests.auctioneer;
+        self.house_id = requests.house_id;
+        self.owner_armed = requests.owner_armed;
+        self.bidder_armed = requests.bidder_armed;
+        self.owner_offset = requests.owner_offset;
+        self.bidder_offset = requests.bidder_offset;
+        self.outbid = requests.outbid;
     }
 
     /// `0x4cdfe0`: the auction leaves each list that holds it, the later rows moving up and the
@@ -519,7 +630,7 @@ impl Plugin for UiAuctionPlugin {
             .add_sweep_leg(SweepLeg::Auction, close_core)
             .add_systems(
                 Update,
-                // The feed before the input pass, and after `UnitFeed` so a row's tooltip reads a
+                // The feed after the packets, and after `UnitFeed` so a row's tooltip reads a
                 // landed template. Only with the interface up: a sale notice landing in the login
                 // burst would otherwise be shown on the glue VM and lost.
                 feed_auction
@@ -816,11 +927,21 @@ pub(crate) fn categories(
         .collect()
 }
 
-/// The DBC catalogs as one system param, since [`feed_auction`] is at Bevy's 16-param limit: the
-/// class tables for the category tree and the random-suffix pair for a rolled listing.
+/// Push the filter menus' tables into a VM before any interface file runs, from the prepare of
+/// every load seat: `GetAuctionItemClasses`, `GetAuctionItemSubClasses` and `GetAuctionInvTypes`
+/// read `ItemClass.dbc` and `ItemSubClass.dbc` inside the call (`0x4cf970`, `0x4cf9c0`,
+/// `0x4cfab0`), so an addon's file scope gets the names. Nothing else feeds them.
+pub(crate) fn seed_item_classes(world: &World, script: &mut UiScript) {
+    let tree = categories(
+        world.get_resource::<crate::ui_items::ItemClasses>(),
+        world.get_resource::<crate::ui_items::ItemSubClasses>(),
+    );
+    script.set_auction_item_classes(tree);
+}
+
+/// The random-suffix pair for a rolled listing, as one system param, since [`feed_auction`] is at
+/// Bevy's 16-param limit.
 type AuctionCatalogs<'w> = (
-    Option<Res<'w, crate::ui_items::ItemClasses>>,
-    Option<Res<'w, crate::ui_items::ItemSubClasses>>,
     Option<Res<'w, crate::items::RandomProperties>>,
     Option<Res<'w, crate::items::Enchants>>,
 );
@@ -846,7 +967,6 @@ fn feed_auction(
     mut last: crate::ui_script::WindowMemo<Option<AuctionState>>,
     mut last_open: crate::ui_script::WindowMemo<Option<u64>>,
     mut last_can_query: Local<crate::ui_script::VmMemo<bool>>,
-    mut last_classes: Local<crate::ui_script::VmMemo<Vec<AuctionCategory>>>,
     mut closes: CoreCloses,
 ) {
     vm.turn(|script, (mut auction, mut steps)| {
@@ -860,15 +980,6 @@ fn feed_auction(
             *last_open = None;
         }
         let last_can_query = last_can_query.get(script);
-
-        // The class tree needs no session: the stock `AuctionFrameBrowse_OnLoad` reads
-        // `GetAuctionItemClasses()` when the addon loads (`Blizzard_AuctionUI.lua:174`).
-        let classes_now = categories(catalogs.0.as_deref(), catalogs.1.as_deref());
-        let last_classes = last_classes.get(script);
-        if *last_classes != classes_now {
-            *last_classes = classes_now.clone();
-            script.set_auction_item_classes(classes_now);
-        }
 
         // A `_S` line whose item was not cached when its handler ran, shown once the record lands,
         // as the reference defers it through `0x4cd190`; the `items.template` call below asks for
@@ -912,8 +1023,8 @@ fn feed_auction(
 
         let self_guid = self_q.iter().next().map(|g| g.0);
         let rolls = crate::items::RollCatalogs {
-            props: catalogs.2.as_deref(),
-            enchants: catalogs.3.as_deref(),
+            props: catalogs.0.as_deref(),
+            enchants: catalogs.1.as_deref(),
         };
         // A list's result, and the window's show, are the frames the stock tabs call their getters
         // on.

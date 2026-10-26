@@ -55,6 +55,10 @@ fn spell_owner(spell_id: u32) -> u64 {
 #[test]
 fn unit_name_asks_a_missed_name_inside_its_call() {
     let (mut app, rx) = client();
+    // The target the resolver reads (`0x515a86`), and its view.
+    app.world_mut()
+        .resource_mut::<crate::target::Selection>()
+        .guid = Some(0x77);
     vm(&mut app).set_unit(
         "target",
         Some(UnitState {
@@ -220,6 +224,23 @@ fn an_auction_row_answers_a_cached_name_inside_its_call() {
 #[test]
 fn get_guild_info_asks_a_missed_guild_inside_its_call() {
     let (mut app, rx) = client();
+    // The object the getter reads at the call: a player of guild 9 (fields 191 and 192).
+    let target = app
+        .world_mut()
+        .spawn(crate::net::ObjectStore(
+            benilla_protocol::ObjectFields::from_pairs(&[(191, 9), (192, 0)])
+                .into_created(benilla_protocol::messages::ObjectType::Player),
+        ))
+        .id();
+    app.world_mut()
+        .resource_mut::<crate::net::GuidIndex>()
+        .0
+        .insert(0x77, target);
+    *app.world_mut().resource_mut::<crate::target::Selection>() = crate::target::Selection {
+        target: Some(target),
+        guid: Some(0x77),
+        ..Default::default()
+    };
     vm(&mut app).set_unit(
         "target",
         Some(UnitState {
@@ -642,7 +663,8 @@ fn the_quest_log_getters_ask_a_missed_record_inside_their_calls() {
         let mut s = vm(&mut app);
         s.seed_quest_record(50, record);
         s.set_quest_log_player(true);
-        s.quest_log_changed(slots);
+        s.set_quest_slots(slots);
+        s.quest_log_changed();
     }
     eval::<()>(
         &mut app,

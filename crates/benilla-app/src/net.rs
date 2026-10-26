@@ -649,6 +649,11 @@ impl Objects<'_, '_> {
             .and_then(|&e| self.stores.get(e).ok())
     }
 
+    /// The store of `entity`, as the net stage left it.
+    pub(crate) fn store_of(&self, entity: Entity) -> Option<&ObjectStore> {
+        self.stores.get(entity).ok()
+    }
+
     /// Every streamed object, items included.
     pub fn iter(&self) -> impl Iterator<Item = (u64, Entity, &ObjectFields)> + '_ {
         self.index
@@ -1385,6 +1390,16 @@ pub(crate) enum ClientCommand {
     MeetingStoneLeave,
     /// The enter-world meeting-stone status query: `CMSG 0x296`.
     MeetingStoneStatusQuery,
+    // ── Account data ──
+    /// A section the server's digest says changed there: `CMSG_REQUEST_ACCOUNT_DATA`.
+    RequestAccountData {
+        section: u32,
+    },
+    /// A section changed here: `CMSG_UPDATE_ACCOUNT_DATA` with its file.
+    UpdateAccountData {
+        section: u32,
+        contents: Vec<u8>,
+    },
     // ── The tutorial system ──
     /// `FlagTutorial` or an auto-acknowledge: `CMSG_TUTORIAL_FLAG`, the 0-based id.
     TutorialFlag {

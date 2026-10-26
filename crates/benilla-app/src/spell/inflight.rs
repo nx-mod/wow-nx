@@ -275,7 +275,8 @@ pub(super) fn inflight_item(
 }
 
 /// The player's cast state as the VM reads it ([`CastView`]): what the action bar's checked tests
-/// and `SpellStopCasting` hold the slots against, pushed each frame and after every script call.
+/// and `SpellStopCasting` hold the slots against, pushed each frame, as each packet left it at its
+/// place in the drain ([`crate::ui_cast::CastViews`]), and after every script call that moved it.
 #[derive(bevy::ecs::system::SystemParam)]
 pub(crate) struct CastState<'w, 's> {
     pending: Res<'w, PendingCast>,
@@ -374,10 +375,10 @@ pub(crate) struct AutoRepeatActive(pub Option<u32>);
 pub(crate) const SPELL_INTERRUPT_MOVEMENT: u32 = 0x1; // SpellRec+0x54 InterruptFlags (SPELL_INTERRUPT_FLAG_MOVEMENT)
 const CHANNEL_INTERRUPT_MOVING: u32 = 0x8; // SpellRec+0x5c ChannelInterruptFlags (AURA_INTERRUPT_MOVING_CANCELS)
 
-/// This frame's cancelling press, set by `player::control` and consumed by
-/// [`local_self_cancel`]: a press that newly set forward, back, strafe or autorun (the mask
-/// `0x10f0`, `0x5150ce`), the press that completed both mouse bits (`0x5150e2`), or the Jump
-/// command (`0x513c43`).
+/// This frame's cancelling press, set by the command press among the input records
+/// (`player::press`) and consumed by [`local_self_cancel`]: a press that newly set forward, back,
+/// strafe or autorun (the mask `0x10f0`, `0x5150ce`), the press that completed both mouse bits
+/// (`0x5150e2`), or the Jump command (`0x513c43`).
 #[derive(Resource, Default)]
 pub(crate) struct LocalMoveStart {
     pub(crate) pressed: bool,
@@ -406,7 +407,7 @@ pub(crate) struct LocalMoveStart {
 /// restored is in flight, and the report fires nothing (`0x6e2228`). The stock
 /// `CastingBarFrame.lua:132-139` steps the flash once per OnUpdate after the 1 s hold, followed
 /// by the fade.
-pub(super) fn local_self_cancel(mut moved: ResMut<LocalMoveStart>, mut cancel: SelfCancel) {
+pub(crate) fn local_self_cancel(mut moved: ResMut<LocalMoveStart>, mut cancel: SelfCancel) {
     if std::mem::take(&mut moved.pressed) {
         cancel.cancel(false, true, moved.mover_is_player);
     }

@@ -57,12 +57,25 @@ pub(super) fn wire_packets(packets: Vec<Vec<SessionEvent>>) -> Vec<SessionEvent>
         .collect()
 }
 
-/// A create block of `kind` whose fields are `pairs`, as the wire's whole descriptor.
+/// A create block of `kind` whose fields are `pairs`, as the wire's whole descriptor, with the
+/// `OBJECT_FIELD_TYPE` every create carries (object, unit and, for a player, player bits) unless
+/// `pairs` sets its own: the resolver's hop and the getters' lookups test it (typemask 8,
+/// `0x515a0f`).
 pub(super) fn created(guid: u64, kind: EntityKind, pairs: &[(u16, u32)]) -> SessionEvent {
     let as_type = match kind {
         EntityKind::Player => ObjectType::Player,
         _ => ObjectType::Unit,
     };
+    const OBJECT_TYPE: u16 = 2;
+    let mut pairs = pairs.to_vec();
+    if !pairs.iter().any(|&(i, _)| i == OBJECT_TYPE) {
+        let mask = match as_type {
+            ObjectType::Player => 0x19,
+            _ => 0x9,
+        };
+        pairs.insert(0, (OBJECT_TYPE, mask));
+    }
+    let pairs = &pairs[..];
     SessionEvent::ObjectCreate {
         guid,
         kind,
@@ -393,9 +406,9 @@ fn a_write_the_log_missed_fails_the_rewind() {
     );
 }
 
-/// A worldport drops every streamed object without an update block (`SMSG_NEW_WORLD`): logged as
-/// the stores it takes, the rewind of the target the frame creates again lands on the store the
-/// frame started from.
+/// A worldport drops every streamed object without an update block (`SMSG_NEW_WORLD`), logged as
+/// the stores it takes: the transfer ends the selection, so no seat reads the dropped target's
+/// store, and the target the frame creates again is read live.
 #[test]
 fn a_worldport_is_logged_as_the_stores_it_takes() {
     let mut app = client();
@@ -417,10 +430,7 @@ fn a_worldport_is_logged_as_the_stores_it_takes() {
     );
     let views = app.world().resource::<crate::ui_unit::views::UnitViews>();
     #[cfg(debug_assertions)]
-    assert_eq!(
-        views.starts_checked, 1,
-        "the target, checked against the snapshot"
-    );
+    assert_eq!(views.starts_checked, 0, "no seat reads a dropped store");
     assert!(!views.holds(WOLF), "and read live again");
 }
 

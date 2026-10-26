@@ -42,13 +42,6 @@ pub trait CallHost {
         false
     }
 
-    /// The player-name cache's record for `guid` as a getter reads it now (`0x55f080` on a valid
-    /// node), reading only: `None` for a miss, a refusal, and from a host that reads none.
-    fn player_name(&mut self, guid: u64) -> Option<String> {
-        let _ = guid;
-        None
-    }
-
     /// Hand `read` the unit object the engine holds under `guid`, as a getter reads it now: its
     /// descriptor's own fields, each derived as it is asked for, as of the place the getter runs
     /// (`UnitHealth` reads the object, `0x5174d0`). Whether there was one to hand: `false` when it
@@ -57,6 +50,28 @@ pub trait CallHost {
         &mut self,
         guid: u64,
         read: &mut dyn FnMut(&dyn super::UnitObjectRead),
+    ) -> bool {
+        let _ = (guid, read);
+        false
+    }
+
+    /// Hand `read` what the unit-token resolver reads off the objects as it resolves now
+    /// (`0x515970`): the active player's object, a player's pet off its descriptor and a unit's
+    /// `UNIT_FIELD_TARGET`, as of the place the getter runs. Whether it read: `false` from a host
+    /// that reads none. `read` runs no Lua.
+    fn read_unit_tokens(&mut self, read: &mut dyn FnMut(&dyn super::UnitTokenObjects)) -> bool {
+        let _ = read;
+        false
+    }
+
+    /// Hand `read` what names the unit object the engine holds under `guid`, as a getter reads it
+    /// now: its name off the name caches (`0x609210`) and its race and class bytes through the
+    /// tables, as of the place the getter runs. Whether there was one to hand: `false` when it
+    /// holds no object there, and from a host that reads none. `read` runs no Lua.
+    fn read_unit_identity(
+        &mut self,
+        guid: u64,
+        read: &mut dyn FnMut(&dyn super::UnitIdentityRead),
     ) -> bool {
         let _ = (guid, read);
         false
@@ -92,6 +107,28 @@ pub trait CallHost {
     /// Lua.
     fn read_self(&mut self, read: &mut dyn FnMut(&dyn super::SelfRead)) -> bool {
         let _ = read;
+        false
+    }
+
+    /// Hand `read` the aura list of the unit held under `guid` as the aura walks read it now: the
+    /// object's slots with `UnitBuff`'s gate on the active player as it stands (`0x519617`,
+    /// `0x5195be`), else the roster record of a member with no object (`0x519735`), as of the
+    /// place the getter runs; `None` for neither. Whether it read: `false` from a host that reads
+    /// none. `read` runs no Lua.
+    fn read_unit_auras(
+        &mut self,
+        guid: u64,
+        read: &mut dyn FnMut(Option<&dyn super::AuraListRead>),
+    ) -> bool {
+        let _ = (guid, read);
+        false
+    }
+
+    /// Answer a getter's question of the live state ([`super::live::ask`]), as of the place it
+    /// runs, by the family its type names: whether one of the host's families took it. A host
+    /// that reads none takes none.
+    fn read_live(&mut self, ask: &mut super::live::LiveAsk<'_>) -> bool {
+        let _ = ask;
         false
     }
 }

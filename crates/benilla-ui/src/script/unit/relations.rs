@@ -45,24 +45,23 @@ impl super::super::UiScript {
     }
 
     /// The drunk watcher's test on the active player (`0x5e2afb`-`0x5e2b2a`): the target global
-    /// `[0xb4e2d8]` names a unit the host holds (`0x468460`, typemask 8) and
-    /// `CanAttack 0x606980(player, target)` holds.
+    /// `[0xb4e2d8]`, read through the lent host as of here, names a unit the host holds
+    /// (`0x468460`, typemask 8) and `CanAttack 0x606980(player, target)` holds.
     pub fn player_can_attack_target(&self) -> bool {
         let model = self.model_ref();
         let guids = &model.unit_guids;
+        let target = super::UnitTokenGlobals::target(&super::LiveGlobals::asked(self.lua(), guids));
         model.unit_relations.as_deref().is_some_and(|rel| {
-            guids.target != 0
-                && rel.holds(guids.target)
-                && rel.can_attack(guids.player, guids.target) == Some(true)
+            target != 0 && rel.holds(target) && rel.can_attack(guids.player, target) == Some(true)
         })
     }
 }
 
 /// `GetGUIDFromName 0x515970` on one token: the guid of the unit it names, 0 for nobody. An
 /// unknown token raises `Unknown unit name` (`0x515c14`).
-fn guid_of(model: &Model, token: &str) -> mlua::Result<u64> {
+fn guid_of(lua: &Lua, model: &Model, token: &str) -> mlua::Result<u64> {
     check_unit_token(&Some(token.to_string()))?;
-    Ok(model.unit(token).map_or(0, |u| u.guid))
+    Ok(super::view(lua, model, token).map_or(0, |u| u.guid))
 }
 
 /// The guid when the host holds it as a unit: `None` is the null object a verb answers nil for.
@@ -99,7 +98,7 @@ fn ask_pair<T>(
     ask: impl FnOnce(&dyn UnitRelations, u64, u64) -> Option<T>,
 ) -> mlua::Result<Option<T>> {
     let model = lua.app_data_ref::<Model>().expect("model app_data");
-    let (ga, gb) = (guid_of(&model, a)?, guid_of(&model, b)?);
+    let (ga, gb) = (guid_of(lua, &model, a)?, guid_of(lua, &model, b)?);
     let (Some(ga), Some(gb)) = (held(&model, ga), held(&model, gb)) else {
         return Ok(None);
     };
@@ -120,7 +119,7 @@ fn predicate_or_group(
     predicate: impl FnOnce(&dyn UnitRelations, u64, u64) -> Option<bool>,
 ) -> mlua::Result<bool> {
     let model = lua.app_data_ref::<Model>().expect("model app_data");
-    let (ga, gb) = (guid_of(&model, a)?, guid_of(&model, b)?);
+    let (ga, gb) = (guid_of(lua, &model, a)?, guid_of(lua, &model, b)?);
     let hit = held(&model, ga)
         .zip(held(&model, gb))
         .zip(model.unit_relations.as_deref())
@@ -137,14 +136,14 @@ fn predicate_or_group(
 /// unknown token raises (`0x515c14`).
 pub(super) fn unit_is_pvp(lua: &Lua, token: &str) -> mlua::Result<Value> {
     let model = lua.app_data_ref::<Model>().expect("model app_data");
-    let guid = guid_of(&model, token)?;
+    let guid = guid_of(lua, &model, token)?;
     let answer = match held(&model, guid) {
         Some(guid) => model
             .unit_relations
             .as_deref()
             .and_then(|rel| rel.is_pvp(guid))
             .unwrap_or(false),
-        None => model.unit(token).is_some_and(|u| u.pvp),
+        None => super::view(lua, &model, token).is_some_and(|u| u.pvp),
     };
     Ok(flag(answer))
 }

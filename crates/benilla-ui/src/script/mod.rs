@@ -66,6 +66,7 @@ mod char_name;
 mod client;
 pub use client::FrameTimeRing;
 mod clock;
+mod cooldown_read;
 mod cvar_checks;
 mod cvars;
 mod dressup;
@@ -76,6 +77,7 @@ mod follow;
 pub(crate) mod font;
 mod font_block;
 mod frame_enum;
+mod roster_read;
 pub use char_name::{check_char_name, NameCharsets, NameLists, NoNameLists, CHAR_NAME_SUCCESS};
 mod glue;
 mod glue_addons;
@@ -104,10 +106,12 @@ mod gm_survey;
 mod gm_ticket;
 mod gossip;
 mod guild;
+mod guild_read;
 mod handler_prof;
 mod host;
 mod hyperlink;
 mod lfg;
+pub mod live;
 mod lottery;
 mod screenshot;
 mod tabard;
@@ -163,6 +167,7 @@ mod petition;
 mod pointer;
 mod pvp;
 mod quest;
+mod quest_live;
 mod quest_log;
 pub(crate) mod region;
 mod region_map;
@@ -217,7 +222,7 @@ mod zone_text;
 
 pub use action::{
     macro_slot_id, macro_slot_word, ActionBarCall, ActionSlot, ActionState, ActionUse, CastView,
-    OpenProfessions, Profession,
+    OpenProfessions, Profession, WearsItem,
 };
 pub use addon::{addon_load_context, AddOnInfo, AddonLoad, AddonReply, AddonSecurity};
 pub use addon_enable::{AddonStateFiles, EnableHash, EnableStore};
@@ -228,7 +233,9 @@ pub use auction::{
     AuctionStartRequest, AuctionState, AuctionSubCategory, BidVerdict, BIDDER, LIST, OWNER,
     SORT_KEYS,
 };
-pub use aura::{AuraCall, AuraState, TrackingState, UnitAuraList};
+pub use aura::{
+    AuraCall, AuraListRead, AuraRead, AuraState, PlayerBuffExpiry, TrackingState, UnitAuraList,
+};
 pub use backdrop::{Backdrop, Insets};
 pub use bank::{BankCall, BankState};
 pub use battlefield_positions::{BattlefieldFlagView, BattlefieldPositionView};
@@ -259,6 +266,7 @@ pub use container::{
     BagAutoStore, ContainerMove, ContainerSlot, ContainerState, ContainerUse, EnchantView,
     PendingWrap, PetitionSlotView, RandomPropertyView, UiCursorMode, UseArm, UseFork,
 };
+pub use cooldown_read::{CooldownQuery, CooldownTriple};
 pub use craft::{CraftCall, CraftDifficulty, CraftReagent, CraftRecipe, CraftState, CraftTooltip};
 pub use cursor::equip::{AutoEquip, BIND_WHEN_EQUIPPED};
 pub use cursor::money::coin_icon;
@@ -282,9 +290,10 @@ pub use cvar_checks::{
 };
 pub use cvars::small_cull_text;
 pub use cvars::{
-    CvarWrite, MultisampleFormat, ScreenResolution, SeededCvar, VideoCaps, CVAR_FRILL_DENSITY,
-    CVAR_GAMMA, CVAR_SMALL_CULL, CVAR_WORLD_DETAIL, IN_WORLD_READ_ONLY_CVARS, LUA_CVAR_LIMIT,
-    VIDEO_DEFAULT_CVARS, WORLD_DETAIL_STOPS,
+    CvarWrite, MultisampleFormat, MultisampleFormatsQuery, ScreenModes, ScreenModesQuery,
+    ScreenResolution, SeededCvar, VideoCaps, CVAR_FRILL_DENSITY, CVAR_GAMMA, CVAR_SMALL_CULL,
+    CVAR_WORLD_DETAIL, IN_WORLD_READ_ONLY_CVARS, LUA_CVAR_LIMIT, VIDEO_DEFAULT_CVARS,
+    WORLD_DETAIL_STOPS,
 };
 pub use death::{DeathAction, DeathUiState};
 pub use dialog_verbs::MeetingStoneCall;
@@ -298,6 +307,7 @@ pub use guild::{
     GuildCall, GuildCells, GuildMemberInfo, GuildRankEdit, GuildRankInfo, GuildState, LastOnline,
     UnitGuild, MAX_RANKS, MIN_RANKS, RANK_RIGHT_BITS,
 };
+pub use guild_read::{GuildAnswer, GuildRead, OwnGuild, UnitGuildRead};
 pub use host::{CallHost, CallTail, Deferring};
 pub use input_verbs::{BindingInput, FiredInput, HeldInput, LookCall, PostureCall, ViewAxis};
 pub use item_calls::ItemCall;
@@ -305,11 +315,19 @@ pub use item_read::{ItemInfoFields, ItemKey, ItemRead, ItemRoll};
 pub use lfg::LfgDungeon;
 pub use lottery::UnservedSend;
 pub use modelframe::{CharacterPaneFrame, ModelPaneFrame, ModelWanted};
+pub use movieframe::{
+    movie_bitmap, MovieAudio, MovieAudioStart, MovieBitmap, MovieOpen, MoviePicture, MovieReadFn,
+    MovieReader,
+};
 pub use petition::{
     validate_guild_name, PetitionCall, PetitionRecordView, PetitionState, PETITION_TYPE_CHARTER,
     PETITION_TYPE_PETITION,
 };
 pub use protected::InputEvents;
+pub use roster_read::{
+    GroupCells, GroupCellsQuery, GroupRow, MemberOrPetQuery, MemberQuery, Membership, RaidRowQuery,
+    RosterName, RosterNames, RosterNamesQuery, RowQuery,
+};
 pub use stat_read::{CombatRead, NoPlayer, SelfRead, UnitCombatStats};
 pub use tabard::{
     emblem_mask_path, TabardCall, TabardHost, EMBLEM_MASK_TOKEN, TABARD_COUNTS,
@@ -360,6 +378,9 @@ pub use pvp::{
     decorated_name, pvp_name_global_keys, HonorState, InspectHonorData, PvpCall, RankTitle,
 };
 pub use quest::{QuestCall, QuestItemView, QuestPanel, QuestRewardSpell, QuestSelect, QuestState};
+pub use quest_live::{
+    QuestClock, QuestClockRead, QuestCoinage, QuestHeld, QuestSlots, QuestStanding,
+};
 pub use quest_log::{
     QuestLogCarry, QuestObjectiveView, QuestRecordView, QuestSlotView, QUEST_LOG_SLOTS,
 };
@@ -368,7 +389,10 @@ pub(crate) use region::{
     load_blend_mode, load_texture_file, load_texture_name, load_xml_font_file,
     texture_name_verdict, FileLoad,
 };
-pub use reputation::{FactionEntry, ReputationCall, ReputationListOp, ReputationState};
+pub use reputation::{
+    Book, FactionEntry, FactionQuery, FactionRead, ReputationBook, ReputationCall,
+    ReputationListOp, ReputationState,
+};
 pub use session::SessionRequest;
 pub use shapeshift::ShapeshiftFormView;
 pub(crate) use simplehtml::{
@@ -408,8 +432,10 @@ pub use types::{
 };
 pub use unit::by_name::{self, NameCandidate, SeatedSelection};
 pub use unit::{
-    grey_band, level_reads_unknown, parse_unit_token, power_token, unit_is_grey, PlayerRecord,
-    SelectionRequest, UnitBase, UnitGuids, UnitObject, UnitObjectRead, UnitRelations, UnitState,
+    grey_band, level_reads_unknown, parse_unit_token, power_token, resolve_unit_in, unit_is_grey,
+    ObjectNameQuery, PlayerNameQuery, PlayerRecord, SelectionGlobals, SelectionQuery,
+    SelectionRequest, UnitBase, UnitGuids, UnitIdentityRead, UnitObject, UnitObjectRead,
+    UnitRecord, UnitRecordQuery, UnitRelations, UnitState, UnitTokenGlobals, UnitTokenObjects,
     UnitTokenParse,
 };
 pub use weapon_enchant::WeaponEnchant;
@@ -617,8 +643,7 @@ const SCRIPT_KINDS: [&str; 46] = [
     "OnDoubleClick",
     // The layout event (base map `0x76a0d0`, `+0x120`), fired by the resolve pass on a size change.
     "OnSizeChanged",
-    // The movie frame's three (script map `0x78c2e0`): fired by its player alone, which does not
-    // exist here ([`movieframe`]), so they are stored and never run.
+    // The movie frame's three (script map `0x78c2e0`), fired by its player ([`movieframe`]).
     "OnMovieFinished",
     "OnMovieShowSubtitle",
     "OnMovieHideSubtitle",
@@ -642,6 +667,16 @@ pub struct UiScript {
     /// VM instructions counted while a budget is installed ([`UiScript::set_instruction_budget`]).
     instructions: std::sync::Arc<std::sync::atomic::AtomicU64>,
     session: u64,
+}
+
+/// A VM's end destroys its frames, and a movie frame's destructor stops its movie, firing
+/// `OnMovieFinished` (`0x78c280`).
+impl Drop for UiScript {
+    fn drop(&mut self) {
+        if self.lua.app_data_ref::<Model>().is_some() {
+            self.stop_movies();
+        }
+    }
 }
 
 /// Hands out [`UiScript::session`] ids: process-global and monotone, so an id is never reused.
@@ -948,10 +983,21 @@ impl UiScript {
         self.set_root(Rect::new(0.0, 0.0, height, width), None)
     }
 
-    /// Set the screen root for a window of `width` by `height` pixels: the screen-scale cells from
-    /// its aspect `a = RN24(width / height)`, as `0x41ad10` takes it, and the root `768·a` by 768
-    /// script units, whose layout extent is exactly the cells' `K1` by `K2` (`0x764284`). A window
-    /// with no area reads as 4/3. Returns whether anything moved, as [`Self::set_screen_size`].
+    /// Set the screen root for a window of `width` by `height` pixels: [`Self::set_screen_aspect`]
+    /// at its aspect `RN24(width / height)`, 4/3 for a window with no area.
+    pub fn set_window_size(&mut self, width: f32, height: f32) -> bool {
+        self.set_screen_aspect(if width > 0.0 && height > 0.0 {
+            width / height
+        } else {
+            4.0 / 3.0
+        })
+    }
+
+    /// Set the screen root for the display aspect `a`: the screen-scale cells from it, as
+    /// `0x41ad10` takes it, and the root `768·a` by 768 script units, whose layout extent is
+    /// exactly the cells' `K1` by `K2` (`0x764284`). The host passes the aspect `0x4901e0` answers:
+    /// the window's, or exactly 4/3 with `widescreen` 0, stored at `0x48fe1e`, which it draws
+    /// stretched across the window. Returns whether anything moved, as [`Self::set_screen_size`].
     ///
     /// Deviation: the reference sets the cells only when glue or the interface is built, `0x41ad10`
     /// from `0x46a828` (`0x46a7b0`) and `0x48fe2b` (`0x48fbf0`), and a resize reaches them only
@@ -960,16 +1006,10 @@ impl UiScript {
     /// interface (`0x491380`) past 0.001 (`0x492f26`, `0x492f31`). The gate and the rebuild both
     /// take the aspect from `gxResolution` (`0x46ab40`, `0x4901e0`; 4/3 while `widescreen` is
     /// off), never the live window. Here every resize sets the cells from the window, because the
-    /// UI is kept live across a resize, and `widescreen` off keeps the window's aspect, as a 4:3
-    /// root over a wider window would take a seam stretched on one axis. A dragged frame with no
-    /// layout-cache row (unnamed, or `SetUserPlaced(false)`) keeps its drag pin in layout units,
-    /// where the rebuild would put it back where its script places it.
-    pub fn set_window_size(&mut self, width: f32, height: f32) -> bool {
-        let a = if width > 0.0 && height > 0.0 {
-            width / height
-        } else {
-            4.0 / 3.0
-        };
+    /// UI is kept live across a resize. A dragged frame with no layout-cache row (unnamed, or
+    /// `SetUserPlaced(false)`) keeps its drag pin in layout units, where the rebuild would put it
+    /// back where its script places it.
+    pub fn set_screen_aspect(&mut self, a: f32) -> bool {
         self.set_root(Rect::new(0.0, 0.0, 768.0, 768.0 * a), Some(a))
     }
 

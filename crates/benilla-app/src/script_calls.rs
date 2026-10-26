@@ -27,6 +27,7 @@ use benilla_ui::script::{
 
 pub(crate) mod disjoint;
 mod engine;
+pub(crate) mod live;
 mod windows;
 
 /// `DoEmote` (`0x5ef560`) in the reference's order: a posture emote's stand change to a state but 0
@@ -56,6 +57,9 @@ disjoint::disjoint_set! {
         /// reports the call made.
         self_cancel: crate::spell::SelfCancel<'static>,
         cast_state: crate::spell::CastState<'static, 'static>,
+        /// What the VM last took of the live cast state, and the views lane's log; absent in a
+        /// harness without the cast lanes.
+        cast_views: Option<ResMut<'static, crate::ui_cast::CastViews>>,
         reports: crate::ui_cast::CallReports<'static, 'static>,
         /// The character panel's tabs: talents, skills and reputation.
         talents: crate::ui_talent::TalentSteps<'static, 'static>,
@@ -134,115 +138,8 @@ disjoint::disjoint_set! {
         /// The console's commands, against what they read and write, and the getters' lookups.
         console: crate::console::ConsoleSteps<'static, 'static>,
         asks: engine::RecordAsks<'static>,
-        /// The unit objects, the items and the stats the getters read as they run.
-        units: UnitLive<'static, 'static>,
-        items_live: crate::ui_items::live::ItemLive<'static, 'static>,
-        stats_live: StatsLive<'static, 'static>,
-    }
-}
-
-/// The unit objects the `Unit*` getters read off as they run, as the reference's read the object
-/// they resolve (`UnitHealth`, `0x5174d0`): by guid through the object manager (`0x468460`), each
-/// store as of the drain's place, so a listener reads its own packet's.
-#[derive(SystemParam)]
-pub(crate) struct UnitLive<'w, 's> {
-    index: Option<Res<'w, crate::net::GuidIndex>>,
-    stores: crate::ui_unit::views::ViewStores<'w, 's>,
-}
-
-impl UnitLive<'_, '_> {
-    /// Hand `read` the object held under `guid`, as of here; whether one was held.
-    fn read(
-        &self,
-        guid: u64,
-        read: &mut dyn FnMut(&dyn benilla_ui::script::UnitObjectRead),
-    ) -> bool {
-        let Some(store) = self
-            .index
-            .as_deref()
-            .and_then(|i| i.0.get(&guid))
-            .and_then(|&e| self.stores.get(e).ok())
-        else {
-            return false;
-        };
-        read(&crate::ui_unit::StoreObject(store));
-        true
-    }
-}
-
-/// The unit objects the stat getters and the active player's getters read off as they run, as
-/// the reference's read the object they resolve (`UnitStat`, `0x518600`) and the active player's
-/// fields (`GetMoney`, `0x518160`): each store as of the drain's place, so a listener reads its
-/// own packet's, and the active player's worn weapons' records, read without asking.
-#[derive(SystemParam)]
-pub(crate) struct StatsLive<'w, 's> {
-    objects: crate::net::Objects<'w, 's>,
-    stores: crate::ui_unit::views::ViewStores<'w, 's>,
-    items: Res<'w, crate::items::Items>,
-}
-
-impl StatsLive<'_, '_> {
-    /// Hand `read` the object held under `guid` and its stats, as of here, the active player's
-    /// with its weapons; whether one was held.
-    fn read(
-        &self,
-        guid: u64,
-        read: &mut dyn FnMut(
-            &dyn benilla_ui::script::UnitObjectRead,
-            &dyn benilla_ui::script::CombatRead,
-        ),
-    ) -> bool {
-        let Some(entity) = self.objects.entity(guid) else {
-            return false;
-        };
-        let Ok(store) = self.stores.get(entity) else {
-            return false;
-        };
-        let entry = |guid| self.item_entry(guid);
-        let stats = if self.objects.player() == Some(entity) {
-            crate::ui_char::StatsObject::player(
-                store,
-                crate::ui_char::Worn::new(store, &entry, &self.items),
-            )
-        } else {
-            crate::ui_char::StatsObject::unit(store)
-        };
-        read(&crate::ui_unit::StoreObject(store), &stats);
-        true
-    }
-
-    /// An item's entry as of here, a worn weapon a later packet destroys included.
-    fn item_entry(&self, guid: u64) -> Option<u32> {
-        self.stores
-            .by_guid(guid, self.objects.store(guid))?
-            .0
-            .object_entry()
-    }
-
-    /// The active player's store as of here, `None` while none is held.
-    fn player(&self) -> Option<&crate::net::ObjectStore> {
-        self.objects.player().and_then(|e| self.stores.get(e).ok())
-    }
-
-    /// Hand `read` the active player's stats, as of here, `None` while none is held.
-    fn read_own(&self, read: &mut dyn FnMut(Option<&dyn benilla_ui::script::CombatRead>)) {
-        let Some(store) = self.player() else {
-            return read(None);
-        };
-        let entry = |guid| self.item_entry(guid);
-        read(Some(&crate::ui_char::StatsObject::player(
-            store,
-            crate::ui_char::Worn::new(store, &entry, &self.items),
-        )));
-    }
-
-    /// Hand `read` the active player's own fields as of here, [`benilla_ui::script::NoPlayer`]'s
-    /// while none is held.
-    fn read_self(&self, read: &mut dyn FnMut(&dyn benilla_ui::script::SelfRead)) {
-        match self.player() {
-            Some(store) => read(&crate::ui_unit::StoreObject(store)),
-            None => read(&benilla_ui::script::NoPlayer),
-        }
+        /// What the getters read as they run ([`live::LiveReads`]).
+        live: live::LiveReads<'static, 'static>,
     }
 }
 
@@ -330,17 +227,47 @@ impl ScriptCallHost<'_, '_> {
         script.hosted(self, |_| ());
     }
 
+    /// A field watcher's usable refresh (`0x4b31c0`) outside any call, inside its packet: the bar's
+    /// states and cache derived off the stores as of the drain's place and pushed, then its signals
+    /// with the host lent, so their listeners' calls apply inside the verb. A harness without the
+    /// action feed's inputs refreshes nothing.
+    pub(crate) fn engine_usable_refresh(&mut self, script: &mut UiScript) {
+        let signals = self
+            .appliers
+            .action_states()
+            .as_mut()
+            .map(|states| states.usable_refresh(script));
+        if let Some(signals) = signals {
+            script.hosted(self, |script| signals.fire(script));
+        }
+    }
+
+    /// A recount's slot write outside any call (`0x4e58e0`): the slot's usable pair stored and
+    /// pushed, with nothing signalled ([`crate::ui_action::ActionStates::slot_written`]).
+    pub(crate) fn engine_slot_written(&mut self, script: &mut UiScript) {
+        if let Some(states) = self.appliers.action_states().as_mut() {
+            states.slot_written(script);
+        }
+    }
+
     /// Push the views a call left for the script's next line, and for the listeners at a signal
     /// point inside it.
     fn commit_views(&mut self, script: &mut UiScript) {
         let appliers = &mut self.appliers;
         // The cast state: `SpellStopCasting` (`0x6e6e80`) finds the cast the call sent in flight
         // (`0x6e5026`), and `IsCurrentAction` (`0x4e53a0`) checks its slot, as stock
-        // `ActionButtonUp` reads straight after `UseAction` (`ActionButton.lua:54-55`).
+        // `ActionButtonUp` reads straight after `UseAction` (`ActionButton.lua:54-55`); with the
+        // targeting word `SpellIsTargeting` (`0x6e6cd0`) reads. A call that moved none of it
+        // leaves the view its listener's packet left ([`crate::ui_cast::CastViews::commit`]).
         let view = appliers.cast_state().view();
-        script.set_cast_view(view);
-        // The targeting word: `SpellIsTargeting` (`0x6e6cd0`) reads it, and `SpellTargetUnit`
-        // binds to it.
+        match appliers.cast_views().as_deref_mut() {
+            Some(views) => views.commit(script, view),
+            None => {
+                script.set_cast_view(view);
+                script.set_spell_targeting(view.targeting.is_some());
+            }
+        }
+        // The rest of the targeting word's: `SpellTargetUnit` binds to it.
         appliers.cursor().push_view(script);
     }
 
@@ -633,11 +560,7 @@ impl CallHost for ScriptCallHost<'_, '_> {
         key: benilla_ui::script::ItemKey,
         read: &mut dyn FnMut(&dyn benilla_ui::script::ItemRead),
     ) -> bool {
-        self.appliers.items_live().read(key, read)
-    }
-
-    fn player_name(&mut self, guid: u64) -> Option<String> {
-        self.appliers.asks().player_name(guid)
+        self.appliers.live().items().read(key, read)
     }
 
     fn read_unit_object(
@@ -645,7 +568,23 @@ impl CallHost for ScriptCallHost<'_, '_> {
         guid: u64,
         read: &mut dyn FnMut(&dyn benilla_ui::script::UnitObjectRead),
     ) -> bool {
-        self.appliers.units().read(guid, read)
+        self.appliers.live().units().read(guid, read)
+    }
+
+    fn read_unit_identity(
+        &mut self,
+        guid: u64,
+        read: &mut dyn FnMut(&dyn benilla_ui::script::UnitIdentityRead),
+    ) -> bool {
+        self.appliers.live().units().read_identity(guid, read)
+    }
+
+    fn read_unit_tokens(
+        &mut self,
+        read: &mut dyn FnMut(&dyn benilla_ui::script::UnitTokenObjects),
+    ) -> bool {
+        self.appliers.live().units().read_tokens(read);
+        true
     }
 
     fn read_unit_stats(
@@ -656,20 +595,35 @@ impl CallHost for ScriptCallHost<'_, '_> {
             &dyn benilla_ui::script::CombatRead,
         ),
     ) -> bool {
-        self.appliers.stats_live().read(guid, read)
+        self.appliers.live().stats().read(guid, read)
     }
 
     fn read_own_stats(
         &mut self,
         read: &mut dyn FnMut(Option<&dyn benilla_ui::script::CombatRead>),
     ) -> bool {
-        self.appliers.stats_live().read_own(read);
+        self.appliers.live().stats().read_own(read);
         true
     }
 
     fn read_self(&mut self, read: &mut dyn FnMut(&dyn benilla_ui::script::SelfRead)) -> bool {
-        self.appliers.stats_live().read_self(read);
+        self.appliers.live().stats().read_self(read);
         true
+    }
+
+    fn read_unit_auras(
+        &mut self,
+        guid: u64,
+        read: &mut dyn FnMut(Option<&dyn benilla_ui::script::AuraListRead>),
+    ) -> bool {
+        match self.appliers.live().auras() {
+            Some(auras) => auras.read(guid, read),
+            None => false,
+        }
+    }
+
+    fn read_live(&mut self, ask: &mut benilla_ui::script::live::LiveAsk<'_>) -> bool {
+        self.appliers.live().answer(ask)
     }
 
     fn apply(&mut self, script: &mut UiScript, call: ScriptCall) -> Option<CallTail> {
@@ -1131,6 +1085,26 @@ impl<P: SystemParam + 'static> VmWith<'_, '_, P> {
         pay(self.set.p0(), select.owed);
     }
 
+    /// A field watcher's usable refresh in place with the host
+    /// ([`ScriptCallHost::engine_usable_refresh`]); with no VM or no host, nobody listens.
+    pub(crate) fn engine_usable_refresh(&mut self) {
+        if let Some(script) = self.script.as_deref_mut() {
+            if let Some(host) = self.set.p1().as_mut() {
+                host.engine_usable_refresh(script);
+            }
+        }
+    }
+
+    /// A recount's slot write with the host ([`ScriptCallHost::engine_slot_written`]); with no VM
+    /// or no host, the next feed stores the pair.
+    pub(crate) fn engine_slot_written(&mut self) {
+        if let Some(script) = self.script.as_deref_mut() {
+            if let Some(host) = self.set.p1().as_mut() {
+                host.engine_slot_written(script);
+            }
+        }
+    }
+
     /// An engine writer's StartAttack at `guid`, its select signalled in place with the host
     /// ([`ScriptCallHost::engine_start_attack`]); with no VM or no host, `start` runs it on `P`.
     pub(crate) fn engine_start_attack(
@@ -1274,6 +1248,12 @@ pub(crate) fn bind_parked_picks(mut cursor: crate::spell::ScriptCursor) {
     cursor.bind_parked();
 }
 
+/// [`bind_parked_picks`] after a walk's arrival in the frame time, whose dispatch selects through
+/// the same front.
+pub(crate) fn bind_arrival_picks(mut cursor: crate::spell::ScriptCursor) {
+    cursor.bind_parked();
+}
+
 /// The census list ([`benilla_ui::script::census`]).
 #[cfg(test)]
 pub(crate) mod census;
@@ -1408,7 +1388,7 @@ mod tests {
             }],
         });
         if selected {
-            // The frame's unit snapshot, as the feed pushed it before the input pass.
+            // The frame's unit snapshot, as the last feed pushed it.
             script.set_unit(
                 "target",
                 Some(benilla_ui::script::UnitState {
@@ -1817,11 +1797,13 @@ mod tests {
         use benilla_ui::script::UnitState;
         let mut f = frame(true);
         let world = f.app.world_mut();
-        // `party1` targets us (`UNIT_FIELD_TARGET`, fields 16 and 17).
+        // `party1`, a player (`OBJECT_FIELD_TYPE`), targets us (`UNIT_FIELD_TARGET`, fields 16
+        // and 17).
         let new = world.resource::<GuidIndex>().0[&NEW];
         world
             .entity_mut(new)
             .insert(ObjectStore(benilla_protocol::ObjectFields::from_pairs(&[
+                (2, 0x19),
                 (22, 100),
                 (28, 100),
                 (16, ME as u32),
@@ -2179,6 +2161,19 @@ mod tests {
         }
     }
 
+    /// The world's group as a party we lead, `member` alone in `party1`: what the loot setters'
+    /// gates read at the call (`0x4e92a6`-`0x4e92eb`).
+    fn lead_party(world: &mut World, member: u64, name: &str) {
+        let mut group = world.resource_mut::<crate::ui_party::GroupState>();
+        group.members = vec![GroupMemberEntry {
+            name: name.into(),
+            guid: member,
+            status: 1,
+            flags: 0,
+        }];
+        group.leader = ME;
+    }
+
     /// The `CMSG_LOOT_METHOD`s `chunk` sends inside its calls, run with the host lent.
     fn loot_methods_sent(f: &mut Frame, chunk: &str) -> Vec<(u32, u64, u32)> {
         let _ = f.rx.try_iter().count();
@@ -2202,7 +2197,6 @@ mod tests {
     /// dead one is no candidate, so the name finds nobody and the binding sends nothing.
     #[test]
     fn set_loot_method_resolves_a_held_groupmate_only_while_alive() {
-        use benilla_ui::script::{PartyMemberInfo, PartyState};
         for (health, resolved) in [(100, true), (0, false)] {
             let mut f = frame(false);
             // OLD is a friendly player, our groupmate "Olly" in `party1`.
@@ -2214,17 +2208,8 @@ mod tests {
             world
                 .run_system_once(crate::ui_unit::feed_name_candidates)
                 .expect("the candidate feed runs as a one-shot system");
+            lead_party(f.app.world_mut(), OLD, "Olly");
             let mut script = f.app.world_mut().non_send_resource_mut::<UiScript>();
-            script.set_party(PartyState {
-                members: vec![PartyMemberInfo {
-                    name: "Olly".into(),
-                    guid: OLD,
-                }],
-                leader_index: 0,
-                leader_guid: ME,
-                own_guid: ME,
-                ..Default::default()
-            });
             script.set_unit(
                 "player",
                 Some(benilla_ui::script::UnitState {
@@ -2257,7 +2242,6 @@ mod tests {
     /// above 0 (`0x493eca`): a ghost, at health 1, does; a corpse, at 0, does not.
     #[test]
     fn set_loot_method_resolves_our_own_name_through_the_feed() {
-        use benilla_ui::script::PartyState;
         for (health, resolved) in [(100, true), (1, true), (0, false)] {
             let mut f = frame(false);
             with_factions(&mut f, FRIEND, &[]);
@@ -2278,16 +2262,8 @@ mod tests {
             world
                 .run_system_once(crate::ui_unit::feed_name_candidates)
                 .expect("the candidate feed runs as a one-shot system");
+            lead_party(f.app.world_mut(), OLD, "Olly");
             let mut script = f.app.world_mut().non_send_resource_mut::<UiScript>();
-            script.set_party(PartyState {
-                members: vec![benilla_ui::script::PartyMemberInfo {
-                    name: "Olly".into(),
-                    guid: OLD,
-                }],
-                leader_guid: ME,
-                own_guid: ME,
-                ..Default::default()
-            });
             script.set_unit(
                 "player",
                 Some(benilla_ui::script::UnitState {
@@ -2308,9 +2284,9 @@ mod tests {
 
     /// The commit's `IsSelectable` (`0x4935ee`) refuses a `UNIT_FLAG_NOT_SELECTABLE` unit: the
     /// nearer namesake is the ranked pick and it is refused, so the commit keeps its selection,
-    /// not the farther namesake, and the chunk keeps the old target's view.
+    /// not the farther namesake, and the chunk reads the old target.
     #[test]
-    fn target_by_name_shows_nothing_when_the_commit_refuses_its_pick() {
+    fn target_by_name_keeps_the_old_target_when_the_commit_refuses_its_pick() {
         /// `UNIT_FLAG_NOT_SELECTABLE`, `UNIT_FIELD_FLAGS` bit 25.
         const NOT_SELECTABLE: u32 = 1 << 25;
         /// A selectable namesake of `MOB` farther off, told apart by its health.
@@ -2330,6 +2306,13 @@ mod tests {
             ))
             .id();
         world.resource_mut::<GuidIndex>().0.insert(TWIN, twin);
+        // The old target told apart from the mob by its health.
+        let old = world.resource::<GuidIndex>().0[&OLD];
+        world
+            .get_mut::<ObjectStore>(old)
+            .expect("the old target's store")
+            .0
+            .merge(benilla_protocol::ObjectFields::from_pairs(&[(HEALTH, 70)]));
         let mut names = world.resource_mut::<crate::names::NameCache>();
         names.insert_player(MOB, "Red Affinity".into(), None);
         names.insert_player(TWIN, "Red Affinity".into(), None);
@@ -2341,8 +2324,8 @@ mod tests {
             "TargetByName('Red Affinity') return UnitHealth('target')",
         );
         assert_eq!(
-            shown, 0,
-            "the old target's view, not the twin's 40 or the mob's 100"
+            shown, 70,
+            "the old target's health, not the twin's 40 or the mob's 100"
         );
         assert_eq!(selected(&f), Some(OLD), "the commit refuses the same pick");
     }
@@ -4439,13 +4422,17 @@ mod tests {
         f
     }
 
-    /// A feed's event handler casts inside its call: the action feed pushes as an engine turn,
-    /// and the events it owes are signalled with the host lent, each handler run in place
-    /// (`SignalEvent` `0x703e50`). Here the bar's first `ACTIONBAR_UPDATE_COOLDOWN`.
+    /// A lane's event handler casts inside its call: the cooldown lane signals each flush with
+    /// the host lent, each handler run in place (`SignalEvent` `0x703e50`). Here the cheat's
+    /// `ACTIONBAR_UPDATE_COOLDOWN` (`0x6e9712`).
     #[test]
-    fn a_feeds_event_handler_casts_and_binds_inside_its_call() {
+    fn a_cooldown_flushs_handler_casts_and_binds_inside_its_call() {
         let mut f = cork_on("ACTIONBAR_UPDATE_COOLDOWN");
-        crate::ui_action::run_action_events_once(f.app.world_mut());
+        f.app
+            .world_mut()
+            .resource_mut::<crate::spell::Cooldowns>()
+            .wipe();
+        crate::lanes::fire_in_order(f.app.world_mut());
         assert_eq!(global(&mut f, "RAN"), Some(1), "the handler ran");
         assert_eq!(global(&mut f, "FIRST"), Some(1), "armed on the next line");
         assert_eq!(global(&mut f, "SECOND"), None, "bound and sent");
