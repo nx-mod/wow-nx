@@ -1,10 +1,9 @@
 # wow-nx: the Switch port
 
 Status (2026-10-25): **playable, in progress.** It logs in to a 1.12.1 server (Kronos), enters the world and plays
-with the Joy-Con through benilla-pad, touch, or a USB keyboard and mouse. Performance numbers wait for the first
-tested release. Upstream is
-merged to 0bd7d053. Open below: a crash while the world loads in the latest builds, status bars drawn with chunks
-missing, and the main thread's speed. `main` mirrors upstream untouched.
+with the Joy-Con through benilla-pad, touch, or a USB keyboard and mouse, at 17–22 fps in the world at 720p on the
+first release build. Upstream is merged to 0bd7d053. The main thread's speed is the open work. `main` mirrors
+upstream untouched.
 
 ## How the port works
 
@@ -33,24 +32,20 @@ Measured on the console: the backend logs fps and GPU time per pass every 300 fr
 each pipeline), and `WOWNX_PROFILE=1` samples every thread 250 times a second into `sdmc:/wow-nx/samples.txt`, which
 `switch/profile.py` names from the ELF, with the lock a blocked thread waits on.
 
-Bugs:
+Fixed on 2026-10-25, for the record: a world-load crash (the GPU ring full under a loading burst; a timed-out
+kickoff is now retried while the channel is healthy, `kickoff.c`) and status bars with chunks missing (deko3d's tile
+height for an 8-row texture was taller than the image; `create_texture` picks the smallest that covers it).
 
-- **A GPU timeout while the world loads** (kickoff `0xd5c`) since the gamepad bar first showed; seen with and without
-  multi-threaded Update/PostUpdate. A deko3d debug build (`WOWNX_DEKO3D_DEBUG=1`) names the work that hangs.
-- **Status bars with chunks missing** (health, cast bars; many, not all): the bar texture comes out wrong, not the
-  bar logic. `WOW_NO_BC=1` (DXT decoded on the CPU) splits our compressed-texture path from the rest.
-- **The minimap's terrain picture** was drawn beside its frame while the UI camera kept 1600x900; check it again now
-  that the window size is announced.
-
-Speed (profiles from test builds; release numbers come with the first tested release). In the world the main
+Speed: 17–22 fps in the world at 720p on the first release build (`switch-ship`: dependencies in one codegen unit
+each). Profiles from test builds: in the world the main
 thread is the frame (~88 % busy); the workers and the render thread idle. Done: Bevy's compute pool has a worker per
 core and threads spread over the cores (`thread.c`); a thread-caching allocator took the main thread's waits on
 newlib's malloc lock from ~21 % to ~3 % of its samples. Next:
 
-- **Inlining.** The profile's top entries are small Bevy functions (parameter checks, table and resource lookups) that
-  a full build inlines. `[profile.switch]` has no LTO and 16 codegen units so the phone that builds it does not run
-  out of memory; dependencies at one codegen unit each (upstream measured +1.2 cpu_ms at 16 on desktop) is the next
-  experiment, built single-job.
+- **Inlining.** The profile's top entries were small Bevy functions (parameter checks, table and resource lookups)
+  that a full build inlines. Releases now build with `switch-ship` (dependencies in one codegen unit each); our own
+  crates stay at 16 units without LTO, since `benilla-app` in one unit does not fit the phone. A CI build has the
+  memory for more (thin LTO, our crates at fewer units): worth measuring there.
 - **The call host's parameter checks** (`Appliers::validate_param`, ~4 %): every system that lends the host validates
   its ~70 parts each frame.
 - **Multi-threaded Update/PostUpdate** (`WOW_MT_UPDATE=1`, `WOW_MT_POSTUPDATE=1`): upstream's switches; on the first

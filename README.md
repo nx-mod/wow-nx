@@ -12,16 +12,15 @@ through [benilla-pad](https://github.com/lucasvallejodev/benilla-gamepad).
 
 ## Status
 
-In progress, and playable: it logs in to a 1.12.1 server (tested on Kronos), enters the world, and you can fight,
-loot, cast and quest with the Joy-Con, touch, or a USB keyboard and mouse.
+In progress, and playable: it logs in to a 1.12.1 server, enters the world, and you can fight, loot, cast and quest
+with the Joy-Con, touch, or a USB keyboard and mouse. Tested on Kronos (TwinStar) with a new night elf druid, from
+level 1 in Teldrassil.
 
 Known issues, being worked on ([docs/SWITCH.md](docs/SWITCH.md) has the details):
 
-- **Speed:** below a steady 60 fps; the main thread is the limit and the work on it continues. Numbers come with the
-  first tested release.
-- **The latest builds can crash while the world loads** (a GPU timeout); a debug build is narrowing it down.
-- **Some status bars** (health, cast bars) draw with chunks missing.
-- The controller menu's descriptions still use Xbox button names.
+- **Speed:** 17–22 fps in the world at 720p on the first release build (30–60 on the character screen). The main
+  thread is the limit, and the work on it continues.
+- The controller menu's descriptions still use Xbox button names, and cooldowns on the round buttons are square.
 
 ## Install
 
@@ -77,8 +76,10 @@ Needs devkitPro (devkitA64, libnx, switch-tools) and the Rust nightly in `switch
 sh switch/build-benilla.sh -j2        # target/wow-nx.nro
 ```
 
-`WOWNX_BUILD_NUMBER=<n>` numbers a release build, and `switch/release.sh <n> <notes>` publishes it as GitHub release
-`build-<n>`, the one the updater takes. `WOWNX_DEKO3D_DEBUG=1` links deko3d's debug library and names the work in a
+Releases come from GitHub Actions (`.github/workflows/switch.yml`): pushing a tag `v<version>` builds the release
+profile (`WOWNX_SHIP=1`: every dependency in one codegen unit) numbered with the run number and publishes it as
+`build-<n>` with the stored `wow-nx-switch.zip` the updater reads. `switch/release.sh` publishes a local build the
+same way. `WOWNX_DEKO3D_DEBUG=1` links deko3d's debug library and names the work in a
 GPU fault.
 
 The PC client is upstream's: [README.benilla.md](README.benilla.md).

@@ -1,0 +1,94 @@
+name: Switch
+
+# The Nintendo Switch release, for this repository only: pushing a tag v<version> builds wow-nx.nro with the release
+# profile (switch-ship: every dependency in one codegen unit) and publishes it as the release build-<run number>,
+# titled with the version, in the form the self-updater reads (crates/benilla-horizon/update.c): the build number is
+# the run number, baked into the program (WOWNX_BUILD_NUMBER), and the release carries wow-nx-switch.zip, stored
+# (zip -0) so the console unpacks wow-nx.nro as it downloads. Run by hand (workflow_dispatch), it builds the same
+# program as an artifact and publishes nothing.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+concurrency:
+  group: switch-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  switch:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    # devkitPro's image carries devkitA64, libnx and deko3d; its package hosts refuse GitHub's runners.
+    container: devkitpro/devkita64:latest
+    timeout-minutes: 240
+    env:
+      DEVKITPRO: /opt/devkitpro
+      DEVKITA64: /opt/devkitpro/devkitA64
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Check the toolchain
+        run: |
+          for f in /opt/devkitpro/libnx/lib/libnx.a /opt/devkitpro/libnx/lib/libdeko3d.a \
+                   /opt/devkitpro/tools/bin/elf2nro /opt/devkitpro/tools/bin/nacptool \
+                   /opt/devkitpro/devkitA64/bin/aarch64-none-elf-gcc; do
+            if [ -e "$f" ]; then echo "found $f"; else echo "::error::$f is not in the image"; exit 1; fi
+          done
+
+      - name: Install the build tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends python3 zip curl git gh ca-certificates build-essential
+
+      - uses: actions/checkout@v4
+        with:
+          # The build stamp describes the commit from its tags and history.
+          fetch-depth: 0
+
+      - name: Rust
+        run: |
+          curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          # The toolchain switch/env.sh names, with the standard library's source for -Zbuild-std.
+          toolchain=$(sed -n 's/^export RUSTUP_TOOLCHAIN=//p' switch/env.sh)
+          "$HOME/.cargo/bin/rustup" toolchain install "$toolchain" --profile minimal --component rust-src
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-registry-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-registry-
+
+      - name: Build
+        env:
+          WOWNX_SHIP: "1"
+          WOWNX_BUILD_NUMBER: ${{ github.run_number }}
+        run: sh switch/build-benilla.sh -j"$(nproc)"
+
+      - name: Package
+        run: |
+          mkdir -p release
+          (cd target && zip -0 -X "$GITHUB_WORKSPACE/release/wow-nx-switch.zip" wow-nx.nro)
+          ls -l target/wow-nx.nro release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wow-nx-switch
+          path: release/wow-nx-switch.zip
+          retention-days: 7
+
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "build-$GITHUB_RUN_NUMBER" release/wow-nx-switch.zip --target "$GITHUB_SHA" --latest \
+            --title "wow-nx ${TAG#v} (build $GITHUB_RUN_NUMBER)" \
+            --notes "wow-nx ${TAG#v} for the Nintendo Switch. Put wow-nx.nro in sdmc:/wow-nx/ with your 1.12.1 client's Data folder at sdmc:/wow-nx/Data (README). A release looks for newer ones while it loads and offers them."
