@@ -82,6 +82,9 @@ pub struct Sampler {
 #[derive(Debug)]
 pub(super) struct CompiledStage {
     pub(super) shader: Box<DkShader>,
+    /// Registers a thread, scratch (registers spilled to local memory) and code bytes, from the DKSH header: what
+    /// decides how many warps a GPU core keeps in flight, logged per pipeline.
+    pub(super) cost: (u32, u32, u32),
 }
 
 /// What a pipeline's shaders read, besides buffers: per texture slot, the sampler slot it is combined with.
@@ -403,7 +406,11 @@ impl super::Device {
             .lock()
             .load(&dksh)
             .ok_or_else(|| crate::PipelineError::Linkage(wgt_stage(naga_stage), "code memory full".into()))?;
-        Ok(CompiledStage { shader })
+        // deko3d's dksh.h: the code size at 12, the first program header at the offset at 16, its registers at +8 and
+        // scratch at +20.
+        let word = |at: usize| dksh.get(at..at + 4).map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+        let programs = word(16) as usize;
+        Ok(CompiledStage { shader, cost: (word(programs + 8), word(programs + 20), word(12)) })
     }
 
     pub(super) fn new_render_pipeline(
@@ -426,6 +433,16 @@ impl super::Device {
             }
             None => None,
         };
+        // What each stage costs on the GPU, by pipeline: the per-pipeline times say where the GPU frame goes, this says
+        // why (a fragment shader's registers decide how many pixels a core shades at once).
+        let label = desc.label.unwrap_or("unlabelled");
+        match &fs {
+            Some(f) => log::info!(
+                "deko3d: pipeline {label}: fragment {} registers, {} scratch, {} code; vertex {} registers, {} code",
+                f.cost.0, f.cost.1, f.cost.2, vs.cost.0, vs.cost.2
+            ),
+            None => log::info!("deko3d: pipeline {label}: vertex {} registers, {} code", vs.cost.0, vs.cost.2),
+        }
 
         let p = &desc.primitive;
         use wgt::PrimitiveTopology as T;
