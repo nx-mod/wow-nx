@@ -12,7 +12,7 @@ upstream untouched.
 | Rust `std` | yes | a custom target, `aarch64-nintendo-switch-newlib` (`target_os = "horizon"`, the code path the 3DS target uses in `std`), built with `-Zbuild-std` against devkitA64's newlib and libnx; `third_party/libc` has Horizon's 64-bit and socket layouts (`third_party/libc/WOW-NX.md`) |
 | Rendering | Bevy on wgpu (Vulkan, Metal, DX12) | Bevy on wgpu on our deko3d wgpu-hal backend, in wgpu's GL slot ([SWITCH-RENDER.md](SWITCH-RENDER.md)); shaders go naga → GLSL → uam, cached on the SD card |
 | Audio | kira on cpal | kira on audout, at 48 kHz |
-| Window, input | winit | `crates/benilla-app/src/switch.rs`: libnx's default window, the applet loop, HID (touch, USB keyboard and mouse, the Joy-Con as Bevy's gamepad), the system keyboard |
+| Window, input | winit | `crates/benilla-app/src/switch.rs`: libnx's default window, the applet loop, HID (touch, USB keyboard and mouse, the Joy-Con as Bevy's gamepad), the system keyboard; each input also goes out as a `WindowEvent`, the stream winit fills on the PC and the UI reads clicks and keys from |
 | Controller play | — | benilla-pad (`crates/benilla-pad`), with Nintendo button names and a Switch layout |
 | Files | the WoW folder | `sdmc:/wow-nx/Data` (the user's client) and `sdmc:/wow-nx/benilla-config`; `sdmc:/wow-nx/benilla.env` sets the login and switches |
 | Threads, memory | OS | libnx threads spread over the 3 cores, a compute worker per core, and a thread-caching allocator in front of newlib's malloc (`crates/benilla-horizon`) |

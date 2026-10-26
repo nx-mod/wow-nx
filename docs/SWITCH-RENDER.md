@@ -58,6 +58,9 @@ Found on the console; each is in the code where it applies.
 - **The launch picture.** Until the first frame, a framebuffer on the default window shows `sdmc:/wow-nx/loading.rgba`
   (or black, not the HOME menu's white); the backend takes the window over when it makes its swapchain and keeps the
   picture up while the first frames' pipelines build.
+- **One frame in flight.** Presenting a frame waits for the one before it to finish on the GPU. Without that the CPU
+  ran frames ahead into the swapchain's three images and the queue's command memory, so where the GPU is the limit
+  (the character screen) an input showed several frames late and the motion stuttered.
 - **Timing.** Each pass is timed by GPU timestamps into a report ring; the log prints the passes (and, with
   `WOWNX_GPU_PIPELINES=1`, the pipelines) every 300 frames. `WOWNX_DEKO3D_DEBUG=1` builds against deko3d's debug
   library and names the passes in a submission that faults.

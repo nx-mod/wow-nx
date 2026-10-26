@@ -964,11 +964,6 @@ pub(crate) struct HostedVm<'w, 's> {
 }
 
 impl HostedVm<'_, '_> {
-    /// wow-nx: whether a host is there to lend (a world without the appliers' state has none).
-    pub(crate) fn has_host(&self) -> bool {
-        self.host.is_some()
-    }
-
     /// Run `f` on the VM with the host lent around all of it ([`hosted`]); `f` gets `None` with
     /// no VM.
     pub(crate) fn run<R>(&mut self, f: impl FnOnce(Option<&mut UiScript>) -> R) -> R {
