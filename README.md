@@ -13,8 +13,8 @@ through [benilla-pad](https://github.com/lucasvallejodev/benilla-gamepad).
 ## Status
 
 In progress, and playable: it logs in to a 1.12.1 server, enters the world, and you can fight, loot, cast and quest
-with the Joy-Con, touch, or a USB keyboard and mouse. Tested on Kronos (TwinStar) with a new night elf druid, from
-level 1 in Teldrassil.
+with the Joy-Con, touch, or a USB keyboard and mouse. Tested on Kronos (TwinStar) with a night elf druid, levels
+1–4, in Teldrassil.
 
 Known issues, being worked on ([docs/SWITCH.md](docs/SWITCH.md) has the details):
 
