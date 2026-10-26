@@ -267,7 +267,7 @@ mod input {
     use bevy::input::mouse::{MouseButton, MouseButtonInput, MouseMotion, MouseScrollUnit, MouseWheel};
     use bevy::input::ButtonState;
     use bevy::prelude::*;
-    use bevy::window::{CursorMoved, PrimaryWindow};
+    use bevy::window::{CursorMoved, PrimaryWindow, WindowEvent};
 
     #[repr(C)]
     #[derive(Default, Clone, Copy)]
@@ -436,6 +436,9 @@ mod input {
         mut motion: MessageWriter<MouseMotion>,
         mut wheel: MessageWriter<MouseWheel>,
         mut moved: MessageWriter<CursorMoved>,
+        // Each event again, in order, as winit's window stream carries it: the UI reads its clicks and keys from that
+        // stream (`ui_script::records`), the typed messages feed bevy's button planes.
+        mut stream: MessageWriter<WindowEvent>,
     ) {
         let Ok((window, mut win)) = windows.single_mut() else { return };
         let hid = &mut *hid;
@@ -447,14 +450,16 @@ mod input {
         let start = hid.cursor;
         let mut key = |code: KeyCode, pressed: bool, shift: bool| {
             let (logical, text) = logical(code, shift);
-            keys.write(KeyboardInput {
+            let ev = KeyboardInput {
                 key_code: code,
                 logical_key: logical,
                 state: if pressed { ButtonState::Pressed } else { ButtonState::Released },
                 text: if pressed { text.map(Into::into) } else { None },
                 repeat: false,
                 window,
-            });
+            };
+            keys.write(ev.clone());
+            stream.write(WindowEvent::KeyboardInput(ev));
         };
 
         // USB keyboard: HID usages, one bit each.
@@ -518,7 +523,9 @@ mod input {
         let mut m = MouseState::default();
         if unsafe { hidGetMouseStates(&mut m, 1) } > 0 && m.sampling_number != 0 {
             if (m.delta_x, m.delta_y) != (0, 0) && (m.x, m.y) != hid.last_mouse {
-                motion.write(MouseMotion { delta: Vec2::new(m.delta_x as f32, m.delta_y as f32) });
+                let ev = MouseMotion { delta: Vec2::new(m.delta_x as f32, m.delta_y as f32) };
+                motion.write(ev);
+                stream.write(WindowEvent::MouseMotion(ev));
                 hid.cursor = (hid.cursor + Vec2::new(m.delta_x as f32, m.delta_y as f32)).clamp(Vec2::ZERO, size);
             }
             hid.last_mouse = (m.x, m.y);
@@ -526,17 +533,16 @@ mod input {
                 if (m.buttons ^ hid.mouse_buttons) & bit != 0 {
                     let state = if m.buttons & bit != 0 { ButtonState::Pressed } else { ButtonState::Released };
                     hid.tapped |= bit == 1 && state == ButtonState::Pressed;
-                    buttons.write(MouseButtonInput { button, state, window });
+                    let ev = MouseButtonInput { button, state, window };
+                    buttons.write(ev);
+                    stream.write(WindowEvent::MouseButtonInput(ev));
                 }
             }
             hid.mouse_buttons = m.buttons;
             if m.wheel_delta_y != 0 {
-                wheel.write(MouseWheel {
-                    unit: MouseScrollUnit::Line,
-                    x: 0.0,
-                    y: m.wheel_delta_y as f32 / 120.0,
-                    window,
-                });
+                let ev = MouseWheel { unit: MouseScrollUnit::Line, x: 0.0, y: m.wheel_delta_y as f32 / 120.0, window };
+                wheel.write(ev);
+                stream.write(WindowEvent::MouseWheel(ev));
             }
         }
 
@@ -552,10 +558,14 @@ mod input {
                 // The press lands where the finger is: move first, then press.
                 if touching {
                     win.set_cursor_position(Some(hid.cursor));
-                    moved.write(CursorMoved { window, position: hid.cursor, delta: Some(hid.cursor - start) });
+                    let ev = CursorMoved { window, position: hid.cursor, delta: Some(hid.cursor - start) };
+                    moved.write(ev.clone());
+                    stream.write(WindowEvent::CursorMoved(ev));
                 }
                 let state = if touching { ButtonState::Pressed } else { ButtonState::Released };
-                buttons.write(MouseButtonInput { button: MouseButton::Left, state, window });
+                let ev = MouseButtonInput { button: MouseButton::Left, state, window };
+                buttons.write(ev);
+                stream.write(WindowEvent::MouseButtonInput(ev));
                 hid.touching = touching;
                 hid.tapped |= touching;
             }
@@ -563,7 +573,9 @@ mod input {
 
         if hid.cursor != start || win.cursor_position().is_none() {
             win.set_cursor_position(Some(hid.cursor));
-            moved.write(CursorMoved { window, position: hid.cursor, delta: Some(hid.cursor - start) });
+            let ev = CursorMoved { window, position: hid.cursor, delta: Some(hid.cursor - start) };
+            moved.write(ev.clone());
+            stream.write(WindowEvent::CursorMoved(ev));
         }
     }
 

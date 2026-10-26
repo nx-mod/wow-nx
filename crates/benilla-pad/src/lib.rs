@@ -24,11 +24,11 @@ pub mod interact;
 pub mod map;
 
 use bevy::input::keyboard::{Key, KeyboardInput};
-use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll, MouseScrollUnit};
+use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll, MouseButtonInput, MouseScrollUnit};
 use bevy::input::ButtonState;
 use bevy::input::InputSystems;
 use bevy::prelude::*;
-use bevy::window::PrimaryWindow;
+use bevy::window::{PrimaryWindow, WindowEvent};
 
 use benilla_ui::script::{ScriptValue, UiScript};
 
@@ -45,7 +45,58 @@ impl Plugin for PadPlugin {
         app.insert_resource(PadSettings::from_env())
             .init_resource::<PadState>()
             .add_systems(Startup, addon::install_addon)
-            .add_systems(PreUpdate, (drive_pad, run_calls).chain().after(InputSystems));
+            .init_resource::<PlaneEdges>()
+            .add_systems(
+                PreUpdate,
+                (note_plane_edges, drive_pad, stream_pad_edges, run_calls)
+                    .chain()
+                    .after(InputSystems),
+            );
+    }
+}
+
+/// wow-nx: the button planes' edges before [`drive_pad`], to tell the pad's own presses from the devices'.
+#[derive(Resource, Default)]
+struct PlaneEdges {
+    mouse: Vec<(MouseButton, ButtonState)>,
+    keys: Vec<(KeyCode, ButtonState)>,
+}
+
+fn edges<T: Copy + Eq + std::hash::Hash + Send + Sync>(plane: &ButtonInput<T>) -> Vec<(T, ButtonState)> {
+    let down = plane.get_just_pressed().map(|&b| (b, ButtonState::Pressed));
+    down.chain(plane.get_just_released().map(|&b| (b, ButtonState::Released))).collect()
+}
+
+fn note_plane_edges(mouse: Res<ButtonInput<MouseButton>>, keys: Res<ButtonInput<KeyCode>>, mut before: ResMut<PlaneEdges>) {
+    before.mouse = edges(&mouse);
+    before.keys = edges(&keys);
+}
+
+/// wow-nx: the pad presses bevy's button planes, and since upstream 2026-10 the UI reads its clicks and keys from the
+/// window's event stream instead (`benilla_app::ui_script::records`), so a pad click highlighted and never clicked.
+/// The edges the pad made this frame go to the stream too, as winit would queue them.
+fn stream_pad_edges(
+    mouse: Res<ButtonInput<MouseButton>>,
+    keys: Res<ButtonInput<KeyCode>>,
+    before: Res<PlaneEdges>,
+    window: Query<Entity, With<PrimaryWindow>>,
+    mut stream: MessageWriter<WindowEvent>,
+) {
+    let Ok(window) = window.single() else {
+        return;
+    };
+    for (key_code, state) in edges(&keys).into_iter().filter(|e| !before.keys.contains(e)) {
+        stream.write(WindowEvent::KeyboardInput(KeyboardInput {
+            key_code,
+            logical_key: Key::Unidentified(bevy::input::keyboard::NativeKey::Unidentified),
+            state,
+            text: None,
+            repeat: false,
+            window,
+        }));
+    }
+    for (button, state) in edges(&mouse).into_iter().filter(|e| !before.mouse.contains(e)) {
+        stream.write(WindowEvent::MouseButtonInput(MouseButtonInput { button, state, window }));
     }
 }
 
