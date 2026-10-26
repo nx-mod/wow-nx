@@ -76,7 +76,7 @@ Needs devkitPro (devkitA64, libnx, switch-tools) and the Rust nightly in `switch
 sh switch/build-benilla.sh -j2        # target/wow-nx.nro
 ```
 
-Releases come from GitHub Actions (`.github/workflows/switch.yml`): pushing a tag `v<version>` builds the release
+Releases come from GitHub Actions (`.github/workflows/switch.yml`): pushing a tag `nx-v<version>` builds the release
 profile (`WOWNX_SHIP=1`: every dependency in one codegen unit) numbered with the run number and publishes it as
 `build-<n>` with the stored `wow-nx-switch.zip` the updater reads. `switch/release.sh` publishes a local build the
 same way. `WOWNX_DEKO3D_DEBUG=1` links deko3d's debug library and names the work in a
