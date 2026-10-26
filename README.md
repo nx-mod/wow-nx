@@ -4,7 +4,7 @@
 the Nintendo Switch. It draws through wgpu on a deko3d backend, the Switch's native GPU API, and plays with the Joy-Con
 through [benilla-pad](https://github.com/lucasvallejodev/benilla-gamepad).
 
-<!-- screenshot: docs/images/switch.jpg -->
+![wow-nx on the Switch: a night elf druid in Shadowglen, Teldrassil, on Kronos, with benilla-pad's gamepad bar](docs/images/switch.jpg)
 
 > [!NOTE]
 > You need your own 1.12.1 client (build 5875) for the game data, and a 1.12.1 server to play on. This repository
