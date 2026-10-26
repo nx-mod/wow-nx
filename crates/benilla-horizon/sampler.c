@@ -168,5 +168,11 @@ void wownx_sampler_start(void) {
     // The main thread is thread 0; thread.c adds the rest as they start.
     wownx_sampler_thread(envGetMainThreadHandle());
     static Thread thread;
-    if (R_SUCCEEDED(threadCreate(&thread, sample, NULL, NULL, 64 * 1024, 0x2B, -2))) threadStart(&thread);
+    // On the last core of the process's, below the main thread's priority: on core 0 above it (as first written), its
+    // stack walks and its dumps took a slice of the main thread's core, and the game answered input late.
+    u64 mask = 0;
+    int core = 2;
+    if (R_SUCCEEDED(svcGetInfo(&mask, InfoType_CoreMask, CUR_PROCESS_HANDLE, 0)) && mask)
+        core = 63 - __builtin_clzll(mask);
+    if (R_SUCCEEDED(threadCreate(&thread, sample, NULL, NULL, 64 * 1024, 0x2D, core))) threadStart(&thread);
 }
