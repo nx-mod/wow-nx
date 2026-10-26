@@ -3,7 +3,9 @@
 // lets it go; every 30 seconds the window's counts go to sdmc:/wow-nx/samples.txt, as offsets into the program, which
 // switch/profile.py names from the ELF. A thread waiting shows as the wait it is in; one waiting for a held lock
 // (svcArbitrateLock, from libnx's mutexLock) also counts the lock's address and up to three return addresses from
-// mutexLock's frame record up, which say whose lock it is.
+// mutexLock's frame record up, which say whose lock it is. Every sample also walks the thread's frame records (the
+// build keeps frame pointers) and counts each return address on its stack once: a function's inclusive time, what a
+// system costs with everything it calls.
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,7 +16,7 @@
 enum {
     MAX_THREADS = 64,
     // (thread, address, PC or LR) counts: open addressing, a power of two.
-    SLOTS = 1 << 16,
+    SLOTS = 1 << 18,
     PERIOD_NS = 4000000,
     WINDOW_NS = 30000000000ULL,
 };
@@ -38,8 +40,8 @@ void wownx_sampler_thread(Handle handle) {
 }
 
 // What a count is of: where the thread is, its caller, a lock waiter's lock and the return addresses above it.
-enum { KIND_PC, KIND_LR, KIND_LOCK, KIND_CALLER1, KIND_CALLER2, KIND_CALLER3 };
-static const char KIND_LETTER[] = "PLM123";
+enum { KIND_PC, KIND_LR, KIND_LOCK, KIND_CALLER1, KIND_CALLER2, KIND_CALLER3, KIND_STACK };
+static const char KIND_LETTER[] = "PLM123S";
 
 // The key: thread in the top 7 bits, the kind in the next 3, the address's offset into the program below (a lock on
 // the heap, below the program, keeps its address).
@@ -101,6 +103,31 @@ static void waiter(int thread, const ThreadContext *context) {
     }
 }
 
+enum { STACK_DEPTH = 32 };
+
+// The thread's call stack from its frame records, each return address counted once per sample.
+static void stack(int thread, const ThreadContext *context) {
+    MemoryInfo region;
+    u32 page;
+    if (R_FAILED(svcQueryMemory(&region, &page, context->sp))) return;
+    u64 seen[STACK_DEPTH];
+    int n = 0;
+    u64 frame = context->fp;
+    for (int depth = 0; depth < STACK_DEPTH; depth++) {
+        if (frame < region.addr || frame + 16 > region.addr + region.size || (frame & 7)) break;
+        const u64 *record = (const u64 *)frame;
+        u64 ret = record[1];
+        int again = 0;
+        for (int i = 0; i < n; i++) again |= seen[i] == ret;
+        if (!again && ret) {
+            seen[n++] = ret;
+            count(thread, KIND_STACK, ret);
+        }
+        if (record[0] <= frame) break;
+        frame = record[0];
+    }
+}
+
 static void sample(void *unused) {
     (void)unused;
     u64 window_start = armGetSystemTick();
@@ -119,6 +146,7 @@ static void sample(void *unused) {
             count(t, KIND_PC, context.pc.x);
             count(t, KIND_LR, context.lr);
             if (context.pc.x >= arbitrate_lock && context.pc.x < arbitrate_lock + 16) waiter(t, &context);
+            stack(t, &context);
         }
         if (armTicksToNs(armGetSystemTick() - window_start) >= WINDOW_NS) {
             dump(++window);

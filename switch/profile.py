@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Names the profiler's samples (crates/benilla-horizon/sampler.c, WOWNX_PROFILE=1): per thread, the functions its
 PCs were in and the callers its LRs were in, most samples first, from the ELF's symbols; and for a thread waiting on a
-held lock, which lock (a data symbol, or a heap address) and the return addresses above libnx's mutexLock.
+held lock, which lock (a data symbol, or a heap address) and the return addresses above libnx's mutexLock; and the
+inclusive time per function from the stack walks (what a function costs with everything it calls), `--stack` to
+print it.
 
 Usage: switch/profile.py samples.txt [benilla.elf] [--top N]
 """
@@ -73,6 +75,10 @@ def main():
         print("  -- callers (LR)")
         for fn, n in counts[(thread, "L")].most_common(top // 2):
             print(f"  {100 * n / total:5.1f}%  {fn[:150]}")
+        if "--stack" in sys.argv and counts[(thread, "S")]:
+            print("  -- inclusive (on the stack)")
+            for fn, n in counts[(thread, "S")].most_common(top * 2):
+                print(f"  {100 * n / total:5.1f}%  {fn[:150]}")
         if counts[(thread, "M")]:
             print("  -- waiting on a held lock: the lock")
             for lock, n in counts[(thread, "M")].most_common(8):
