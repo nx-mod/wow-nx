@@ -3,10 +3,11 @@
 //! (`0x4de510`) makes of them, and the verbs the stock `QuestLogFrame.lua` calls. A verb reads
 //! what it needs at the call, as the reference's do: a row's title off its quest's record, its
 //! state and counters off its slot, an objective's name off the creature or item cache and its
-//! count off the bags. A record a verb misses is asked for with a callback that fires
-//! `QUEST_LOG_UPDATE` when it lands (`0x4e07d0`, `0x4e0830`); the reference holds one per call that
-//! missed (`0x4e05c9`, `0x4e0b9c`; `0x55bbb3`), benilla one per record
-//! ([`super::UiScript::flush_quest_log_refires`]).
+//! count off the bags, a GameObject's off the object cache. A record a verb misses is asked for
+//! with a callback that fires `QUEST_LOG_UPDATE` when it lands (`0x4e07d0`, `0x4e0830`, and
+//! `0x4e0800` for an object); the reference holds one per call that missed (`0x4e05c9`,
+//! `0x4e0b9c`; `0x55bbb3`), benilla one per record
+//! ([`super::UiScript::flush_quest_log_refires`], and the object cache's waits for an object).
 //!
 //! `QUEST_LOG_UPDATE` fires where the reference fires it: at the rebuild's tail (`0x4de811`), which
 //! the quest log's field watcher (`0x4de4d0`), the world entry (`0x4de430`) and the landing of the
@@ -28,8 +29,6 @@
 //! so a re-index before the popup's Yes cannot retarget them.
 //!
 //! `IsUnitOnQuest` reads a unit's quest-log window off its snapshot ([`super::UnitState`]).
-//!
-//! Not built: a GameObject objective's name, which wears the placeholder.
 
 use std::collections::{HashMap, HashSet};
 
@@ -122,13 +121,31 @@ pub struct QuestRecordView {
     pub reward_money: u32,
     /// The template's money at the top level (`+0x2c`), in copper.
     pub reward_money_max_level: i32,
-    /// `(item id, count)`, the ids that are set, in order (`+0x3c`, `+0x4c`).
+    /// `(item id, count)` per slot as the template stores them, 0 for an unset id (`+0x3c` x 4,
+    /// `+0x5c` x 6): the counts stop at the first unset one and the getters index the slots.
     pub rewards: Vec<(u32, u32)>,
     pub choices: Vec<(u32, u32)>,
-    /// `GetQuestLogQuestText`'s two returns, the macros expanded.
+    /// `GetQuestLogQuestText`'s two returns as the wire sent them, their `$` macros expanded at
+    /// the call ([`super::QuestText`]).
     pub description: String,
     pub objectives_text: String,
     pub reward_spell: Option<QuestRewardSpell>,
+    /// The quest's map point, the template's `PointX`, `PointY` (`+0x90`, `+0x94`) and `PointOpt`
+    /// (`+0x98`), which the selected quest's minimap arrow takes ([`QuestBlip`]).
+    pub point: (f32, f32),
+    pub point_opt: u32,
+}
+
+/// The selected quest's static minimap blip, slot 0 (`0x6dacb0`: icon 5, no flags): the record's
+/// point, its `PointOpt` as the rank and its title as the name, set by `SelectQuestLogEntry` and
+/// by the selected record's arrival (`0x4def70`), cleared when the quest leaves the log
+/// (`0x4df0e0`). The point (0, 0) hides it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct QuestBlip {
+    pub x: f32,
+    pub y: f32,
+    pub rank: u32,
+    pub name: String,
 }
 
 /// One row of the display list `0xbb71c0`: a header, or a quest and its slot (`+0x4`).
@@ -172,28 +189,33 @@ pub(crate) struct QuestLogStore {
     pending: u32,
     /// The rebuild's callbacks (`0x4de8b0`) per awaited quest, one per rebuild that missed it.
     record_waits: HashMap<u32, u32>,
-    /// The quests the rebuild missed, for the app to ask.
+    /// The quests the rebuild missed, asked inside the call that ran it ([`ask_owed`]), or held
+    /// for a harness with no host to take.
     record_asks: Vec<u32>,
-    /// The item and creature records a verb missed and that have not landed.
+    /// The item records a verb missed and that have not landed.
     item_waits: HashSet<u32>,
-    creature_waits: HashSet<u32>,
     /// The item and creature lookups the verb being called missed, which it asks inside its call
     /// once its read of the model ends ([`ask_lookups`]).
     item_asks: Vec<u32>,
     creature_asks: Vec<u32>,
-    /// The creature cache (`0xc0e354`) as far as the leaderboard asked it.
-    creature_names: HashMap<u32, String>,
+    /// The GameObject templates the leaderboard missed, asked inside its call.
+    object_asks: Vec<u32>,
+    /// The creature names a harness with no host seats: the leaderboard reads the creature cache
+    /// through the host (`0xc0e354`, [`quest_live::creature_name`]), which keeps the waits.
+    pub(super) creature_names: HashMap<u32, String>,
     /// The held count of each item a log quest needs (`0x622130(inventory, item, 8)`).
     pub(super) held: HashMap<u32, u32>,
-    /// Missed records that landed, each one `QUEST_LOG_UPDATE` at the next flush.
+    /// Missed item records that landed, each one `QUEST_LOG_UPDATE` at the next flush.
     due: u32,
-    /// Whether the active player is in the world: without one the rebuild returns before its
-    /// signal (`0x4de568`-`0x4de572`).
-    player: bool,
+    /// Whether the active player is in the world, as a harness with no host seats it: without
+    /// one the rebuild returns before its signal (`0x4de568`-`0x4de572`). The host answers it
+    /// ([`quest_live::player`]).
+    pub(super) player: bool,
     /// The quests whose row holds the expiry latch (`[row+0xc]`, `0x4df50d`), cleared with the
     /// rows by every rebuild (`0x4de5e2`).
     latched: HashSet<u32>,
-    /// The quest-giver refreshes (`0x5eb070`) the latch asked for since the app last drained.
+    /// The quest-giver refreshes (`0x5eb070`) the latch owes, asked inside the call that latched
+    /// ([`ask_owed`]) or taken by the handler that latched with no host lent.
     giver_refreshes: u32,
 }
 
@@ -221,7 +243,7 @@ fn rebuild(lua: &Lua, model: &mut Model) -> bool {
     // The slots as the descriptor holds them here (`0x4de63c`), where the list is built; kept
     // whether it builds or waits on a record, for the readers of the copy.
     model.quest_store.slots = quest_live::slots(lua, model);
-    if model.quest_store.pending != 0 || !model.quest_store.player {
+    if model.quest_store.pending != 0 || !quest_live::player(lua, model) {
         return false;
     }
     // The selection is a quest id (`0xbb7480`) no rebuild writes.
@@ -338,9 +360,10 @@ fn latch_expiry(lua: &Lua, model: &mut Model, quest_id: u32, slot: u8) -> bool {
         owe_turn_in_tutorial(model);
         return false;
     }
+    let player = quest_live::player(lua, model);
     let store = &mut model.quest_store;
     store.latched.insert(quest_id);
-    if store.player {
+    if player {
         store.giver_refreshes += 1;
     }
     true
@@ -395,6 +418,7 @@ fn sort_rows(model: &mut Model, selected: Option<u32>) {
         quest_log_collapsed: collapsed,
         quest_store,
         quest_log_selection,
+        quest_blip,
         ..
     } = model;
     let records = &quest_store.records;
@@ -465,6 +489,10 @@ fn sort_rows(model: &mut Model, selected: Option<u32>) {
                 .position(|e| !e.is_header && e.quest_id == id)
         })
         .map_or(0, |i| i as u32 + 1);
+    // The selected quest left the log: its blip goes (`0x4df0e0`, on the selected id).
+    if selected.is_some() && *quest_log_selection == 0 {
+        *quest_blip = None;
+    }
 }
 
 /// Tutorial 0x21, "Quest Completion": a turn-in test that passes triggers it (`0x4df78d`-`0x4df792`
@@ -490,7 +518,7 @@ fn turn_in_passes(
     record: &QuestRecordView,
     slot: &QuestSlotView,
 ) -> bool {
-    if !model.quest_store.player || slot.state & SLOT_FAILED != 0 {
+    if !quest_live::player(lua, model) || slot.state & SLOT_FAILED != 0 {
         return false;
     }
     let any_objective = record
@@ -581,6 +609,28 @@ impl Model {
             .map(|(record, _)| record)
     }
 
+    /// The selected quest's id (`0xbb7480`): the row the selection names.
+    fn selected_quest_id(&self) -> Option<u32> {
+        self.quest_row(self.quest_log_selection as usize)
+            .filter(|r| !r.is_header)
+            .map(|r| r.quest_id)
+    }
+
+    /// `0x4def70`: with the selected quest's record held, static blip 0 is set at its point
+    /// (`0x4defb9`-`0x4defd3`); with none the callback `0x4defe0` runs it again when the record
+    /// lands, and the blip stays as it was.
+    fn set_quest_blip(&mut self) {
+        let Some(record) = self.selected_quest_record() else {
+            return;
+        };
+        self.quest_blip = Some(QuestBlip {
+            x: record.point.0,
+            y: record.point.1,
+            rank: record.point_opt,
+            name: record.title.clone(),
+        });
+    }
+
     /// An item's record with a callback (`0x55ba30` with `0x4e0830`): the name, quality and icon,
     /// or, on a miss, the ask and the record held as awaited.
     fn quest_item_lookup(&mut self, item_id: u32) -> Option<(String, u32, Option<String>)> {
@@ -599,33 +649,44 @@ impl Model {
             }
         }
     }
+}
 
-    /// A creature's name with the callback `0x4e07d0` (`0x4e0461`), or on a miss the ask, once,
-    /// and the entry held as awaited.
-    fn quest_creature_lookup(&mut self, entry: u32) -> Option<String> {
-        let store = &mut self.quest_store;
-        match store.creature_names.get(&entry) {
-            Some(name) => Some(name.clone()),
-            None => {
-                if store.creature_waits.insert(entry) {
-                    store.creature_asks.push(entry);
-                }
-                None
-            }
-        }
+/// What a rebuild or a latch owes the host, asked inside the call that ran it with the host lent:
+/// each quest record the rebuild missed, with the callback `0x4de8b0` (`0x4de65f`), and each
+/// latch's quest-giver refresh (`0x4df531`). With no host lent they wait in the model, for a
+/// harness or the handler that latched to take.
+fn ask_owed(lua: &Lua) {
+    if !super::host::open(lua) {
+        return;
+    }
+    let (records, refreshes) = {
+        let mut model = lua.app_data_mut::<Model>().expect("model app_data");
+        let store = &mut model.quest_store;
+        (
+            std::mem::take(&mut store.record_asks),
+            std::mem::take(&mut store.giver_refreshes),
+        )
+    };
+    // A getter's lookup never raises ([`super::calls::ask`]).
+    for quest_id in records {
+        let _ = super::calls::ask(lua, super::RecordAsk::QuestRecord(quest_id));
+    }
+    for _ in 0..refreshes {
+        let _ = super::calls::ask(lua, super::RecordAsk::QuestGiverStatuses);
     }
 }
 
 /// The lookups the verb's read missed, asked inside its call: each item with the callback
-/// `0x4e0830` (`0x4e05d1`, `0x4e0b9e`), each creature with `0x4e07d0` (`0x4e044c`), whose waits
-/// the VM keeps.
+/// `0x4e0830` (`0x4e05d1`, `0x4e0b9e`), whose waits the VM keeps, and each creature with
+/// `0x4e07d0` (`0x4e044c`) and object with `0x4e0800`, whose waits the host keeps.
 fn ask_lookups(lua: &Lua) -> mlua::Result<()> {
-    let (items, creatures) = {
+    let (items, creatures, objects) = {
         let mut model = lua.app_data_mut::<Model>().expect("model app_data");
         let store = &mut model.quest_store;
         (
             std::mem::take(&mut store.item_asks),
             std::mem::take(&mut store.creature_asks),
+            std::mem::take(&mut store.object_asks),
         )
     };
     for entry in items {
@@ -641,6 +702,9 @@ fn ask_lookups(lua: &Lua) -> mlua::Result<()> {
     }
     for entry in creatures {
         super::calls::ask(lua, super::RecordAsk::QuestCreature(entry))?;
+    }
+    for entry in objects {
+        super::calls::ask(lua, super::RecordAsk::QuestObject(entry))?;
     }
     Ok(())
 }
@@ -775,8 +839,9 @@ fn line_parts(lua: &Lua, model: &mut Model, index: usize, line: usize) -> Option
                 let name = record.rep_faction_name.clone()?;
                 // `0x4d6370`, as the turn-in test reads it: 0 for a faction with no reputation index.
                 let standing = quest_live::standing(lua, model, faction);
-                // `0x612bf0` on the active player: its gender 1 takes the `_FEMALE` text.
-                let female = model.snapshot_unit("player").is_some_and(|u| u.sex == 3);
+                // `0x612bf0` on the active player as the call runs: its gender 1 takes the
+                // `_FEMALE` text.
+                let female = super::unit::view(lua, model, "player").is_some_and(|u| u.sex == 3);
                 return Some(LineParts {
                     text: LineText::Faction {
                         name,
@@ -815,17 +880,31 @@ fn line_parts(lua: &Lua, model: &mut Model, index: usize, line: usize) -> Option
             ));
         }
         if is_go {
+            // The object cache by the id less its top bit, looked up with a callback
+            // (`0x4e0390`-`0x4e039c`); a miss wears the placeholder until it lands.
+            let entry = o.creature_or_go & !GO_OBJECTIVE_BIT;
+            let name = quest_live::object_name(lua, entry).unwrap_or_else(|| {
+                model.quest_store.object_asks.push(entry);
+                NAME_PLACEHOLDER.into()
+            });
             return Some(LineParts::count(
                 "QUEST_OBJECTS_FOUND",
-                NAME_PLACEHOLDER.into(),
+                name,
                 cur,
                 req,
                 kind,
             ));
         }
-        let name = model
-            .quest_creature_lookup(o.creature_or_go)
-            .unwrap_or_else(|| NAME_PLACEHOLDER.into());
+        // The creature cache with the callback `0x4e07d0` (`0x4e0461`), read through the host; a
+        // miss asks inside the call, once per entry, and wears the placeholder until it lands.
+        let entry = o.creature_or_go;
+        let name = quest_live::creature_name(lua, model, entry).unwrap_or_else(|| {
+            let asks = &mut model.quest_store.creature_asks;
+            if !asks.contains(&entry) {
+                asks.push(entry);
+            }
+            NAME_PLACEHOLDER.into()
+        });
         Some(LineParts::count(
             "QUEST_MONSTERS_KILLED",
             name,
@@ -849,6 +928,11 @@ fn line_parts(lua: &Lua, model: &mut Model, index: usize, line: usize) -> Option
     }
 }
 
+/// The reward or choice slots up to the first unset id, the count the log's getters make.
+fn count_to_first_unset(slots: &[(u32, u32)]) -> i64 {
+    slots.iter().take_while(|&&(id, _)| id != 0).count() as i64
+}
+
 /// One reward or choice of the selected quest as a [`QuestItemView`], the item record read
 /// without a callback; `None` past the list or with no selection.
 pub(crate) fn selected_quest_item(
@@ -857,12 +941,18 @@ pub(crate) fn selected_quest_item(
     index: usize,
 ) -> Option<QuestItemView> {
     let record = model.selected_quest_record()?;
-    let list = match kind {
-        "choice" => &record.choices,
-        "reward" => &record.rewards,
-        _ => return None,
+    // Matched in any case (`SStrCmpI`, `0x4e0f9b`, `0x4e0fc0`).
+    let list = if kind.eq_ignore_ascii_case("choice") {
+        &record.choices
+    } else if kind.eq_ignore_ascii_case("reward") {
+        &record.rewards
+    } else {
+        return None;
     };
-    let &(item_id, count) = list.get(index.checked_sub(1)?)?;
+    // An unset slot holds no item.
+    let &(item_id, count) = list
+        .get(index.checked_sub(1)?)
+        .filter(|&&(id, _)| id != 0)?;
     let template = model.item_templates.get(&item_id);
     Some(QuestItemView {
         name: template.map(|t| t.name.clone()),
@@ -944,23 +1034,28 @@ impl super::UiScript {
         else {
             return false;
         };
-        if is_header {
+        let latched = if is_header {
             // `0x4df50d`, then the givers' refresh with a player (`0x4df531`).
-            let store = &mut model.quest_store;
-            if store.player {
-                store.giver_refreshes += 1;
+            if quest_live::player(&self.lua, &model) {
+                model.quest_store.giver_refreshes += 1;
             }
-            return true;
-        }
-        latch_expiry(&self.lua, &mut model, quest_id, slot)
+            true
+        } else {
+            latch_expiry(&self.lua, &mut model, quest_id, slot)
+        };
+        drop(model);
+        ask_owed(&self.lua);
+        latched
     }
 
-    /// The quest-giver refreshes the latch asked for (`0x4df531`) since the last drain.
+    /// The quest-giver refreshes a latch run with no host lent owed (`0x4df531`), for the caller
+    /// to send.
     pub fn take_quest_giver_refreshes(&mut self) -> u32 {
         std::mem::take(&mut self.model_mut().quest_store.giver_refreshes)
     }
 
-    /// Whether the active player is in the world, which the rebuild needs (`0x4de568`).
+    /// Whether the active player is in the world, which the rebuild needs (`0x4de568`), for a
+    /// harness with no host to answer it ([`super::QuestPlayer`]).
     pub fn set_quest_log_player(&mut self, present: bool) {
         self.model_mut().quest_store.player = present;
     }
@@ -982,6 +1077,7 @@ impl super::UiScript {
     /// rebuild and its `QUEST_LOG_UPDATE`.
     pub fn quest_log_changed(&mut self) {
         let ran = rebuild(&self.lua, &mut self.model_mut());
+        ask_owed(&self.lua);
         if ran {
             self.fire_event("QUEST_LOG_UPDATE", Vec::new());
         }
@@ -1003,6 +1099,7 @@ impl super::UiScript {
             model.quest_store.pending = 0;
             rebuild(&self.lua, &mut model)
         };
+        ask_owed(&self.lua);
         if ran {
             self.fire_event("QUEST_LOG_UPDATE", Vec::new());
         }
@@ -1017,9 +1114,18 @@ impl super::UiScript {
             let store = &mut model.quest_store;
             let ids: Vec<u32> = records.iter().map(|&(id, _)| id).collect();
             store.records.extend(records);
-            ids.into_iter()
-                .map(|id| store.record_waits.remove(&id).unwrap_or(0))
-                .collect()
+            let waits: Vec<u32> = ids
+                .iter()
+                .map(|id| store.record_waits.remove(id).unwrap_or(0))
+                .collect();
+            // The selected quest's record arriving is the blip's callback (`0x4defe0`).
+            if model
+                .selected_quest_id()
+                .is_some_and(|id| ids.contains(&id))
+            {
+                model.set_quest_blip();
+            }
+            waits
         };
         for _ in 0..waits.into_iter().sum::<u32>() {
             let ran = {
@@ -1028,14 +1134,14 @@ impl super::UiScript {
                 store.pending = store.pending.saturating_sub(1);
                 store.pending == 0 && rebuild(&self.lua, &mut model)
             };
+            ask_owed(&self.lua);
             if ran {
                 self.fire_event("QUEST_LOG_UPDATE", Vec::new());
             }
         }
     }
 
-    /// A record held again with nothing waiting on it: a new VM's seat, or text whose macros
-    /// changed.
+    /// A record held with nothing waiting on it: a new VM's seat, before its load runs any file.
     pub fn seed_quest_record(&mut self, quest_id: u32, record: QuestRecordView) {
         self.model_mut()
             .quest_store
@@ -1052,7 +1158,7 @@ impl super::UiScript {
         model.quest_store.record_waits.remove(&quest_id);
     }
 
-    /// The quests the rebuild missed since the last drain: the app asks each.
+    /// The quests a rebuild run with no host lent missed, for a harness to ask.
     pub fn take_quest_record_asks(&mut self) -> Vec<u32> {
         std::mem::take(&mut self.model_mut().quest_store.record_asks)
     }
@@ -1093,37 +1199,20 @@ impl super::UiScript {
         })
     }
 
-    /// The creature entries the leaderboard waits on, which the app ends with a refusal
-    /// ([`Self::refuse_quest_creature`]).
-    pub fn quest_creature_waits(&self) -> Vec<u32> {
-        self.model_ref()
-            .quest_store
-            .creature_waits
-            .iter()
-            .copied()
-            .collect()
-    }
-
-    /// A creature's name landed: held, and each callback the leaderboard left on it is due
-    /// (`0x4e07d0` signals `QUEST_LOG_UPDATE` on a ready record, `0x4e07ea`).
+    /// A creature's name, for a harness with no host to read the creature cache through.
     pub fn set_quest_creature_name(&mut self, entry: u32, name: String) {
-        let mut model = self.model_mut();
-        let store = &mut model.quest_store;
-        store.creature_names.insert(entry, name);
-        store.due += u32::from(store.creature_waits.remove(&entry));
+        self.model_mut()
+            .quest_store
+            .creature_names
+            .insert(entry, name);
     }
 
-    /// The server refused a creature: its callbacks run with status 0 and only log (`0x4e07dc`).
-    pub fn refuse_quest_creature(&mut self, entry: u32) {
-        self.model_mut().quest_store.creature_waits.remove(&entry);
-    }
-
-    /// Fire one `QUEST_LOG_UPDATE` for each missed record that landed, after the frame's landings,
-    /// so a handler that walks the log reads every one of them.
+    /// Fire one `QUEST_LOG_UPDATE` for each missed item record that landed, after the push that
+    /// carried the frame's records, so a handler that walks the log reads every one of them.
     // Deviation: one signal per missed record, where the reference runs every callback of every
-    // miss as its record lands (creatures in `0x556e20` at `0x556f91`, items in `0x55bc70` via
-    // `0x55bdb0` from `0x555140`; `0x4e07ea`, `0x4e083a`), 2^k - 1 updates for a walking handler
-    // over k first-seen records.
+    // miss as its record lands (items at `0x55bea8` and `0x55bf39` in `0x55bdb0`, from
+    // `0x555140`; `0x4e083a`), 2^k - 1 updates for a walking handler over k first-seen records.
+    // The creatures' and the objects' callbacks are the host's, one per record too.
     pub fn flush_quest_log_refires(&mut self) {
         let due = std::mem::take(&mut self.model_mut().quest_store.due);
         for _ in 0..due {
@@ -1166,6 +1255,20 @@ impl super::UiScript {
             super::ScriptCall::Quest(super::QuestCall::Push(id)) => Some(*id),
             _ => None,
         })
+    }
+
+    /// The selected quest's blip for the minimap's rim arrow, nothing at the point (0, 0)
+    /// (`0x6dac10`'s hidden position).
+    pub fn quest_blip(&self) -> Option<QuestBlip> {
+        self.model_ref()
+            .quest_blip
+            .clone()
+            .filter(|b| (b.x, b.y) != (0.0, 0.0))
+    }
+
+    /// The static blips are cleared when the world is entered (`0x6d8f92`, `0x6d8fb0`).
+    pub fn clear_quest_blip(&mut self) {
+        self.model_mut().quest_blip = None;
     }
 
     /// Set the selection.
@@ -1256,7 +1359,7 @@ fn live_seconds_left(lua: &Lua, model: &Model, row: &QuestLogRow) -> Option<i64>
 fn abandon_items(lua: &Lua, model: &Model) -> Vec<String> {
     let store = &model.quest_store;
     let mark = model.quest_log_abandon_mark;
-    if !store.player {
+    if !quest_live::player(lua, model) {
         return Vec::new();
     }
     let Some(record) = (mark != 0).then(|| store.records.get(&mark)).flatten() else {
@@ -1398,8 +1501,15 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             // `is-number` else `Usage: SelectQuestLogEntry(index)` (`0x84b540`, `0x4dfb0e`).
             let i = binding_abi::index_arg32(lua, i, "Usage: SelectQuestLogEntry(index)")?;
             let mut model = lua.app_data_mut::<Model>().expect("model app_data");
+            // The old selection's blip goes first, ahead of the index test (`0x4def39` →
+            // `0x4df0e0`): a header, a bad index or a quest not yet cached leaves no arrow.
+            if model.selected_quest_id().is_some() {
+                model.quest_blip = None;
+            }
             if model.quest_row(i as usize).is_some_and(|r| !r.is_header) {
                 model.quest_log_selection = i;
+                // `0x4def63` stores the selection, then `0x4def70` sets the blip.
+                model.set_quest_blip();
             }
             Ok(())
         })?,
@@ -1417,14 +1527,19 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     g.set(
         "GetQuestLogQuestText",
         lua.create_function(|lua, ()| {
-            let model = lua.app_data_ref::<Model>().expect("model app_data");
-            // Two nils when the record is not held (`0x4dffdb`).
-            let Some(r) = model.selected_quest_record() else {
-                return Ok((Value::Nil, Value::Nil));
+            let (details, objectives) = {
+                let model = lua.app_data_ref::<Model>().expect("model app_data");
+                // Two nils when the record is not held (`0x4dffdb`).
+                let Some(r) = model.selected_quest_record() else {
+                    return Ok((Value::Nil, Value::Nil));
+                };
+                (r.description.clone(), r.objectives_text.clone())
             };
+            // Each expanded for the player at the call (`0x4dff89`, `0x4dffae`).
+            let (details, objectives) = quest_live::text(lua, &details, &objectives);
             Ok((
-                Value::String(lua.create_string(&r.description)?),
-                Value::String(lua.create_string(&r.objectives_text)?),
+                Value::String(lua.create_string(&details)?),
+                Value::String(lua.create_string(&objectives)?),
             ))
         })?,
     )?;
@@ -1495,7 +1610,11 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                 } => {
                     // `FACTION_STANDING_LABEL<rank + 1>` (`0x84b5dc`) through `0x612bf0`.
                     let label = |rank: u8| {
-                        crate::strings::standing_label(&|k| global(lua, k), rank.into(), *female)
+                        crate::strings::standing_label(
+                            crate::strings::Strings::Vm(lua),
+                            rank.into(),
+                            *female,
+                        )
                     };
                     fill(
                         &template("QUEST_FACTION_NEEDED"),
@@ -1531,11 +1650,15 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     }
     // The reference counts the reward ids to the first unset one (`0x4e0a34`-`0x4e0a40`), so
     // `[A, 0, B, 0]` counts 1, and `GetQuestLogRewardInfo` indexes the raw array (`0x4e0b98`);
-    // the record holds the set ids compacted.
+    // the choices count the same way (`0x4e0ac4`-`0x4e0ad0`).
     // Deviation: four set ids count 4, where the loop's exit `jmp 0x4e0a4c` (`0x4e0a42`) skips
     // the store at `0x4e0a49` and answers 0, a client bug.
-    install_detail_count(lua, "GetNumQuestLogRewards", |r| r.rewards.len() as i64)?;
-    install_detail_count(lua, "GetNumQuestLogChoices", |r| r.choices.len() as i64)?;
+    install_detail_count(lua, "GetNumQuestLogRewards", |r| {
+        count_to_first_unset(&r.rewards)
+    })?;
+    install_detail_count(lua, "GetNumQuestLogChoices", |r| {
+        count_to_first_unset(&r.choices)
+    })?;
     // `0x4e1070`: the base money when not negative (`0x4e10f7`), plus the top-level money
     // (`+0x2c`, `0x4e1102`) for a player of level 60 or more (`0x4e10b2`, signed), summed as a
     // signed dword (`fild` at `0x4e1108`).
@@ -1574,7 +1697,12 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                     let mut model = lua.app_data_mut::<Model>().expect("model app_data");
                     let pair = model.selected_quest_record().and_then(|r| {
                         let list = if choices { &r.choices } else { &r.rewards };
-                        usize::try_from(row).ok().and_then(|n| list.get(n)).copied()
+                        usize::try_from(row)
+                            .ok()
+                            .and_then(|n| list.get(n))
+                            .copied()
+                            // An unset slot holds no item.
+                            .filter(|&(id, _)| id != 0)
                     });
                     pair.and_then(|(id, count)| {
                         let (name, quality, icon) = model.quest_item_lookup(id)?;
@@ -1585,7 +1713,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                             .is_some_and(|t| t.inventory_type != 0);
                         let quality = if worn { quality as i32 } else { -1 };
                         // `isUsable` through the item-usable predicate (`0x4e0c83`, `0x4e0e73`).
-                        let usable = super::item_stats::item_usable_by_id(&model, id);
+                        let usable = super::item_stats::item_usable_by_id(lua, &model, id);
                         Some((name, quality, icon, count, usable))
                     })
                 };
@@ -1652,7 +1780,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                 .quest_row(model.quest_log_selection as usize)
                 .filter(|r| !r.is_header);
             Ok(flag(
-                model.quest_store.player
+                quest_live::player(lua, &model)
                     && (selected_slot(lua, &model)
                         .is_some_and(|slot| slot.state & SLOT_FAILED != 0)
                         || selected.is_some_and(|r| model.quest_store.is_latched(r.quest_id))),
@@ -1778,7 +1906,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         lua.create_function(|lua, ()| {
             let rows: Vec<(u32, u8)> = {
                 let model = lua.app_data_ref::<Model>().expect("model app_data");
-                if !model.quest_store.player {
+                if !quest_live::player(lua, &model) {
                     return Ok(MultiValue::new());
                 }
                 model
@@ -1816,6 +1944,8 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                         .get(&quest_id)
                         .map(|r| r.title.clone())
                 };
+                // The latch's quest-giver refresh, inside its call (`0x4df531`).
+                ask_owed(lua);
                 // The line is shown inside the walk, before the signal (`0x4e1529`, `0x4e1559`).
                 let template = lua
                     .globals()
@@ -1846,7 +1976,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             // Nil without a player (`0x4e165f`).
             let index = t
                 .checked_sub(1)
-                .filter(|_| model.quest_store.player)
+                .filter(|_| quest_live::player(lua, &model))
                 .and_then(|n| {
                     model
                         .quest_log
@@ -1874,7 +2004,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             let model = lua.app_data_ref::<Model>().expect("model app_data");
             let synced = quest_live::clock(lua, &model).server.is_some();
             let left = selected_slot(lua, &model)
-                .filter(|_| model.quest_store.player && synced)
+                .filter(|_| quest_live::player(lua, &model) && synced)
                 .and_then(|slot| seconds_left(&slot, countdown_now(lua, &model)));
             Ok(match left {
                 // Clamped where the lists drop the row, as in the reference.
@@ -1924,11 +2054,9 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             let Some(unit) = crate::script::unit::view(lua, &model, &token) else {
                 return Ok(Value::Nil);
             };
-            // The active player or one of the four party slots, by guid (`0x4e7f70`): a raid mate
-            // outside our subgroup, a pet or a stranger answers nil.
-            let me = crate::script::unit::view(lua, &model, "player").map_or(0, |p| p.guid);
-            let grouped = unit.guid != 0
-                && (unit.guid == me || model.party.members.iter().any(|m| m.guid == unit.guid));
+            // The active player or one of the four party slots, by guid, at the call (`0x4e7f70`):
+            // a raid mate outside our subgroup, a pet or a stranger answers nil.
+            let grouped = super::roster_read::membership(lua, &model.party, unit.guid).party;
             // Held as a player (`0x468460`, typemask `0x10`) and not deactivated (`0x614ea0`, a
             // state the app's despawn never leaves held), then the 20 slots' ids, stride 12
             // (`0x4dfebd`-`0x4dfed7`); a non-player's window is all zero.
@@ -1970,12 +2098,13 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     g.set(
         "QuestLogPushQuest",
         lua.create_function(|lua, ()| {
-            // The verb checks the party and the sharable bit itself (`0x4e13a6`), as a macro can
-            // call it solo; a header has no quest and sends nothing.
+            // The verb checks the sharable bit (`0x4e13a0`) and the first party slot's guid as
+            // it stands at the call (`0x4e13a6`-`0x4e13b2`) itself, as a macro can call it solo; a
+            // header has no quest and sends nothing.
             let id = {
                 let model = lua.app_data_ref::<Model>().expect("model app_data");
                 let index = model.quest_log_selection as usize;
-                (!model.party.members.is_empty())
+                (super::roster_read::cells(lua, &model.party).party[0] != 0)
                     .then(|| {
                         model
                             .quest_row_parts(index)
@@ -2317,6 +2446,62 @@ mod tests {
         );
     }
 
+    /// `SelectQuestLogEntry` sets the minimap's static blip 0 at the quest's point, ranked by its
+    /// `PointOpt` and named by its title (`0x4def63` → `0x4def70` → `0x6dacb0`); a quest with the
+    /// point (0, 0) hides it; the quest leaving the log clears it (`0x4df0e0`); a record landing
+    /// after the selection sets it from the callback (`0x4defe0`).
+    #[test]
+    fn the_selected_quests_point_is_the_static_minimap_blip() {
+        let mut s = UiScript::new().unwrap();
+        let (mut a, b) = (threat_within(), camp_cleanup());
+        a.point = (-8900.0, 600.0);
+        a.point_opt = 3;
+        seat(&mut s, &[(5, a, slot(5, 0, 0)), (6, b, slot(6, 0, 0))]);
+        assert_eq!(s.quest_blip(), None, "nothing selected");
+        // The header row selects nothing (`0x4def55`).
+        s.run("SelectQuestLogEntry(1)").unwrap();
+        assert_eq!(s.quest_blip(), None);
+        s.run("SelectQuestLogEntry(2)").unwrap();
+        let blip = s.quest_blip().expect("the quest's point");
+        assert_eq!(
+            (blip.x, blip.y, blip.rank, blip.name.as_str()),
+            (-8900.0, 600.0, 3, "A Threat Within")
+        );
+        s.run("SelectQuestLogEntry(3)").unwrap();
+        assert_eq!(s.quest_blip(), None, "the point (0, 0) is hidden");
+        s.run("SelectQuestLogEntry(2)").unwrap();
+        assert!(s.quest_blip().is_some());
+        // The old selection's blip goes before the new index is judged (`0x4def39`): a header
+        // click hides the arrow, and the selection stays.
+        s.run("SelectQuestLogEntry(1)").unwrap();
+        assert_eq!(s.quest_blip(), None);
+        assert_eq!(s.quest_log_selection(), 2);
+        s.run("SelectQuestLogEntry(2)").unwrap();
+        assert!(s.quest_blip().is_some());
+        s.clear_quest_blip();
+        assert_eq!(
+            s.quest_blip(),
+            None,
+            "a world entry zeroes the static records"
+        );
+
+        // A record that lands after the selection sets it from the callback (`0x4defe0`).
+        let mut late = threat_within();
+        late.point = (10.0, 20.0);
+        s.refuse_quest_record(5);
+        s.run("SelectQuestLogEntry(2)").unwrap();
+        assert_eq!(s.quest_blip(), None, "no record, no blip");
+        s.land_quest_records(vec![(5, late)]);
+        assert_eq!(s.quest_blip().map(|b| b.x), Some(10.0));
+
+        // The quest leaving the log takes its blip.
+        let mut slots = [QuestSlotView::default(); QUEST_LOG_SLOTS];
+        slots[0] = slot(6, 0, 0);
+        s.set_quest_slots(slots);
+        s.quest_log_changed();
+        assert_eq!(s.quest_blip(), None);
+    }
+
     /// The selection follows its quest across a fold and a rebuild, the reference's quest id.
     #[test]
     fn the_selection_follows_its_quest_across_folds() {
@@ -2548,6 +2733,12 @@ mod tests {
 
         assert_eq!(
             s.eval::<String>("return GetQuestLogItemLink(\"reward\", 1)")
+                .unwrap(),
+            "|cffffffff|Hitem:2024:0:0:0|h[Militia Hammer]|h|r"
+        );
+        // The type in any case (`SStrCmpI`, `0x4e0fc0`).
+        assert_eq!(
+            s.eval::<String>("return GetQuestLogItemLink(\"REWARD\", 1)")
                 .unwrap(),
             "|cffffffff|Hitem:2024:0:0:0|h[Militia Hammer]|h|r"
         );
@@ -3048,6 +3239,8 @@ mod tests {
     fn a_reputation_faction_is_the_last_line_finished_at_the_standing() {
         const ARGENT_DAWN: u32 = 529;
         let mut s = UiScript::new().unwrap();
+        // The label is the player's gendered text, a Lua `GetText` call (`0x612bf0`).
+        crate::test_support::install_text_rules(&s);
         caches(&mut s);
         s.set_item_template(
             900,
@@ -3495,6 +3688,47 @@ mod tests {
         );
     }
 
+    /// The party gate reads the first party slot as the host holds it at the call (`0x4e13a6`),
+    /// not the VM's roster copy: a party the world formed pushes, one it left does not.
+    #[test]
+    fn push_reads_the_party_slot_the_host_holds() {
+        use crate::script::live::LiveAsk;
+        use crate::script::{CallHost, CallTail, GroupCells, GroupCellsQuery, ScriptCall};
+        struct Party(u64, Vec<u32>);
+        impl CallHost for Party {
+            fn apply(&mut self, _: &mut UiScript, call: ScriptCall) -> Option<CallTail> {
+                if let ScriptCall::Quest(crate::script::QuestCall::Push(id)) = call {
+                    self.1.push(id);
+                }
+                None
+            }
+            fn read_live(&mut self, ask: &mut LiveAsk<'_>) -> bool {
+                let first = self.0;
+                ask.answer(|_: &GroupCellsQuery| {
+                    Some(GroupCells {
+                        party: [first, 0, 0, 0],
+                        ..GroupCells::default()
+                    })
+                })
+            }
+        }
+        let mut s = UiScript::new().unwrap();
+        let mut log = two_quests_log();
+        log[0].1.pushable = true; // quest id 783
+        seat(&mut s, &log);
+        s.run("SelectQuestLogEntry(2)").unwrap();
+        let mut formed = Party(0x300, Vec::new());
+        s.hosted(&mut formed, |s| s.run("QuestLogPushQuest()").unwrap());
+        assert_eq!(formed.1, [783], "the world's party, the copy solo");
+        in_a_party(&mut s);
+        let mut left = Party(0, Vec::new());
+        s.hosted(&mut left, |s| s.run("QuestLogPushQuest()").unwrap());
+        assert!(
+            left.1.is_empty(),
+            "the world's empty slot, the copy grouped"
+        );
+    }
+
     #[test]
     fn push_on_a_header_row_queues_nothing() {
         let mut s = two_quests();
@@ -3675,8 +3909,9 @@ mod tests {
         assert!(heard::take(&s).is_empty());
     }
 
-    /// Two reads of each line in flight ask once and signal once per record as it lands, where
-    /// the reference's lookups hold a callback a call (`0x4e05c9`).
+    /// Two reads of each line in flight: the item asks once and signals once as it lands, where
+    /// the reference's lookups hold a callback a call (`0x4e05c9`); the creature is asked in each
+    /// call that misses it, its wait the host's, and its name read through the host.
     #[test]
     fn each_missed_record_signals_once_however_many_calls_missed_it() {
         let mut s = UiScript::new().unwrap();
@@ -3698,7 +3933,7 @@ mod tests {
             );
         }
         assert_eq!(s.take_item_stat_asks(), vec![900]);
-        assert_eq!(s.take_quest_creature_asks(), vec![40], "asked once");
+        assert_eq!(s.take_quest_creature_asks(), vec![40, 40], "one per call");
         s.set_item_template(
             900,
             ItemTemplateView {
@@ -3706,38 +3941,32 @@ mod tests {
                 ..Default::default()
             },
         );
-        s.set_quest_creature_name(40, "Young Wolf".into());
         s.flush_quest_log_refires();
-        assert_eq!(heard::take(&s).len(), 2);
+        assert_eq!(heard::take(&s).len(), 1);
+        s.set_quest_creature_name(40, "Young Wolf".into());
         assert_eq!(
             s.eval::<String>("return (GetQuestLogLeaderBoard(1, 2))")
                 .unwrap(),
             "Young Wolf slain: 1/3"
         );
+        assert!(
+            s.take_quest_creature_asks().is_empty(),
+            "a hit asks nothing"
+        );
         s.flush_quest_log_refires();
         assert!(heard::take(&s).is_empty(), "a hit holds nothing");
-        // A refused creature's callbacks only log (`0x4e07dc`).
-        let mut other = record("Bears", 1, 12, "Elwynn Forest");
-        other.objectives[0] = kill(41, 3);
-        seat(&mut s, &[(51, other, slot(51, 0, 0))]);
-        heard::take(&s);
-        s.run("GetQuestLogLeaderBoard(1, 2)").unwrap();
-        s.refuse_quest_creature(41);
-        s.set_quest_creature_name(41, "Bear".into());
-        s.flush_quest_log_refires();
-        assert!(heard::take(&s).is_empty());
     }
 
-    /// A handler that walks every line at each `QUEST_LOG_UPDATE` over three creatures in flight:
-    /// the count is one per landed record whether the three land in one frame or in three.
+    /// A handler that walks every line at each `QUEST_LOG_UPDATE` over three items in flight: the
+    /// count is one per landed record whether the three land in one frame or in three.
     #[test]
     fn the_landing_count_does_not_depend_on_how_the_landings_fall_in_frames() {
         let run = |frames: &[&[u32]]| {
             let mut s = UiScript::new().unwrap();
             let quests: Vec<_> = (0..3u32)
                 .map(|i| {
-                    let mut r = record(&format!("Hunt {i}"), 1, 12, "Elwynn Forest");
-                    r.objectives[0] = kill(40 + i, 3);
+                    let mut r = record(&format!("Pelts {i}"), 1, 12, "Elwynn Forest");
+                    r.objectives[0] = collect(900 + i, 3);
                     (50 + i, r, slot(50 + i, 0, 0))
                 })
                 .collect();
@@ -3751,15 +3980,21 @@ mod tests {
             .unwrap();
             for landings in frames {
                 for &entry in *landings {
-                    s.set_quest_creature_name(entry, format!("Beast {entry}"));
+                    s.set_item_template(
+                        entry,
+                        ItemTemplateView {
+                            name: format!("Pelt {entry}"),
+                            ..Default::default()
+                        },
+                    );
                 }
                 s.flush_quest_log_refires();
             }
             s.eval::<i64>("return WALKS").unwrap()
         };
-        assert_eq!(run(&[&[40, 41, 42]]), 3);
-        assert_eq!(run(&[&[40], &[41], &[42]]), 3);
-        assert_eq!(run(&[&[42, 40], &[], &[41]]), 3);
+        assert_eq!(run(&[&[900, 901, 902]]), 3);
+        assert_eq!(run(&[&[900], &[901], &[902]]), 3);
+        assert_eq!(run(&[&[902, 900], &[], &[901]]), 3);
     }
 
     /// `0x4df7b0`: an item of ours that a listed quest needs fires once; one no quest needs fires
@@ -3827,6 +4062,7 @@ mod tests {
                     guid: FAR_MATE,
                 },
             ],
+            own_guid: ME,
             ..Default::default()
         });
         s.set_unit("player", Some(held(ME, &[7, 783])));

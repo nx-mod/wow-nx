@@ -165,6 +165,9 @@ fn set_shapeshift_and_set_pet_action_answer_the_same_flag() {
         ("TT:SetShapeshift(3)", "1:nil:nil"),
         ("TT:SetShapeshift(4)", "1:number:1"),
         ("TT:SetShapeshift(9)", "1:nil:nil"),
+        // `index - 1` against the count, unsigned (`0x5329fe`, `0x532a01`): 0 is past the list,
+        // not the running first entry.
+        ("TT:SetShapeshift(0)", "1:nil:nil"),
         ("TT:SetPetAction(1)", "1:number:1"),
         ("TT:SetPetAction(2)", "1:nil:nil"),
         ("TT:SetPetAction(3)", "1:nil:nil"),
@@ -328,6 +331,12 @@ fn the_mail_and_auction_item_setters_answer_one_value() {
     ] {
         assert_eq!(call(&s, c), "1:nil:nil", "{c} filled");
         assert!(s.eval::<bool>("return TT:IsShown()").unwrap(), "{c} drew");
+    }
+    // Row `ftol(n) - 1` compared unsigned, so 0 names none (`0x5355ce`, `0x535933`).
+    for c in ["TT:SetInboxItem(0)", "TT:SetAuctionItem('list', 0)"] {
+        s.run("TT:Hide()").unwrap();
+        assert_eq!(call(&s, c), "1:nil:nil", "{c}");
+        assert!(!s.eval::<bool>("return TT:IsShown()").unwrap(), "{c} drew");
     }
     assert!(s.take_errors().is_empty(), "{:?}", s.take_errors());
 }

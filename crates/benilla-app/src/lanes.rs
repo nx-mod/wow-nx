@@ -115,12 +115,101 @@ pub(crate) fn stamp() -> Stamp {
     }
 }
 
+/// The item firing on this thread, if any: a verb its listeners call runs at that item's moment.
+pub(crate) fn firing_now() -> Option<Stamp> {
+    FIRING.get()
+}
+
+/// Whether the item firing on this thread was pushed between `from` and `to`, or nests under one
+/// that was: it is part of what ran between the two marks.
+pub(crate) fn firing_between(from: Mark, to: Mark) -> bool {
+    FIRING
+        .get()
+        .is_some_and(|s| s.path().iter().any(|n| (from.0..to.0).contains(n)))
+}
+
+thread_local! {
+    /// A close core is running held behind a lane: what a core it re-enters signals is its.
+    static BEHIND: Cell<bool> = const { Cell::new(false) };
+    /// The net dispatch is running the frame's packet handlers on this thread ([`at_packets`]).
+    static AT_PACKETS: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Run `f` as the dispatch of the frame's packets, each handler whole in wire order: a close core
+/// a handler runs with no item firing takes its place on its lane there ([`waits_behind`]), so its
+/// signals fire after every earlier packet's and ahead of every later one's, as the reference's
+/// fire inside the handler that closes (`0x537ae5`, `0x703e50`).
+pub(crate) fn at_packets<R>(f: impl FnOnce() -> R) -> R {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            AT_PACKETS.set(self.0);
+        }
+    }
+    let _reset = Reset(AT_PACKETS.replace(true));
+    f()
+}
+
+/// Where [`behind`] ran its core.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Behind {
+    /// At once, its signals fired in place.
+    Ran,
+    /// Held, its signals parked on the lane.
+    Parked,
+    /// Inside another core's hold, which parks its signals with its own.
+    Nested,
+}
+
+/// Run a close `core` behind a lane whose head is `head`: at once unless it waits
+/// ([`waits_behind`]), else with the world's VM held, what it signalled parked under a key `park`
+/// queues on the lane, so a close never fires ahead of the open it closes, nor ahead of an earlier
+/// packet's signals when a handler runs it. A core it re-enters, as a release re-enters its close
+/// (`0x493310`), runs inside the hold.
+pub(crate) fn behind(
+    world: &mut World,
+    head: Option<Stamp>,
+    core: impl FnOnce(&mut World),
+    park: impl FnOnce(&mut World, u64, u64),
+) -> Behind {
+    if BEHIND.get() {
+        core(world);
+        return Behind::Nested;
+    }
+    let Some((_held, mark)) = waits_behind(head)
+        .then(|| crate::script_calls::defer_vm(world))
+        .flatten()
+    else {
+        core(world);
+        return Behind::Ran;
+    };
+    BEHIND.set(true);
+    core(world);
+    BEHIND.set(false);
+    if let Some((session, key)) = crate::script_calls::park_since(world, mark) {
+        park(world, session, key);
+    }
+    Behind::Parked
+}
+
+/// Whether a close run now must wait behind a lane whose head is `head`, as no other core's hold
+/// already takes what it signals ([`behind`]): with an item firing, the lane holds one stamped
+/// before it; with none, a packet handler runs it ([`at_packets`]), whose place is the lane's
+/// next stamp, or the lane holds any item.
+pub(crate) fn waits_behind(head: Option<Stamp>) -> bool {
+    !BEHIND.get()
+        && match firing_now() {
+            Some(now) => head.is_some_and(|head| head < now),
+            None => AT_PACKETS.get() || head.is_some(),
+        }
+}
+
 /// Run `f` as the firing of the item stamped `at`, so what it pushes nests under the item; with
 /// whether anything was stamped meanwhile, after which the drain takes the lowest stamp again.
 pub(crate) fn firing<R>(at: Stamp, f: impl FnOnce() -> R) -> (R, bool) {
     let before = CLOCK.load(Ordering::Relaxed);
     let outer = FIRING.replace(Some(at));
-    let r = f();
+    let r = benilla_ui::script::origin::within(benilla_ui::script::origin::Origin::Lane, f);
     FIRING.set(outer);
     (r, CLOCK.load(Ordering::Relaxed) != before)
 }
@@ -161,9 +250,9 @@ impl Until {
 pub(crate) type LaneReads = fn(&mut World) -> bevy::ecs::query::FilteredAccessSet;
 
 /// The access `system` declares, measured on `world` by initializing a copy of it.
-pub(crate) fn system_access<M>(
+pub(crate) fn system_access<I: bevy::ecs::system::SystemInput + 'static, O: 'static, M>(
     world: &mut World,
-    system: impl IntoSystem<(), (), M>,
+    system: impl IntoSystem<I, O, M>,
 ) -> bevy::ecs::query::FilteredAccessSet {
     use bevy::ecs::system::System;
     IntoSystem::into_system(system).initialize(world)
@@ -297,6 +386,7 @@ impl LaneApp for App {
         begin: Option<fn(&World)>,
     ) -> &mut Self {
         if self.world().get_resource::<Lanes>().is_none() {
+            crate::ui_script::raise_origin::arm_each_frame(self);
             self.init_resource::<Lanes>()
                 .configure_sets(
                     Update,
@@ -400,7 +490,11 @@ pub(crate) fn fire_in_order(world: &mut World) {
             fence,
         };
         let lane = &lanes.0[i];
-        if let Err(e) = world.run_system_with(lane.fire, until) {
+        let fired =
+            benilla_ui::script::origin::within(benilla_ui::script::origin::Origin::Lane, || {
+                world.run_system_with(lane.fire, until)
+            });
+        if let Err(e) = fired {
             error!("lanes: `{}` did not fire: {e}", lane.name);
             break;
         }
@@ -422,17 +516,43 @@ pub(crate) fn fire_in_order(world: &mut World) {
 #[cfg(test)]
 mod action_live_tests;
 #[cfg(test)]
+mod alert_live_tests;
+#[cfg(test)]
+mod arrival_live_tests;
+#[cfg(test)]
+mod auction_live_tests;
+#[cfg(test)]
 mod aura_live_tests;
 #[cfg(test)]
 mod aura_view_tests;
 #[cfg(test)]
 mod bag_tests;
 #[cfg(test)]
+mod bank_live_tests;
+#[cfg(test)]
+mod battlefield_live_tests;
+#[cfg(test)]
+mod book_live_tests;
+#[cfg(test)]
 mod cast_live_tests;
+#[cfg(test)]
+mod chat_clock_live_tests;
+#[cfg(test)]
+mod close_parked_tests;
 #[cfg(test)]
 mod cooldown_live_tests;
 #[cfg(test)]
+mod death_live_tests;
+#[cfg(test)]
+mod dialog_live_tests;
+#[cfg(test)]
 mod duration_live_tests;
+#[cfg(test)]
+mod follow_live_tests;
+#[cfg(test)]
+mod gossip_live_tests;
+#[cfg(test)]
+mod group_live_tests;
 #[cfg(test)]
 mod group_view_tests;
 #[cfg(test)]
@@ -442,33 +562,86 @@ mod guild_live_tests;
 #[cfg(test)]
 mod host_read_tests;
 #[cfg(test)]
+mod inspect_live_tests;
+#[cfg(test)]
+mod instance_live_tests;
+#[cfg(test)]
 mod item_live_tests;
 #[cfg(test)]
 mod item_tests;
+#[cfg(test)]
+mod item_text_live_tests;
+#[cfg(test)]
+mod logout_live_tests;
+#[cfg(test)]
+mod loot_live_tests;
+#[cfg(test)]
+mod loot_roll_live_tests;
+#[cfg(test)]
+mod mail_live_tests;
+#[cfg(test)]
+mod merchant_live_tests;
 #[cfg(test)]
 mod name_live_tests;
 #[cfg(test)]
 mod packet_signal_tests;
 #[cfg(test)]
+mod pet_live_tests;
+#[cfg(test)]
+mod petition_live_tests;
+#[cfg(test)]
+mod profession_live_tests;
+#[cfg(test)]
 mod quest_log_live_tests;
 #[cfg(test)]
 mod quiet_tests;
 #[cfg(test)]
+mod record_callback_tests;
+#[cfg(test)]
 mod reputation_live_tests;
 #[cfg(test)]
+mod requirement_live_tests;
+#[cfg(test)]
 mod selection_live_tests;
+#[cfg(test)]
+mod social_live_tests;
+#[cfg(test)]
+mod spell_slot_live_tests;
+#[cfg(test)]
+mod stable_live_tests;
+#[cfg(test)]
+mod stance_live_tests;
 #[cfg(test)]
 mod stat_live_tests;
 #[cfg(test)]
 mod storm_tests;
 #[cfg(test)]
+mod tabard_live_tests;
+#[cfg(test)]
+mod taxi_live_tests;
+#[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod token_live_tests;
 #[cfg(test)]
+mod tooltip_live_tests;
+#[cfg(test)]
+mod trade_live_tests;
+#[cfg(test)]
+mod trainer_live_tests;
+#[cfg(test)]
+mod tutorial_live_tests;
+#[cfg(test)]
+mod ui_error_live_tests;
+#[cfg(test)]
+mod unit_feed_live_tests;
+#[cfg(test)]
 mod unit_live_tests;
 #[cfg(test)]
 mod unit_view_tests;
+
+#[cfg(test)]
+mod world_map_update_tests;
 
 #[cfg(test)]
 mod unit_tests {

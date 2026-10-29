@@ -32,8 +32,8 @@ use crate::ui_action::{reagent_totem_refusal, CastFail, Spells};
 use crate::ui_cast::CastReports;
 
 mod unit_caster;
+pub(crate) use unit_caster::UnitAttackOwed;
 use unit_caster::UnitCaster;
-pub(crate) use unit_caster::{PetGcdsOwed, UnitAttackOwed};
 
 /// What the commit sends: `SendCast 0x6e54f0` branches on whether the pending-cast guid
 /// (`0xceac48`, the item's when TryCast got one, else the caster's) is the caster's; the item arm
@@ -188,9 +188,10 @@ pub(crate) struct CastLadder<'w, 's> {
     pub(crate) loot_latch: Option<ResMut<'w, crate::ui_loot::LootLatch>>,
     /// The active player's guid, which a unit caster's rungs compare against (`0x468550`).
     active: Option<Res<'w, crate::net::SelfGuid>>,
-    /// The GCDs a unit caster's sends started in the pet's history (`0x6e58fb`); absent in a
-    /// world with no pet bar.
-    pet_gcds: Option<ResMut<'w, PetGcdsOwed>>,
+    /// The pet bar, whose book and unit the validator's learn rungs read (`0x60c740`-`0x60c8d0`)
+    /// and whose history a unit caster's send starts its GCD in (`0x6e58fb`); absent in a world
+    /// with no pet bar.
+    pet_bar: Option<ResMut<'w, crate::ui_pet::PetBar>>,
     /// The attack a unit caster's send owes the pet bar (`0x6e51de`); absent in a world with no
     /// pet bar.
     unit_attack: Option<ResMut<'w, UnitAttackOwed>>,
@@ -201,11 +202,12 @@ pub(crate) struct CastLadder<'w, 's> {
 }
 
 /// The known spells the validator's learn rungs read: the active player's book (`0xb710fc`), and
-/// the pet's book, records and family lines.
+/// the pet's records and family lines, beside the bar the ladder holds.
 #[derive(SystemParam)]
 pub(crate) struct KnownReads<'w> {
     actions: Option<Res<'w, crate::ui_action::PlayerActions>>,
-    pet: super::known::PetReads<'w>,
+    names: Option<Res<'w, crate::names::NameCache>>,
+    families: Option<Res<'w, crate::ui_pet_stats::PetFamilyTables>>,
 }
 
 /// Whether `ReportCastFailure 0x6e1a00` reaches its tail for `fail`
@@ -221,7 +223,8 @@ pub(crate) fn reaches_tail(
         fail.arg,
         spells.and_then(|s| s.catalog.get(fail.spell_id)),
         spells.map(|s| &s.forms),
-        // The lookup with the callback `0x6e29b0` (`0x6e1ea4`).
+        // The lookup (`0x6e1ea4`), asking on a miss; the line's own registers the callback
+        // `0x6e29b0` ([`crate::ui_action::CastFailLines`]).
         |item| items.template(item, 0, Ask::Event(net)).is_some(),
     )
 }
@@ -533,7 +536,7 @@ impl CastLadder<'_, '_> {
             &mut self.stop_word,
             UnitCaster {
                 active: self.active.as_ref().and_then(|g| g.0),
-                pet_gcds: self.pet_gcds.as_deref_mut(),
+                pet_bar: self.pet_bar.as_deref_mut(),
                 engaged: commit
                     .unit_caster()
                     .and_then(|guid| self.objects.entity(guid))
@@ -753,8 +756,7 @@ fn send_spell_cast(
     // about the weapon.
     if let Some(d) = def.filter(|_| player_caster) {
         if let Some(store) = ctx.rel.self_store {
-            if !super::usable::equipped_item_fits(d, store, objects, items, &mut super::Unrecorded)
-            {
+            if !super::usable::equipped_item_fits(d, store, objects, items) {
                 let reason = super::usable::equipped_item_reason(d);
                 debug!("ui_action: cast {spell_id} refused locally — equipped item ({reason:#x})");
                 refuse!(CastFail::local(spell_id, reason));
@@ -1042,9 +1044,15 @@ fn send_spell_cast(
         })
     };
     // `KnowsSpell 0x60c740` on the caster: the active player's book, else the pet bar's unit's.
-    let pet_view = spells
-        .zip(skill_lines)
-        .and_then(|(s, lines)| super::known::PetView::of(&known.pet, lines, &s.catalog));
+    let pet_view = spells.zip(skill_lines).and_then(|(s, lines)| {
+        super::known::PetView::of(
+            unit.pet_bar.as_deref(),
+            known.names.as_deref(),
+            known.families.as_deref(),
+            lines,
+            &s.catalog,
+        )
+    });
     let knows = |spell: u32| match commit.unit_caster() {
         None => known
             .actions
@@ -2329,7 +2337,6 @@ mod tests {
                 crate::ui_cast::CastReport::TradeSkillDisarm => "DISARM",
                 crate::ui_cast::CastReport::AutoRepeat(true) => "START_AUTOREPEAT",
                 crate::ui_cast::CastReport::AutoRepeat(false) => "STOP_AUTOREPEAT",
-                crate::ui_cast::CastReport::Redisplay => "REDISPLAY",
                 crate::ui_cast::CastReport::Line(e) => e.key,
             })
             .collect()

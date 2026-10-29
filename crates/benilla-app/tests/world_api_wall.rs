@@ -88,12 +88,14 @@ const PUBLISHED: &[(&str, &str)] = &[
     ("boot::tuned_default_plugins", "record"),
     ("build_id::BuildId", "record"),
     ("build_id::banner", "record"),
+    ("collision::BodyHit", "record"),
     ("collision::ColliderEpoch", "record"),
     ("collision::MoverTraceExclusions", "record"),
     ("collision::WorldCollision", "record"),
     ("decal::WorldDecal", "record"),
     ("dev_state::STILL_INPUTS_CHANGED", "record"),
     ("doodad_anim::AnimMatPart", "record"),
+    ("doodad_anim::CarrierAnimation", "record"),
     ("doodad_anim::DoodadAnimHost", "record"),
     ("doodad_anim::MatAnim", "record"),
     ("doodad_anim::MatAnimTick", "record"),
@@ -213,9 +215,6 @@ const SORTED_LEAKS: &[(&str, &str)] = &[
     ("instance_tint::IDENTITY", "CLOSE/absorb"),
     ("instance_tint::pack", "CLOSE/absorb"),
     ("interact::PickBox", "CLOSE/absorb"),
-    ("interact::WorldClick", "CLOSE/move-game"),
-    ("interact::WorldRightClick", "CLOSE/move-game"),
-    ("interact::WorldRightPress", "CLOSE/move-game"),
     ("interact::cast_pick_ray_inflated", "CLOSE/absorb"),
     ("interior::BodyBakeCenter", "CLOSE/absorb"),
     ("interior::ContainmentAttach", "CLOSE/absorb"),
@@ -752,7 +751,7 @@ fn expand(s: &str) -> Vec<String> {
                 break;
             }
             let tail = &after[2..];
-            // `interact::{WorldClick, WorldRightClick}`: a group hanging off a walked path.
+            // `interact::{CreaturePickPart, GoPickPart}`: a group hanging off a walked path.
             if tail.trim_start().starts_with('{') {
                 let head = out;
                 return expand(tail)

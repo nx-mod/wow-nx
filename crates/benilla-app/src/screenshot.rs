@@ -65,7 +65,7 @@ impl Default for ScreenshotState {
 
 impl ScreenshotState {
     /// `WoWScrnShot_MMDDYY_HHMMSS.png`, the reference's field order and padding, in local time
-    /// (`0x429450`, `strftime` of `localtime`); UTC where the platform refuses the time.
+    /// (`0x429450`, `strftime` of `localtime`).
     ///
     /// A second capture in the same second gets `_2`, `_3`: the reference overwrites, so a burst
     /// leaves one file, a data loss not copied.
@@ -76,8 +76,7 @@ impl ScreenshotState {
             self.last_second = now;
             self.within_second = 0;
         }
-        let c = benilla_ui::civil::local(now)
-            .map_or_else(|| benilla_ui::civil::from_unix(now), |(c, _)| c);
+        let (c, _) = benilla_ui::civil::local(now);
         let base = format!(
             "{STEM}_{:02}{:02}{:02}_{:02}{:02}{:02}",
             c.month,
@@ -96,7 +95,8 @@ impl ScreenshotState {
 
 /// Captures each `Screenshot()` one frame after the call. Spawn last frame's asks before draining
 /// this frame's: that order is the one-frame hold (module doc). While a movie plays the frame pass
-/// skips its present block, the capture in it (`0x44267c`), so the asks wait for its end.
+/// skips its present block, the capture in it (`0x44267c`), so the asks wait for its end. Not a
+/// call's: the verb only arms the request (`0x4893d0`, `0x442a10`), which the frame pass takes.
 fn ask_for_captures(
     mut commands: Commands,
     mut hosted_vm: crate::script_calls::HostedVm,
@@ -207,13 +207,12 @@ impl Plugin for ScreenshotPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::local_state::test_env::{EnvGuard, ENV_LOCK};
+    use benilla_ui::civil::ZoneGuard;
     use benilla_ui::script::UiScript;
 
     #[test]
     fn names_follow_the_reference_and_never_collide() {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _tz = EnvGuard::set("TZ", "UTC0");
+        let _zone = ZoneGuard::set("UTC0");
         let mut s = ScreenshotState::default();
         // 2026-08-21T13:45:07Z.
         assert_eq!(s.next_name(1_787_319_907), "WoWScrnShot_082126_134507.png");
@@ -234,11 +233,25 @@ mod tests {
     /// 13:45:07Z is 19:30:07, and 20:00Z is past local midnight.
     #[test]
     fn names_stamp_the_local_time() {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _tz = EnvGuard::set("TZ", "NPT-05:45");
+        let _zone = ZoneGuard::set("NPT-05:45");
         let mut s = ScreenshotState::default();
         assert_eq!(s.next_name(1_787_319_907), "WoWScrnShot_082126_193007.png");
         assert_eq!(s.next_name(1_787_342_400), "WoWScrnShot_082226_014500.png");
+    }
+
+    /// The zone is the process's, read once (`0x414568`): a test holds its own through the guard,
+    /// so the stamp follows each zone set in turn, whatever ran before.
+    #[test]
+    fn the_stamp_follows_the_zone_a_test_holds() {
+        for (tz, name) in [
+            ("NPT-05:45", "WoWScrnShot_082126_193007.png"),
+            ("UTC0", "WoWScrnShot_082126_134507.png"),
+            ("NPT-05:45", "WoWScrnShot_082126_193007.png"),
+        ] {
+            let _zone = ZoneGuard::set(tz);
+            let mut s = ScreenshotState::default();
+            assert_eq!(s.next_name(1_787_319_907), name, "TZ {tz}");
+        }
     }
 
     /// An ask made during frame N is spawned on frame N+1.

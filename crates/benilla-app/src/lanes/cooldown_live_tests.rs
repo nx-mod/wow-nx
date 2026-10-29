@@ -165,10 +165,9 @@ fn client() -> Client {
             (2, POTION, ACTION_KIND_ITEM),
         ] {
             slots
-                .buttons
+                .staged
                 .insert(slot, ActionButton { slot, action, kind });
         }
-        slots.dirty = true;
     }
     crate::items::test_spawn_item(
         world,
@@ -264,10 +263,122 @@ fn an_item_cooldowns_listeners_read_its_packets_list() {
     );
 }
 
-/// The getters answer the same through the lent host as off the frame's snapshots wherever the
-/// snapshots are current: every slot, both book spells and the potion, cold and running.
+/// A cooldown query that missed its record left the callback `0x6e2f70` on the item cache
+/// (`0x6e2efb`), and the record's answer runs it inside its handler (`0x55bdb0`): the query again,
+/// and with the item's cooldown running the pair and the bags (`0x6e2f89`, `0x6e2f8e`), at the
+/// answer's place. So with the answer first and a spell cooldown after it in one frame, the
+/// record's flush fires first and reads Frost Nova cold.
 #[test]
-fn every_cooldown_getter_answers_the_same_live_as_off_the_snapshot() {
+fn a_cooldown_querys_record_flushes_at_its_answers_place() {
+    const HEARTHSTONE: u32 = 6948;
+    const HEARTH: u32 = 8690;
+    let mut c = client();
+    let world = c.app.world_mut();
+    {
+        let mut slots = world.resource_mut::<crate::ui_action::ActionSlots>();
+        slots.buttons.insert(
+            3,
+            ActionButton {
+                slot: 3,
+                action: HEARTHSTONE,
+                kind: ACTION_KIND_ITEM,
+            },
+        );
+    }
+    world
+        .resource_mut::<crate::spell::Cooldowns>()
+        .apply_wire_item_cooldown(HEARTHSTONE, HEARTH, std::time::Instant::now());
+    c.frame(vec![]);
+    // The button's cooldown read (`ActionButton_UpdateCooldown`), whose query misses the record.
+    c.eval::<()>(true, "GetActionCooldown(4)");
+    c.seen(&[]);
+    let mut record = crate::items::test_template("Hearthstone");
+    record.use_spell = Some(benilla_protocol::messages::ItemUseSpell {
+        spell_id: HEARTH,
+        cooldown_ms: -1,
+        category: 0,
+        category_cooldown_ms: -1,
+    });
+    c.frame(vec![
+        vec![SessionEvent::ItemTemplate {
+            entry: HEARTHSTONE,
+            info: Some(Box::new(record)),
+        }],
+        vec![spell_cooldown(FROST_NOVA, 10_000)],
+    ]);
+    assert_eq!(
+        c.seen(&[
+            "ACTIONBAR_UPDATE_COOLDOWN",
+            "SPELL_UPDATE_COOLDOWN",
+            "BAG_UPDATE_COOLDOWN"
+        ]),
+        [
+            "ACTIONBAR_UPDATE_COOLDOWN:0:0:0:0:0:0",
+            "SPELL_UPDATE_COOLDOWN:0:0:0:0:0:0",
+            "BAG_UPDATE_COOLDOWN:0:0:0:0:0:0",
+            "ACTIONBAR_UPDATE_COOLDOWN:10:0:0:10:0:0",
+            "SPELL_UPDATE_COOLDOWN:10:0:0:10:0:0",
+        ]
+    );
+}
+
+/// `SMSG_PET_SPELLS` derives the macros that follow the pet's book after its book's sort and
+/// ahead of `SetPetGuid` (`0x4bdadb` → `0x4b2fd0`, `0x4bdae0` → `0x4f0ce0`, `0x4bdaf0` →
+/// `0x4bc7e0`): a `/cast` of the pet's spell that missed is still unbound to the sort's
+/// `SPELLS_CHANGED`, and bound out of the pet's book to `SetPetGuid`'s `PET_BAR_UPDATE`, which
+/// `GetActionAutocast` reads through the record's book (`0x4e6fcb`).
+#[test]
+fn a_pet_spell_list_binds_its_macros_between_its_sort_and_its_pet() {
+    use benilla_protocol::messages::{
+        PetActionEntry, PetSpells, ACTION_KIND_MACRO, PET_ACT_ENABLED,
+    };
+    const PET: u64 = 0x2A;
+    const SEDUCTION: u32 = 6358;
+    let mut c = client();
+    let world = c.app.world_mut();
+    world.insert_resource(spells_with(&[SEDUCTION]));
+    {
+        let mut script = world.non_send_resource_mut::<UiScript>();
+        script.run(r#"SLASH_CAST1 = "/cast""#).unwrap();
+        script.set_macros(benilla_ui::script::MacroState::from_scopes(
+            vec![benilla_ui::script::MacroView {
+                name: "Sed".into(),
+                body: format!("/cast Spell {SEDUCTION}"),
+                ..Default::default()
+            }],
+            Vec::new(),
+        ));
+        // The load's derivation, with no pet: a miss.
+        script.derive_macro_bindings(|_, _| true);
+    }
+    crate::ui_action::hold_for_test(world, 4, ACTION_KIND_MACRO, 1);
+    c.frame(vec![]);
+    c.eval::<()>(
+        false,
+        r#"local g = CreateFrame("Frame")
+        g:RegisterEvent("SPELLS_CHANGED")
+        g:RegisterEvent("PET_BAR_UPDATE")
+        g:SetScript("OnEvent", function()
+            table.insert(Seen, "PET:" .. event .. ":" .. tostring(GetActionAutocast(4)))
+        end)"#,
+    );
+    c.seen(&[]);
+    let entry = PetActionEntry::from(SEDUCTION | (u32::from(PET_ACT_ENABLED) << 24));
+    c.frame(vec![vec![SessionEvent::PetSpells(Box::new(PetSpells {
+        pet_guid: PET,
+        spells: vec![entry],
+        ..Default::default()
+    }))]]);
+    assert_eq!(
+        c.seen(&["PET"]),
+        ["PET:SPELLS_CHANGED:nil", "PET:PET_BAR_UPDATE:1"]
+    );
+}
+
+/// The getters answer through the lent host for every slot, the book and the bags, cold and
+/// running.
+#[test]
+fn every_cooldown_getter_answers_live_cold_and_running() {
     let mut c = client();
     let chunk = r#"
         local out = {}
@@ -280,13 +391,8 @@ fn every_cooldown_getter_answers_the_same_live_as_off_the_snapshot() {
         note("bag 0 1", GetContainerItemCooldown(0, 1))
         note("bag 0 2", GetContainerItemCooldown(0, 2))
         return out"#;
-    let agree = |c: &mut Client, why: &str| {
-        let snapshot: Vec<String> = c.eval(false, chunk);
-        let live: Vec<String> = c.eval(true, chunk);
-        assert_eq!(snapshot, live, "{why}");
-        live
-    };
-    let cold = agree(&mut c, "all cold");
+    let agree = |c: &mut Client| -> Vec<String> { c.eval(true, chunk) };
+    let cold = agree(&mut c);
     assert!(cold.iter().any(|l| l == "action 1 0,0,1"), "{cold:#?}");
     assert!(cold.iter().any(|l| l == "action 4 0,0,0"), "{cold:#?}");
     c.frame(vec![
@@ -296,7 +402,7 @@ fn every_cooldown_getter_answers_the_same_live_as_off_the_snapshot() {
             spell_id: POTION_SPELL,
         }],
     ]);
-    let running = agree(&mut c, "two running");
+    let running = agree(&mut c);
     for prefix in ["action 1 ", "spell 1 ", "action 3 ", "bag 0 1 "] {
         let line = running
             .iter()
@@ -404,9 +510,7 @@ fn a_worn_items_cooldown_reads_live_inside_its_packet() {
         }],
     ]);
     assert_eq!(c.seen(&["WORN"]), ["WORN:0", "WORN:30"]);
-    for live in [false, true] {
-        assert_eq!(c.eval::<f64>(live, chunk), 30.0, "live {live}");
-    }
+    assert_eq!(c.eval::<f64>(true, chunk), 30.0);
 }
 
 /// The pet's list read inside the call, through the book and the bar: `GetSpellCooldown(id,
@@ -447,31 +551,19 @@ fn the_pet_book_and_a_pet_bound_slot_read_the_pets_list_inside_their_packet() {
         .resource_mut::<crate::net::GuidIndex>()
         .0
         .insert(PET, pet);
-    {
-        let mut slots = world.resource_mut::<crate::ui_action::ActionSlots>();
-        slots.buttons.insert(
-            3,
-            ActionButton {
-                slot: 3,
-                action: 1,
-                kind: ACTION_KIND_MACRO,
-            },
-        );
-        slots.dirty = true;
-    }
+    crate::ui_action::hold_for_test(world, 4, ACTION_KIND_MACRO, 1);
     c.frame(vec![]);
     c.frame(vec![]);
-    c.app
-        .world_mut()
-        .resource_mut::<crate::ui_macro::MacroBoundSpells>()
-        .0
-        .insert(
+    crate::ui_macro::bind_for_test(
+        &mut c.app.world_mut().non_send_resource_mut::<UiScript>(),
+        &[(
             1,
             crate::ui_macro::Bound {
                 spell: crate::ui_macro::BoundSpell::Spell(BITE),
                 pet_book: true,
             },
-        );
+        )],
+    );
     c.frame(vec![]);
     c.eval::<()>(
         false,
@@ -495,4 +587,129 @@ fn the_pet_book_and_a_pet_bound_slot_read_the_pets_list_inside_their_packet() {
     ]);
     // The book sorts Bite ahead of Growl.
     assert_eq!(c.seen(&["PET"]), ["PET:0:3:0", "PET:4:3:4"]);
+}
+
+/// A cross-map `SMSG_NEW_WORLD` in a frame, as the cross-map one carries `needs_ack`.
+fn port() -> SessionEvent {
+    SessionEvent::Worldport {
+        map_id: 1,
+        position: [0.0; 3],
+        orientation: 0.0,
+        needs_ack: true,
+    }
+}
+
+/// Frost Nova's and Blink's action slots and the potion's bag slot, as `GetActionCooldown` and
+/// `GetContainerItemCooldown` read the lists through the lent host: the durations in seconds.
+fn running(c: &mut Client) -> (f64, f64, f64) {
+    c.eval(
+        true,
+        "local _, a = GetActionCooldown(1) local _, b = GetActionCooldown(2) \
+         local _, p = GetContainerItemCooldown(0, 1) return a, b, p",
+    )
+}
+
+/// The records both lists hold: the player's, then the pet's.
+fn held(c: &Client) -> (usize, usize) {
+    let world = c.app.world();
+    (
+        world.resource::<crate::spell::Cooldowns>().record_count(),
+        world
+            .resource::<crate::ui_pet::PetBar>()
+            .cooldowns
+            .record_count(),
+    )
+}
+
+/// Frost Nova on 10 s, the potion on the client's 30 s, and Blink on the pet's list.
+fn running_lists() -> Client {
+    let mut c = client();
+    c.frame(vec![
+        vec![spell_cooldown(FROST_NOVA, 10_000)],
+        vec![SessionEvent::ItemCooldown {
+            item_guid: POTION_GUID,
+            spell_id: POTION_SPELL,
+        }],
+    ]);
+    let spells = spells();
+    c.app
+        .world_mut()
+        .resource_mut::<crate::ui_pet::PetBar>()
+        .cooldowns
+        .apply_spell_cooldowns(
+            [(BLINK, 15_000, spells.catalog.get(BLINK))],
+            &crate::spell::SpellModifiers::default(),
+            crate::spell::CategoryPad::Skip,
+            std::time::Instant::now(),
+        );
+    // The pet record's flush fires with the frame's lanes.
+    c.frame(vec![]);
+    c.seen(&[]);
+    assert_eq!(running(&mut c), (10.0, 0.0, 30.0));
+    assert_eq!(
+        held(&c),
+        (2, 1),
+        "Frost Nova's and the potion's, and Blink's"
+    );
+    c
+}
+
+/// The world load's body calls `ClearItemAndSpellCooldowns` (`0x401c17` → `0x6e9ad0`), in the tick
+/// the timer runs: both history lists emptied and the item cooldowns freed, with no flush, so no
+/// cooldown event fires. The server's `SMSG_INITIAL_SPELLS` after it then seeds only what it lists.
+#[test]
+fn a_worldport_empties_the_cooldowns_and_the_resend_seeds_only_what_it_lists() {
+    let mut c = running_lists();
+    c.frame(vec![vec![port()]]);
+    assert_eq!(held(&c), (2, 1), "the port's own tick clears nothing");
+    c.frame(vec![]);
+    // The potion goes with the objects, so its getter reads cold whatever its record does: the
+    // lists are read by their records.
+    assert_eq!(
+        held(&c),
+        (0, 0),
+        "the timer's tick empties both lists, the item cooldown with them"
+    );
+    assert_eq!(running(&mut c), (0.0, 0.0, 0.0));
+    assert_eq!(
+        c.seen(&[
+            "ACTIONBAR_UPDATE_COOLDOWN",
+            "SPELL_UPDATE_COOLDOWN",
+            "BAG_UPDATE_COOLDOWN"
+        ]),
+        Vec::<String>::new(),
+        "the clear signals nothing"
+    );
+    c.frame(vec![vec![SessionEvent::SpellBook {
+        spell_ids: vec![FROST_NOVA, BLINK],
+        cooldowns: vec![benilla_protocol::messages::SpellCooldown {
+            spell_id: BLINK as u16,
+            item_id: 0,
+            category: 0,
+            spell_cd_ms: 20_000,
+            category_cd_ms: 0,
+        }],
+    }]]);
+    let (nova, blink, _) = running(&mut c);
+    assert_eq!(
+        (nova, blink, held(&c).0),
+        (0.0, 20.0, 1),
+        "Blink alone, as the resend lists it"
+    );
+}
+
+/// A teleport inside the map (`MSG_MOVE_TELEPORT`) runs no world load: both lists stand.
+#[test]
+fn a_same_map_teleport_leaves_the_cooldowns() {
+    let mut c = running_lists();
+    let before = held(&c);
+    c.frame(vec![vec![SessionEvent::Teleport {
+        guid: ME,
+        counter: 1,
+        position: [1.0, 2.0, 3.0],
+        orientation: 0.0,
+    }]]);
+    c.frame(vec![]);
+    assert_eq!(running(&mut c), (10.0, 0.0, 30.0));
+    assert_eq!(held(&c), before);
 }

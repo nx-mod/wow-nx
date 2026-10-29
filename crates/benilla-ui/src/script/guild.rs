@@ -399,14 +399,13 @@ fn name_or_nil(lua: &Lua, name: &str) -> mlua::Result<Value> {
 }
 
 /// The rank-name gate `GuildControlSaveRank` (`0x4d20d0`) and `GuildControlAddRank` (`0x4d2210`)
-/// run before any packet: the name up to the first NUL must be 1 to 16 UTF-16 code units
-/// (`0x65b250`), untrimmed, and is sent as measured. vmangos kicks a name over 15 code points; the
+/// run before any packet: the name up to the first NUL must be 1 to 16 code points (`0x65b250`
+/// folds each byte sign-extended, so a multi-byte sequence counts one, a four-byte form included
+/// where UTF-16 would count two; `dec eax` at `0x4d212c`), untrimmed, and is sent as measured. vmangos kicks a name over 15 code points; the
 /// app caps that at the send (`ui_guild::feed::capped_rank_name`).
 fn gated_rank_name(name: &str) -> Option<&str> {
     let c_name = name.split('\0').next().unwrap_or_default();
-    (1..=16)
-        .contains(&c_name.encode_utf16().count())
-        .then_some(c_name)
+    (1..=16).contains(&c_name.chars().count()).then_some(c_name)
 }
 
 /// Register the guild globals.
@@ -441,7 +440,13 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     // ([`super::RecordAsk::Guild`]); the zero key never is (`0x560e3d`).
     g.set(
         "GetGuildInfo",
-        lua.create_function(|lua, unit: Option<String>| {
+        lua.create_function(|lua, unit: Value| {
+            // `is-number-or-string` else `Usage: GetGuildInfo("unit")` (`0x848ca0`, `0x4c935b`).
+            let unit = Some(binding_abi::string_arg(
+                lua,
+                unit,
+                r#"Usage: GetGuildInfo("unit")"#,
+            )?);
             crate::script::unit::check_unit_token(&unit)?;
             let model = lua.app_data_ref::<Model>().expect("model app_data");
             let Some(state) = unit
@@ -723,64 +728,104 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     }
 
     // ── The by-name verbs ────────────────────────────────────────────────────────────────────
-    // Five name-taking verbs (`0x48aef0`, `0x48afb0`, `0x48b050`, `0x48b0f0`, `0x48b190`). An empty
-    // or whitespace name is not sent. vmangos ignores an empty one without a reply, except an
-    // invite, which it answers with `ERR_GUILD_PLAYER_NOT_FOUND_S`
-    // (`Handlers/GuildHandler.cpp:77-83`).
-    for (global, make) in [
-        ("GuildInviteByName", GuildCall::Invite as fn(String) -> _),
+    // GuildInviteByName(name) (`0x48aef0`): a non-string, nil or "" shows ERR_COMMAND_NEEDS_TARGET
+    // (`push 0x132`, `0x48af93`) and raises nothing; any other string is sent as given.
+    g.set(
+        "GuildInviteByName",
+        lua.create_function(|lua, name: Value| {
+            match binding_abi::optional_string(lua, &name).filter(|n| !n.is_empty()) {
+                Some(name) => submit(lua, GuildCall::Invite(name)),
+                None => super::calls::display_error(lua, "ERR_COMMAND_NEEDS_TARGET"),
+            }
+        })?,
+    )?;
+
+    // Four more name-taking verbs (`0x48afb0`, `0x48b050`, `0x48b0f0`, `0x48b190`): a non-string
+    // raises each one's usage line (`0x842848`, `0x84286c`, `0x842890`, `0x8428b4`). The name is
+    // sent as given, "" and whitespace included; `GuildSetLeaderByName` puts no name for "" or
+    // `target` (`0x48b1e1`, `0x48b1fc`) but sends all the same.
+    for (global, usage, make) in [
         (
             "GuildUninviteByName",
+            r#"Usage: GuildUninviteByName("name")"#,
             GuildCall::Uninvite as fn(String) -> _,
         ),
-        ("GuildPromoteByName", GuildCall::Promote as fn(String) -> _),
-        ("GuildDemoteByName", GuildCall::Demote as fn(String) -> _),
+        (
+            "GuildPromoteByName",
+            r#"Usage: GuildPromoteByName("name")"#,
+            GuildCall::Promote as fn(String) -> _,
+        ),
+        (
+            "GuildDemoteByName",
+            r#"Usage: GuildDemoteByName("name")"#,
+            GuildCall::Demote as fn(String) -> _,
+        ),
         (
             "GuildSetLeaderByName",
+            r#"Usage: GuildSetLeaderByName("name")"#,
             GuildCall::SetLeader as fn(String) -> _,
         ),
     ] {
         g.set(
             global,
-            lua.create_function(move |lua, name: String| {
-                if name.trim().is_empty() {
-                    return Ok(());
+            lua.create_function(move |lua, name: Value| {
+                let mut name = binding_abi::string_arg(lua, name, usage)?;
+                // `GuildSetLeaderByName` sends its packet whatever the name (`0x48b220`) and
+                // writes the name only when it is neither empty (`0x48b1e1`) nor `target` in any
+                // case (`SStrCmpI` against `0x8428d8`, `0x48b1fc`): the others send none.
+                if global == "GuildSetLeaderByName" && name.eq_ignore_ascii_case("target") {
+                    name.clear();
                 }
                 submit(lua, make(name))
             })?,
         )?;
     }
 
-    // GuildSetMOTD(text) (`0x48b270`) / SetGuildInfoText(text) (`0x4d2380`): an empty string is
-    // sent, and clears the text.
-    for (global, make) in [
-        ("GuildSetMOTD", GuildCall::SetMotd as fn(String) -> _),
+    // GuildSetMOTD(text) (`0x48b270`) / SetGuildInfoText(text) (`0x4d2380`): a non-string raises
+    // `Usage: GuildSetMOTD("message")` (`0x8428e0`) or `Usage: SetGuildInfoText(text)`
+    // (`0x849cd4`); any string is sent.
+    for (global, usage, make) in [
+        (
+            "GuildSetMOTD",
+            r#"Usage: GuildSetMOTD("message")"#,
+            GuildCall::SetMotd as fn(String) -> _,
+        ),
         (
             "SetGuildInfoText",
+            "Usage: SetGuildInfoText(text)",
             GuildCall::SetInfoText as fn(String) -> _,
         ),
     ] {
         g.set(
             global,
-            lua.create_function(move |lua, text: String| submit(lua, make(text)))?,
+            lua.create_function(move |lua, text: Value| {
+                let text = binding_abi::string_arg(lua, text, usage)?;
+                submit(lua, make(text))
+            })?,
         )?;
     }
 
     // GuildRosterSetPublicNote(index, note) (`0x4d15e0`) / GuildRosterSetOfficerNote (`0x4d1700`)
-    // take a roster row, which the host resolves to the name the wire carries.
-    for (global, make) in [
+    // take a roster row, which the host resolves to the name the wire carries. `is-number` on the
+    // index and `is-number-or-string` on the note, else the verb's usage line (`0x849b38`,
+    // `0x849b68`); the index is `_ftol`ed with no raise for a row out of range.
+    for (global, usage, make) in [
         (
             "GuildRosterSetPublicNote",
+            "Usage: GuildRosterSetPublicNote(index, note)",
             (|index, note| GuildCall::SetPublicNote { index, note }) as fn(u32, String) -> _,
         ),
         (
             "GuildRosterSetOfficerNote",
+            "Usage: GuildRosterSetOfficerNote(index, note)",
             (|index, note| GuildCall::SetOfficerNote { index, note }) as fn(u32, String) -> _,
         ),
     ] {
         g.set(
             global,
-            lua.create_function(move |lua, (index, note): (i64, String)| {
+            lua.create_function(move |lua, (index, note): (Value, Value)| {
+                let index = binding_abi::number_arg(lua, index, usage)?;
+                let note = binding_abi::string_arg(lua, note, usage)?;
                 let Ok(index) = u32::try_from(index) else {
                     return Ok(());
                 };
@@ -942,7 +987,10 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     // which the reference never tests, ride through as the server sent them.
     g.set(
         "GuildControlSaveRank",
-        lua.create_function(|lua, name: String| {
+        lua.create_function(|lua, name: Value| {
+            // `is-number-or-string` else `Usage: GuildControlSaveRank(name)` (`0x849c8c`,
+            // `0x4d20e8`).
+            let name = binding_abi::string_arg(lua, name, "Usage: GuildControlSaveRank(name)")?;
             let Some(name) = gated_rank_name(&name).map(str::to_string) else {
                 return Ok(());
             };
@@ -979,7 +1027,10 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     // `MAX_RANKS`, both before any packet.
     g.set(
         "GuildControlAddRank",
-        lua.create_function(|lua, name: String| {
+        lua.create_function(|lua, name: Value| {
+            // `is-number-or-string` else `Usage: GuildControlAddRank(name)` (`0x849cb0`,
+            // `0x4d2228`).
+            let name = binding_abi::string_arg(lua, name, "Usage: GuildControlAddRank(name)")?;
             let Some(name) = gated_rank_name(&name).map(str::to_string) else {
                 return Ok(());
             };
@@ -1101,7 +1152,7 @@ mod tests {
         s
     }
 
-    /// `0x4d20d0` refuses silently: a name outside 1 to 16 UTF-16 units (`0x65b250` counts them
+    /// `0x4d20d0` refuses silently: a name outside 1 to 16 code points (`0x65b250` counts them
     /// plus the NUL), no rank loaded, or a rank past the count.
     #[test]
     fn saving_a_rank_refuses_what_the_reference_refuses() {
@@ -1117,17 +1168,28 @@ mod tests {
             .unwrap();
         assert_eq!(saves(&mut s), 0, "an empty name is a silent no-op");
 
-        // Sixteen UTF-16 units is the ceiling; seventeen is refused.
+        // Sixteen code points is the ceiling; seventeen is refused.
         s.run(r#"GuildControlSetRank(2); GuildControlSaveRank(string.rep("a", 16))"#)
             .unwrap();
         assert_eq!(saves(&mut s), 1);
         s.run(r#"GuildControlSetRank(2); GuildControlSaveRank(string.rep("a", 17))"#)
             .unwrap();
-        assert_eq!(saves(&mut s), 0, "seventeen units");
+        assert_eq!(saves(&mut s), 0, "seventeen code points");
         // Units, not bytes: sixteen two-byte letters are sixteen units.
         s.run(r#"GuildControlSetRank(2); GuildControlSaveRank(string.rep("é", 16))"#)
             .unwrap();
-        assert_eq!(saves(&mut s), 1, "32 bytes, 16 units");
+        assert_eq!(saves(&mut s), 1, "32 bytes, 16 code points");
+        // A code point above U+FFFF counts one (`0x65b2f8`), though UTF-16 holds it in two units.
+        s.run(r#"GuildControlSetRank(2); GuildControlSaveRank(string.rep("a", 15) .. "\240\159\152\128")"#)
+            .unwrap();
+        assert_eq!(
+            saves(&mut s),
+            1,
+            "15 letters and one astral are 16 code points"
+        );
+        s.run(r#"GuildControlSetRank(2); GuildControlSaveRank(string.rep("a", 16) .. "\240\159\152\128")"#)
+            .unwrap();
+        assert_eq!(saves(&mut s), 0, "seventeen code points");
         // Whitespace is not empty to the reference.
         s.run(r#"GuildControlSetRank(2); GuildControlSaveRank(" ")"#)
             .unwrap();

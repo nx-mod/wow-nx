@@ -26,21 +26,25 @@ pub(crate) mod io;
 pub(crate) mod motion;
 mod objects;
 #[cfg(test)]
+pub(crate) use objects::answer_item;
+pub(crate) use objects::continue_refusal_walk;
+#[cfg(test)]
 pub(crate) use objects::wire;
 pub(crate) use objects::Listed;
 pub(crate) use objects::{release_unheld, ReleasePending};
 mod reputations;
 mod session;
+#[cfg(test)]
+pub(crate) use session::fire_worldport_timer;
+pub(crate) use session::{world_ported, PendingWorldports, WorldportTimer};
 mod world;
 
 pub(crate) use reputations::Reputations;
 
 pub(crate) use apply::apply_net_updates;
-pub(crate) use apply::enter_world_on_self_create;
-use apply::tag_self_player;
 #[cfg(test)]
 pub(crate) use game_time::GameTime;
-pub(crate) use game_time::{clock_tick, ServerTime};
+pub(crate) use game_time::{clock_tick, GameTimeLive, ServerTime};
 pub(crate) use handlers::NetHandlerApp;
 
 pub(crate) use io::LoginRequest;
@@ -69,10 +73,6 @@ pub(crate) struct NetOffline;
 
 impl Plugin for NetPlugin {
     fn build(&self, app: &mut App) {
-        // The release-on-enter for the ask-once caches this plugin owns.
-        crate::query_cache::register::<crate::names::NameCache>(app);
-        crate::query_cache::register::<crate::go_templates::GameObjectTemplates>(app);
-        crate::query_cache::register::<crate::items::Items>(app);
         let handles = io::spawn_net(self.connect);
         if !self.connect {
             app.insert_resource(NetOffline);
@@ -100,18 +100,17 @@ impl Plugin for NetPlugin {
             .init_resource::<ServerWallClock>()
             .init_resource::<Reputations>()
             .init_resource::<HomeBind>()
-            .init_resource::<PlayedTimeAnswer>()
             .init_resource::<Proficiencies>()
             .init_resource::<crate::names::NameCache>()
             .init_resource::<crate::go_templates::GameObjectTemplates>()
             .init_resource::<crate::items::Items>()
             .init_resource::<crate::world_state::WorldStates>()
+            .init_resource::<crate::world_state::WorldStateLane>()
             .add_message::<TeleportMessage>()
             .add_message::<FieldChanged>()
             .add_message::<AuraFieldsChanged>()
             .init_resource::<crate::item_lane::ItemLane>()
             .init_resource::<crate::item_watch::BagCache>()
-            .init_resource::<crate::ui_items::feed::BagView>()
             .init_resource::<crate::field_watch::NoticeLane>()
             .add_message::<SelfMoveMessage>()
             .add_message::<SpeedChangeMessage>()
@@ -133,7 +132,7 @@ impl Plugin for NetPlugin {
             .add_message::<CharRenameMessage>()
             .add_message::<CharacterLoginFailedMessage>()
             .add_message::<EnteredWorldMessage>()
-            .add_message::<WorldEnterCascadeMessage>()
+            .init_resource::<MoverClaim>()
             .add_message::<CinematicTriggeredMessage>()
             .add_message::<ServerSaidMessage>()
             .add_message::<LoggedOutMessage>()
@@ -144,12 +143,9 @@ impl Plugin for NetPlugin {
             .add_systems(
                 Update,
                 (
-                    apply_net_updates,
-                    tag_self_player,
-                    enter_world_on_self_create,
-                    // The create gives control back (`0x5deb56`), in the Net stage ahead of
-                    // `control`'s read of the flags.
-                    crate::player::regain_control_on_arrival.in_set(crate::player::ControlRestore),
+                    // Our own create, a packet, gives control back inside it (`0x5deb56`),
+                    // ahead of `control`'s read of the flags.
+                    apply_net_updates.in_set(crate::player::ControlRestore),
                     sample_splines,
                     // Swim state from the water at the feet (the wire never carries it for
                     // creatures), before the clamp so a swimmer is exempt the same frame.
@@ -169,13 +165,14 @@ impl Plugin for NetPlugin {
                 // `apply_net_updates` and before `drive_display_facing`, so the `"npc"` token is
                 // current when a window's show handler reads it.
             )
-            // Not part of the movement chain above: the cascade's time query, after the self create
+            // Not part of the movement chain above: the hourly time query, after the self create
             // has claimed the mover.
+            .init_resource::<QueryTimeAsks>()
             .add_systems(
                 Update,
                 send_query_time
                     .in_set(WorldStage::Net)
-                    .after(enter_world_on_self_create),
+                    .after(apply_net_updates),
             )
             .add_systems(Update, population_pulse.in_set(WorldStage::Net));
     }
@@ -417,7 +414,9 @@ pub(crate) fn apply_fields_for_test(world: &mut World, entity: Entity, delta: Ob
 }
 
 /// Our own character's entity (guid == [`SelfGuid`]): identity, not what we steer ([`Embodied`]).
+/// It carries what its own `ShowHelm` and `ShowCloak` calls left on its model.
 #[derive(Component)]
+#[require(crate::entities::WornPins)]
 pub(crate) struct SelfPlayer;
 
 /// The body this client is attached to: the reference's camera anchor (`camera+0x88`), written
@@ -439,6 +438,70 @@ pub(crate) struct Embodied;
 /// are attached to but lost control of still follows the server.
 #[derive(Component)]
 pub(crate) struct ActiveMover;
+
+/// `IsClientControlled` (`0x5fa5f0`): bit 0x400 of the unit's `+0xc58`, which the control update
+/// sets or clears on its unit (`0x5fa62a`, `0x5fa631`, stored at `0x5fa636`) and only the
+/// constructor clears besides (`0x5fae7a`), so it outlives a release. Our own character's is read
+/// off [`crate::player::OwnControlLost`], which the same update writes beside it.
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub(crate) struct ClientControlled;
+
+/// The active-mover global (`0xc4da98`/`0xc4da9c`) as the claims read it: the guid the last
+/// `SetActiveMover` (`0x6006e0`) stored, or none. A claim of the guid it holds returns at once
+/// (`0x6006ee`-`0x6006fb` → `0x600852`), so `CMSG_SET_ACTIVE_MOVER` goes out only on a change.
+/// It is zeroed at every world entry (`CGUnit_C::Initialize`, `0x6039a9`, from
+/// `ClientInitializeGame` at `0x401639`), by the destructor of the unit it names
+/// (`0x5fb631`-`0x5fb655`), which a world load (`0x401bf7`) and the game's teardown (`0x402011`)
+/// run on every object through `ClntObjMgrDestroy` (`0x467700` → `0x467800`), by that unit's
+/// release (`0x5fbc26`-`0x5fbc3b` → `0x6006b0`), and by a control update that stops it
+/// (`0x5fa678`-`0x5fa696`).
+#[derive(Resource, Default)]
+pub(crate) struct MoverClaim(Option<u64>);
+
+impl MoverClaim {
+    /// `SetActiveMover(guid)`: whether the global moved, stored as it does (`0x600791`), with
+    /// `CMSG_SET_ACTIVE_MOVER` sent for a guid that is not zero (`0x6007a5`, `0x6007ae`).
+    pub(crate) fn claim(&mut self, guid: u64, net: &NetCommands) -> bool {
+        let guid = (guid != 0).then_some(guid);
+        if self.0 == guid {
+            return false;
+        }
+        self.0 = guid;
+        if let Some(guid) = guid {
+            let _ = net.0.send(ClientCommand::SetActiveMover { guid });
+        }
+        true
+    }
+
+    /// The guid the global names.
+    pub(crate) fn get(&self) -> Option<u64> {
+        self.0
+    }
+
+    /// Whether the global names `guid` (`0x6103a0`'s first test).
+    pub(crate) fn holds(&self, guid: u64) -> bool {
+        self.0 == Some(guid)
+    }
+
+    /// The unit `guid` gone or stopped: the global is zeroed when it names it.
+    pub(crate) fn forget(&mut self, guid: u64) {
+        if self.0 == Some(guid) {
+            self.0 = None;
+        }
+    }
+
+    /// The world entry's zeroing (`0x6039a9`).
+    pub(crate) fn reset(&mut self) {
+        self.0 = None;
+    }
+
+    /// A teardown that freed objects: the global is zeroed when its unit is no longer held.
+    pub(crate) fn forget_unless_held(&mut self, index: &GuidIndex) {
+        if self.0.is_some_and(|g| !index.0.contains_key(&g)) {
+            self.0 = None;
+        }
+    }
+}
 
 // ── ECS state: resources ─────────────────────────────────────────────────────────────────────────
 
@@ -765,24 +828,42 @@ impl ServerWallClock {
 /// `[0xbb749c]`, armed `now + 0xe10` at `0x4def11`).
 const RESYNC_AFTER: Duration = Duration::from_secs(3600);
 
-/// Ask for the server's wall clock at each world-enter cascade (the quest-log init `0x4de430`,
-/// called at `0x4909a1`, sends it at `0x4de45b`) and hourly after, which tracks a server
+/// When the wall clock was last asked for, and whether a cascade has seated us since the session
+/// began, which the hourly resync waits for.
+#[derive(Resource, Default)]
+pub(crate) struct QueryTimeAsks {
+    asked_at: Option<Instant>,
+    seated: bool,
+}
+
+/// Ask for the server's wall clock in each world-enter cascade's place (the quest-log init
+/// `0x4de430`, called at `0x4909a1`, sends it at `0x4de45b`, [`crate::ui_world_enter`]).
+pub(crate) fn query_time_at_world_enter(
+    asks: Option<ResMut<QueryTimeAsks>>,
+    commands: Res<NetCommands>,
+) {
+    if let Some(mut asks) = asks {
+        asks.asked_at = Some(Instant::now());
+        asks.seated = true;
+    }
+    let _ = commands.0.send(ClientCommand::QueryTime);
+}
+
+/// Ask for the server's wall clock hourly after a cascade asked it, which tracks a server
 /// re-clocked under us.
 pub(crate) fn send_query_time(
-    mut cascades: MessageReader<WorldEnterCascadeMessage>,
     commands: Res<NetCommands>,
     clock: Res<ServerWallClock>,
     status: Res<NetStatus>,
-    mut asked_at: Local<Option<Instant>>,
-    mut seated: Local<bool>,
+    mut asks: ResMut<QueryTimeAsks>,
 ) {
-    let entering = cascades.read().next().is_some();
     // `connected` rises at `CMSG_PLAYER_LOGIN`, before the server seats us, so the resync waits
     // for the first cascade; a logout or a disconnect clears `connected` and so the wait re-arms.
-    *seated = status.connected && (*seated || entering);
-    let due = *seated && clock.stale() && asked_at.is_none_or(|t| t.elapsed() >= RESYNC_AFTER);
-    if entering || due {
-        *asked_at = Some(Instant::now());
+    asks.seated &= status.connected;
+    let due =
+        asks.seated && clock.stale() && asks.asked_at.is_none_or(|t| t.elapsed() >= RESYNC_AFTER);
+    if due {
+        asks.asked_at = Some(Instant::now());
         let _ = commands.0.send(ClientCommand::QueryTime);
     }
 }
@@ -791,11 +872,6 @@ pub(crate) fn send_query_time(
 /// token names.
 #[derive(Resource, Default)]
 pub(crate) struct HomeBind(pub(crate) Option<u32>);
-
-/// The undelivered `/played` answer (`SMSG_PLAYED_TIME`): total seconds and seconds this level.
-/// One slot: the server sends one reply per request.
-#[derive(Resource, Default)]
-pub(crate) struct PlayedTimeAnswer(pub(crate) Option<(u32, u32)>);
 
 /// Equip proficiencies (`SMSG_SET_PROFICIENCY`): item class (2 weapon, 4 armor) to a subclass
 /// bitmask, the client's `0xc4d4a0[class]` store.
@@ -1070,6 +1146,13 @@ pub(crate) enum ClientCommand {
     /// gift instead changes entry in place with no window.
     OpenItem {
         bag_index: u8,
+        slot: u8,
+    },
+    /// `CMSG_READ_ITEM`: the bag (255 for the player's own slots, else the equipped bag's inventory
+    /// slot) and the slot; the server answers `SMSG_READ_ITEM_OK` or `SMSG_READ_ITEM_FAILED` on the
+    /// item's guid.
+    ReadItem {
+        bag: u8,
         slot: u8,
     },
     /// `CMSG_WRAP_ITEM`, the paper first as on the wire. The client filters nothing; the server
@@ -1776,7 +1859,7 @@ pub(crate) enum ClientCommand {
         target: u64,
     },
     /// `CMSG_BEGIN_TRADE`: accept a request; the server sends `OPEN_WINDOW` to both. Sent only by
-    /// [`crate::ui_trade::answer_trade_request`].
+    /// [`crate::ui_trade::answer_request`].
     BeginTrade,
     /// `CMSG_IGNORE_TRADE` (`0x119`): the refusal ladder's ignore leg (`0x4bf759` to `0x5d41c0`);
     /// vmangos answers the initiator `TRADE_STATUS_IGNORE_YOU`.
@@ -2314,12 +2397,6 @@ pub(crate) struct EnteredWorldMessage {
     pub(crate) tutorial_flags: Option<Vec<u8>>,
 }
 
-/// The reference's world-enter cascade (`0x4908c0`) ran: our own player's create, at login and
-/// every cross-map worldport ([`enter_world_on_self_create`]), or a `/reload`. Its sends wait for
-/// this, not [`EnteredWorldMessage`], which fires before the server has seated the player.
-#[derive(Message)]
-pub(crate) struct WorldEnterCascadeMessage;
-
 /// `SMSG_ADDON_INFO`: the addons the server hid from the Lua index space, or `None` if it did
 /// not answer. A resource, since it must exist before the world-entry UI load runs any addon;
 /// rewritten on every login from the reply its link got.
@@ -2381,14 +2458,18 @@ impl DisconnectedMessage {
     /// login env vars: a person's launch line sets them too, and a reconnect would take the
     /// account back from whoever displaced us.
     pub(crate) fn new(reason: String, end: benilla_protocol::SessionEnd) -> Self {
-        let session_over =
-            end == benilla_protocol::SessionEnd::Lost && !crate::run_mode::unattended();
         Self {
             reason,
             end,
-            session_over,
+            session_over: session_over(end),
         }
     }
+}
+
+/// Whether a session that ended with `end` is over, back at the account screen with nothing
+/// retried ([`DisconnectedMessage::session_over`]): a loss outside an unattended run.
+pub(crate) fn session_over(end: benilla_protocol::SessionEnd) -> bool {
+    end == benilla_protocol::SessionEnd::Lost && !crate::run_mode::unattended()
 }
 
 /// A login attempt failed before the roster; the IO thread is back at its pre-logon park.

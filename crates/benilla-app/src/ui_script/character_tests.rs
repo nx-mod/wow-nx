@@ -398,7 +398,7 @@ fn close_button_draws_above_the_paper_doll_page() {
 
 /// `PaperDollFrame_SetLevel` writes `PLAYER_LEVEL` to `CharacterLevelText` and `HonorLevelText`
 /// (`PaperDollFrame.lua:100-103`); `UNIT_LEVEL` repaints it while the page shows (`:42-49`). A nil
-/// race raises in its `format`, and `ui_unit::feed_units` always pushes the player snapshot before
+/// race raises in its `format`, and the getters read the player through the host before
 /// `PLAYER_ENTERING_WORLD`, so the test seats one first.
 #[test]
 fn level_line_reads_the_snapshot_and_repaints_on_unit_level() {
@@ -462,6 +462,8 @@ fn clicking_an_occupied_doll_slot_picks_it_up_and_locks_it() {
     s.set_unit("player", Some(player_unit()));
     s.set_player_combat_stats(Some(combat_stats()));
     s.set_inventory_slots(inventory_with_head_item());
+    // The worn item's watcher runs the alert recompute, whose event repaints the slots.
+    s.recompute_inventory_alerts();
     // Shown, so extract() emits the slot quads.
     s.run(r#"ToggleCharacter("PaperDollFrame")"#).unwrap();
     s.take_sounds();

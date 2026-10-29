@@ -3,6 +3,7 @@
 use mlua::{Lua, MultiValue, Value};
 
 use crate::script::container::ContainerMove;
+use crate::script::merchant::VendorAtCall;
 use crate::script::tick::verb;
 use crate::script::{ItemCall, Model};
 
@@ -68,14 +69,19 @@ enum Dest {
 /// `PutItemInBag(inventorySlot)` (`0x4c7c00`): true (the reference's `1`) when the click was
 /// consumed against an occupied slot, else false (nil). An empty cursor's nil is what lets
 /// `BagSlotButton_OnClick` open the bag.
-pub(super) fn put_item_in_bag(model: &mut Model, live: u32) -> bool {
-    accepts(live) && put_item(model, Dest::Slot(live))
+pub(super) fn put_item_in_bag(
+    lua: &Lua,
+    model: &mut Model,
+    live: u32,
+    vendor: VendorAtCall,
+) -> bool {
+    accepts(live) && put_item(lua, model, Dest::Slot(live), vendor)
 }
 
 /// `PutItemInBackpack()`, the worker on the player's own guid (`0x4c7ed0`): the empty-slot leg is
 /// unreachable and `0x4c7d3e` skips the swap, so even a bag is stored into the backpack.
-pub(super) fn put_item_in_backpack(model: &mut Model) -> bool {
-    put_item(model, Dest::Backpack)
+pub(super) fn put_item_in_backpack(lua: &Lua, model: &mut Model, vendor: VendorAtCall) -> bool {
+    put_item(lua, model, Dest::Backpack, vendor)
 }
 
 /// The worker `0x4c7c00`, in its order:
@@ -89,7 +95,7 @@ pub(super) fn put_item_in_backpack(model: &mut Model) -> bool {
 /// - a vendor row buys into the bag (`0x4c7e66`), then clears and answers nil;
 /// - a bag held from a bag slot, or any container, swaps (`0x4c7d44`-`0x4c7df5`), a backpack
 ///   destination excepted (`0x4c7d3e`); anything else is stored (`0x4c7e0c`-`0x4c7e55`).
-fn put_item(model: &mut Model, dest: Dest) -> bool {
+fn put_item(lua: &Lua, model: &mut Model, dest: Dest, vendor: VendorAtCall) -> bool {
     if !model.player_control {
         return false;
     }
@@ -101,14 +107,14 @@ fn put_item(model: &mut Model, dest: Dest) -> bool {
             }
             let occupant = usize::try_from(live)
                 .ok()
-                .and_then(|slot| model.own_inv_view(slot))
+                .and_then(|slot| crate::script::char_stats::own_inv_view(lua, model, slot))
                 .map(|s| s.guid);
             let Some(occupant) = occupant else {
                 // The doll click on the empty slot: it places or buys what is held, and with
                 // nothing held finds nothing to pick up, so it owes no pickup. A held item takes
                 // the click before an armed item pick (`0x4c769a`), so no gate is reached.
                 // A swap into the empty slot has no occupant to lock.
-                let click = doll_click(model, live, true);
+                let click = doll_click(lua, model, live, true, vendor);
                 debug_assert!(matches!(click, DollClick::Done(_) | DollClick::Swapped(0)));
                 return false;
             };
@@ -121,21 +127,17 @@ fn put_item(model: &mut Model, dest: Dest) -> bool {
             clear_cursor(model);
             true
         }
-        Some(CursorPayload::Item(held)) => place_held(model, dest, held),
+        Some(CursorPayload::Item(held)) => place_held(lua, model, dest, held),
         // Mode 5 with a vendor open: one of the row's item into the bag, slot `0xFF`, count 1
         // (`0x4c7e6f`-`0x4c7eaa`), the item the row names now. Deviation: a row index the list no
         // longer holds buys nothing and drops, where this site reads through a null row
         // (`0x4c7e9a`, `0x4c7ea5`).
-        Some(CursorPayload::Merchant(row)) => {
-            let entry = model
-                .merchant
-                .as_ref()
-                .and_then(|m| m.items.get(row.row as usize))
-                .map(|it| it.item_id);
-            if let Some(entry) = entry {
-                model
-                    .merchant_drops
-                    .push(crate::script::MerchantCall::BuyIntoBag { bag_guid, entry });
+        Some(CursorPayload::Merchant(_)) => {
+            if let Some(entry) = vendor.held_entry {
+                model.merchant_call_in_verb(crate::script::MerchantCall::BuyIntoBag {
+                    bag_guid,
+                    entry,
+                });
             }
             clear_cursor(model);
             false
@@ -148,7 +150,7 @@ fn put_item(model: &mut Model, dest: Dest) -> bool {
 }
 
 /// The worker's item legs past its cancels' guid test (`0x4c7cea` on).
-fn place_held(model: &mut Model, dest: Dest, held: CursorItem) -> bool {
+fn place_held(lua: &Lua, model: &mut Model, dest: Dest, held: CursorItem) -> bool {
     // A held item that lives in this very bag cancels: its container guid is the destination's
     // (`0x4c7cea`-`0x4c7cf6`), the backpack's being the player's, where only an item from the
     // backpack's own slots 23-38 cancels (`0x4c7cf8`-`0x4c7d0f`).
@@ -172,10 +174,11 @@ fn place_held(model: &mut Model, dest: Dest, held: CursorItem) -> bool {
             // split count, so a split carry swaps its whole stack.
             let occupant = usize::try_from(live)
                 .ok()
-                .and_then(|slot| model.own_inv_view(slot))
+                .and_then(|slot| crate::script::char_stats::own_inv_view(lua, model, slot))
                 .map_or(0, |s| s.guid);
             lock_item(model, occupant);
             super::swap::swap_and_file(
+                lua,
                 model,
                 ContainerMove {
                     src_bag: held.bag,
@@ -197,14 +200,12 @@ fn place_held(model: &mut Model, dest: Dest, held: CursorItem) -> bool {
             None => return false,
         },
     };
-    model
-        .item_calls
-        .push(ItemCall::AutoStore(crate::script::BagAutoStore {
-            src_bag: held.bag,
-            src_slot: held.slot,
-            dst_bag,
-            count: held.count,
-        }));
+    model.item_call(ItemCall::AutoStore(crate::script::BagAutoStore {
+        src_bag: held.bag,
+        src_slot: held.slot,
+        dst_bag,
+        count: held.count,
+    }));
     // `ClearCursor(0,1)` past the send (`0x4c7e55`), locking nothing new.
     clear(model, Clear::KEEP_LOCK);
     true
@@ -227,7 +228,7 @@ pub(super) fn pickup_bag_from_slot(lua: &Lua, live: u32) -> mlua::Result<()> {
             !model.player_control || (BANK_BAG_INV_SLOTS.contains(&live) && model.bank.is_none());
         let occupied = usize::try_from(live)
             .ok()
-            .and_then(|slot| model.own_inv_view(slot))
+            .and_then(|slot| crate::script::char_stats::own_inv_view(lua, &model, slot))
             .is_some_and(|s| s.item_id != 0);
         (gated, occupied)
     };
@@ -245,7 +246,7 @@ pub(super) fn pickup_bag_from_slot(lua: &Lua, live: u32) -> mlua::Result<()> {
     }
     let picked = {
         let model = lua.app_data_ref::<Model>().expect("model app_data");
-        grab_bag(&model, live)
+        grab_bag(lua, &model, live)
     };
     if let Some(item) = picked {
         pick_up_item(lua, item);
@@ -255,10 +256,10 @@ pub(super) fn pickup_bag_from_slot(lua: &Lua, live: u32) -> mlua::Result<()> {
 
 /// `PickupBagFromSlot`'s grab: an unlocked container in `live` (`0x4c7bc1`), which it picks up
 /// with `SetCursorItem(1, …)` and `LockItem` (`0x4c7be2`, `0x4c7be9`).
-fn grab_bag(model: &Model, live: u32) -> Option<CursorItem> {
+fn grab_bag(lua: &Lua, model: &Model, live: u32) -> Option<CursorItem> {
     usize::try_from(live)
         .ok()
-        .and_then(|slot| model.own_inv_view(slot))
+        .and_then(|slot| crate::script::char_stats::own_inv_view(lua, model, slot))
         .filter(|s| s.item_id != 0 && !item_locked(model, s.guid))
         .map(|s| CursorItem {
             item_class: None,
@@ -305,18 +306,16 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             // `Invalid bag slot in PutItemInBag` (`0x848b84`) unless the slot reader passes and
             // the slot is a bag's or beyond, Lua 20 up (`0x4c8f13`, `0x4c8f1f`).
             let live = bag_slot(lua, live, "Invalid bag slot in PutItemInBag")?;
-            let answer = verb(lua, |model| put_item_in_bag(model, live));
-            crate::script::item_calls::submit_item_calls(lua)?;
-            crate::script::merchant::submit_slot_buys(lua)?;
+            let vendor = crate::script::merchant::at_call(lua);
+            let answer = verb(lua, |model| put_item_in_bag(lua, model, live, vendor));
             consumed(answer)
         })?,
     )?;
     g.set(
         "PutItemInBackpack",
         lua.create_function(|lua, ()| {
-            let answer = verb(lua, put_item_in_backpack);
-            crate::script::item_calls::submit_item_calls(lua)?;
-            crate::script::merchant::submit_slot_buys(lua)?;
+            let vendor = crate::script::merchant::at_call(lua);
+            let answer = verb(lua, |model| put_item_in_backpack(lua, model, vendor));
             consumed(answer)
         })?,
     )?;

@@ -1,20 +1,24 @@
 //! Death and resurrection: the wire-fed stores, the events into the Lua UI and the intents back
-//! to the wire. Dead is health 0 and ghost is `PLAYER_FLAGS` bit 0x10, read off the self
-//! descriptor each frame; `PLAYER_DEAD` signals inside our own death's handler
-//! ([`signal_death_state`]) and at a VM's first sight of the body dead, and `PLAYER_ALIVE` on
-//! release and on a pre-release res.
-//! `PLAYER_UNGHOST` is the ghost state's (`0x5de9c0`), signalled where it runs: the ghost bit's
-//! clear ([`crate::field_watch`]) and an alive arrival (`crate::ui_unit`).
+//! to the wire. Dead is health 0 and ghost is `PLAYER_FLAGS` bit 0x10. The getters read the
+//! stores through the host as they run ([`DeathView`]). The death state signals (`PLAYER_DEAD` or
+//! `PLAYER_ALIVE`) inside our own death's handler and after each arrival's world-enter cascade
+//! ([`signal_death_state`]), and `PLAYER_ALIVE` in the health watcher's revive arm, on release
+//! and on a res ([`crate::field_watch`]). The offers and the corpse-range signals that packets
+//! raise go on the dialogs' lane at their handlers ([`net`]); the corpse range's own poll runs in
+//! the world frame's update ([`poll_corpse`]). The cascade releases a body it finds dead
+//! ([`repop_on_world_enter`]). `PLAYER_UNGHOST` is the ghost state's (`0x5de9c0`), signalled where
+//! it runs: the ghost bit's clear ([`crate::field_watch`]) and an alive arrival (`crate::ui_unit`).
 
 use bevy::prelude::*;
 
 use benilla_assets::coords::wow_to_bevy;
-use benilla_ui::script::{DeathAction, DeathUiState, ScriptValue, UiScript};
+use benilla_ui::script::{
+    DeathAction, DeathQuery, DeathUiState, ResSicknessLevelQuery, ScriptValue, UiScript,
+};
 
 use crate::net::{ClientCommand, NetCommands, ObjectStore, Objects, SelfGuid, SelfPlayer};
 use crate::query_cache::Ask;
 use crate::ui_action::Spells;
-use crate::ui_script::UiFeed;
 
 pub(crate) mod net;
 
@@ -41,13 +45,17 @@ pub(crate) struct ResurrectOffer {
     pub(crate) sickness: bool,
     /// The reclaim-delay gate still holds: RESURRECT, not RESURRECT_NO_TIMER.
     pub(crate) has_timer: bool,
+    /// The caster's name was asked with the callback `0x5e7ca0` (`0x5e7c82`), whose answer shows
+    /// the offer or forgets it.
+    pub(crate) waits_name: bool,
 }
 
 /// The release timer our own death arms (`0x5e99b0`, `0xb4e340` and its no-timer byte
 /// `0xb4e344`), which `GetReleaseTimeRemaining` reads (`0x4962a0`).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) enum ReleaseTimer {
-    /// No death this session armed it.
+    /// No death since the interface started armed it: `UI_Init` zeroes it at each login and
+    /// `/reload` (`0x490131`, `0x490137`), and `GetReleaseTimeRemaining` answers 0 (`0x4962b6`).
     #[default]
     Unset,
     /// Released at this real time: the death's time plus 360000 ms (`0x5e9a30` → `0x496250`).
@@ -67,22 +75,15 @@ pub(crate) struct DeathNet {
     pub(crate) release: ReleaseTimer,
     /// When the corpse becomes reclaimable: `SMSG_CORPSE_RECLAIM_DELAY` anchored at arrival.
     pub(crate) reclaim_at: Option<f64>,
-    /// Bumped per `SMSG_CORPSE_RECLAIM_DELAY`: the 1.12 client's handler re-fires the range
-    /// events on each.
-    pub(crate) reclaim_generation: u32,
     /// The last `MSG_CORPSE_QUERY` answer; a not-found drops it.
     pub(crate) corpse: Option<CorpsePoint>,
-    /// A pending resurrection offer; cleared when answered or when the popup times out.
+    /// A pending resurrection offer (`[0xc4d760]`); cleared when answered, or by a refused name.
     pub(crate) resurrect: Option<ResurrectOffer>,
-    /// Bumped per `SMSG_RESURRECT_REQUEST`: the offer announces per message (`0x5e7bc0` through
-    /// `0x5ded50`), because the stock UI can hide the popup without answering it.
-    pub(crate) resurrect_generation: u32,
     /// Our streamed corpse object's guid, which `CMSG_RECLAIM_CORPSE` carries like the 1.12 client.
     pub(crate) corpse_guid: Option<u64>,
-    /// The spirit healer awaiting the XP-loss answer; Accept sends `CMSG_SPIRIT_HEALER_ACTIVATE`.
+    /// The spirit healer awaiting the XP-loss answer (`[0xc4d798]`); Accept sends
+    /// `CMSG_SPIRIT_HEALER_ACTIVATE`.
     pub(crate) spirit_healer: Option<u64>,
-    /// Bumped per ask: a Cancel clears nothing, so only a fresh ask re-shows the dialog.
-    pub(crate) confirm_generation: u32,
     /// Water-walking is granted on our mover; mirrored, not applied: walking on the water surface
     /// is not built.
     #[allow(dead_code)]
@@ -100,57 +101,90 @@ impl DeathNet {
         };
     }
 
-    /// Arm the spirit healer's XP-loss question. The reference raises it on the click with no
-    /// packet (`0x5df730`), and vmangos also pushes `SMSG_SPIRIT_HEALER_CONFIRM`; both come here.
-    pub(crate) fn ask_spirit_healer(&mut self, npc: u64) {
-        self.spirit_healer = Some(npc);
-        self.confirm_generation = self.confirm_generation.wrapping_add(1);
+    /// Zero the release timer, as `UI_Init` does at each login and `/reload` (`0x490131`,
+    /// `0x490137`): only a death since writes it (`0x5e9a35`, `0x5e9a3c`).
+    pub(crate) fn zero_release(&mut self) {
+        self.release = ReleaseTimer::Unset;
     }
 }
 
-/// The feed's memory in two scopes: the body's state and the release window's anchor survive a
-/// `/reload`, while what the VM was told dies with the VM.
+/// The interface's death globals beside the stores, world-scoped and cleared at the session's end:
+/// the body's last state, which the corpse asks' edges compare, and the corpse-range latch. A
+/// `/reload` keeps both.
 #[derive(Resource, Default)]
-struct DeathFeedState {
-    /// World-scoped: the last `(guid, dead, ghost)` the self body showed.
+pub(crate) struct DeathLatches {
+    /// The last `(guid, dead, ghost)` the self body showed.
     mirror: Option<(u64, bool, bool)>,
-    /// World-scoped: when the body was first seen dead, the release window's anchor while no
-    /// death this session armed the timer ([`ReleaseTimer::Unset`]).
-    died_at: Option<f64>,
-    /// VM-scoped: the announce latches.
-    vm: crate::ui_script::VmMemo<DeathAnnounced>,
+    /// The corpse-range latch `[0xb4e324]`: whether the last verdict signalled was in range
+    /// (`0x4920f0`), which the cascade's corpse step zeroes into whichever VM is live.
+    corpse_in_range: bool,
 }
 
-/// What the live VM has been told; a first snapshot counts as an edge, so logging in or
-/// reloading dead brings the popup up.
-///
-/// Deviation: a `/reload` dead keeps the release window and signals `PLAYER_DEAD` again, where
-/// the reference zeroes the timer at every UI start (`0x490131`) and its cascade never calls
-/// `0x495850` (`0x490168`), because without both a player who reloads dead has no Release.
-#[derive(Default)]
-struct DeathAnnounced {
-    /// The last `(guid, dead, ghost)` this VM was given an event for.
-    last: Option<(u64, bool, bool)>,
-    /// The last corpse-range verdict announced.
-    corpse_range: Option<CorpseRange>,
-    /// A fresh reclaim delay re-fires the range events, as the 1.12 client does (`0x4962d0`),
-    /// so RECOVER_CORPSE re-shows with the new delay.
-    reclaim_generation: u32,
-    /// Held back while a player caster's name is still resolving.
-    offer_generation: u32,
-    /// The offer whose caster's name was looked up as its packet's (`0x5e7c82`, callback
-    /// `0x5e7ca0`): the frames that wait on it read.
-    offer_asked: u32,
-    /// A fresh ask re-fires `CONFIRM_XP_LOSS`.
-    confirm_generation: u32,
+impl DeathLatches {
+    /// The corpse-range latch set, as a ghost in range of its corpse left it.
+    #[cfg(test)]
+    pub(crate) fn latch_corpse_in_range_for_test(&mut self) {
+        self.corpse_in_range = true;
+    }
+
+    /// `SetCorpseInRange 0x4920f0`: on a change (`0x4920f6`), the latch stored and its signal,
+    /// [`CorpseSignal::in_range`] for in range, `CORPSE_OUT_OF_RANGE` (399, `0x49211f`) for out.
+    fn set_in_range(
+        &mut self,
+        in_range: bool,
+        corpse: Option<&CorpsePoint>,
+    ) -> Option<CorpseSignal> {
+        if std::mem::replace(&mut self.corpse_in_range, in_range) == in_range {
+            return None;
+        }
+        Some(if in_range {
+            CorpseSignal::in_range(corpse)
+        } else {
+            CorpseSignal::Out
+        })
+    }
 }
 
-/// The corpse-range verdicts the reference's events distinguish.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum CorpseRange {
-    Out,
+/// A corpse-range event, each argumentless (`0x703e50`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CorpseSignal {
+    /// `CORPSE_IN_RANGE` (397).
     In,
+    /// `CORPSE_IN_INSTANCE` (398).
     InInstance,
+    /// `CORPSE_OUT_OF_RANGE` (399).
+    Out,
+}
+
+impl CorpseSignal {
+    /// The in-range event for the cached corpse: [`Self::InInstance`] when the cache's display
+    /// map is not the corpse's own, a dungeon's entrance (`0x492102`-`0x492114`,
+    /// `0x4962f5`-`0x496307`).
+    fn in_range(corpse: Option<&CorpsePoint>) -> Self {
+        if corpse.is_some_and(|c| u32::try_from(c.display_map) != Ok(c.corpse_map)) {
+            Self::InInstance
+        } else {
+            Self::In
+        }
+    }
+
+    /// Signalled in place.
+    fn fire(self, script: &mut UiScript) {
+        match self {
+            Self::In => script.fire_event("CORPSE_IN_RANGE", vec![]),
+            Self::InInstance => script.fire_event("CORPSE_IN_INSTANCE", vec![]),
+            Self::Out => script.fire_event("CORPSE_OUT_OF_RANGE", vec![]),
+        }
+    }
+
+    /// Queued on the dialogs' lane at a handler's place.
+    fn queue(self, lane: &mut crate::ui_dialog_verbs::DialogLane) {
+        match self {
+            Self::In => lane.event("CORPSE_IN_RANGE", vec![]),
+            Self::InInstance => lane.event("CORPSE_IN_INSTANCE", vec![]),
+            Self::Out => lane.event("CORPSE_OUT_OF_RANGE", vec![]),
+        }
+    }
 }
 
 /// The corpse-range dialog radius, 40 yd inclusive: the 1.12 client compares d² ≤ `[0xb4e2ac]`
@@ -161,10 +195,10 @@ const CORPSE_RANGE_SQ: f32 = 40.0 * 40.0;
 /// The spirit-healer dialog range: `CheckSpiritHealerDist` compares d² ≤ `[0xc4c28c]` (30.864).
 const SPIRIT_HEALER_RANGE_SQ: f32 = 5.5556 * 5.5556;
 
-/// What the death snapshot reads ([`DeathView::snapshot`]): the self body, the death stores and
-/// what `HasSoulstone()` walks.
+/// What the death getters read through the host as they run ([`DeathQuery`]): the self body, the
+/// death stores and what `HasSoulstone()` walks.
 #[derive(bevy::ecs::system::SystemParam)]
-struct DeathView<'w, 's> {
+pub(crate) struct DeathView<'w, 's> {
     self_q: Query<'w, 's, (&'static ObjectStore, &'static Transform), With<SelfPlayer>>,
     self_guid: Res<'w, SelfGuid>,
     death_net: Res<'w, DeathNet>,
@@ -189,47 +223,30 @@ impl DeathView<'_, '_> {
         Some((guid, store, self_t))
     }
 
-    /// The snapshot the death verbs read, pushed before an event fires so its handlers read
-    /// current values. `died_at` anchors the release window while no death armed it.
-    fn snapshot(
-        &self,
-        script: &UiScript,
-        store: &ObjectStore,
-        self_t: &Transform,
-        died_at: Option<f64>,
-    ) -> DeathUiState {
+    /// The death state as the getters read it now: the timers off the stores, and what reads
+    /// the live body (the healer's range, the self-res) while one is held.
+    fn state(&self) -> DeathUiState {
         let now = self.time.elapsed_secs_f64();
         let death_net = &self.death_net;
         let release_remaining = match death_net.release {
             ReleaseTimer::At(at) => Some((at - now).max(0.0) as f32),
             ReleaseTimer::Off => None, // GetReleaseTimeRemaining() == -1, the no-timer DEATH text
-            // Deviation: with no death this session to arm it (dead at login or after a
-            // `/reload`), the window runs from the first sight of the body dead, while the bit is
-            // set. The reference zeroes the timer at every UI start (`0x490131`) and answers 0
-            // (`0x4962a0`), so its DEATH popup never shows and the player has no Release.
-            ReleaseTimer::Unset if store.0.player_release_timer_running() => {
-                died_at.map(|t| ((t + RELEASE_WINDOW_SECS - now).max(0.0)) as f32)
-            }
-            ReleaseTimer::Unset => None,
+            // A zero timer answers 0 (`0x4962b4`-`0x4962cc`), so no DEATH popup shows.
+            ReleaseTimer::Unset => Some(0.0),
         };
         let recovery_delay = death_net
             .reclaim_at
             .map_or(0.0, |at| (at - now).max(0.0) as f32);
-        let spirit_healer_in_range = death_net.spirit_healer.is_some_and(|npc| {
-            self.objects
-                .entity(npc)
-                .and_then(|e| self.transforms.get(e).ok())
-                .is_some_and(|t| {
-                    t.translation.distance_squared(self_t.translation) <= SPIRIT_HEALER_RANGE_SQ
-                })
-        });
-        let sickness = sickness_duration(store.0.unit_level().unwrap_or(0), &|key: &str| {
-            script
-                .lua()
-                .globals()
-                .get::<String>(key)
-                .ok()
-                .filter(|t| !t.is_empty())
+        let body = self.body();
+        let spirit_healer_in_range = body.is_some_and(|(_, _, self_t)| {
+            death_net.spirit_healer.is_some_and(|npc| {
+                self.objects
+                    .entity(npc)
+                    .and_then(|e| self.transforms.get(e).ok())
+                    .is_some_and(|t| {
+                        t.translation.distance_squared(self_t.translation) <= SPIRIT_HEALER_RANGE_SQ
+                    })
+            })
         });
         DeathUiState {
             release_remaining,
@@ -237,180 +254,121 @@ impl DeathView<'_, '_> {
             resurrect_sickness: death_net.resurrect.as_ref().is_some_and(|o| o.sickness),
             resurrect_has_timer: death_net.resurrect.as_ref().is_some_and(|o| o.has_timer),
             spirit_healer_in_range,
-            sickness_duration: sickness,
+            // Worded by the getter off [`ResSicknessLevelQuery`].
+            sickness_duration: None,
             // `HasSoulstone()`; the dead gate is first, so the inventory walk runs only while dead.
-            self_res_label: resolve_self_res(
-                &store.0,
-                &self.objects,
-                &self.items,
-                self.spells.as_deref(),
-            )
-            .map(|r| r.label().to_owned()),
+            self_res_label: body.and_then(|(_, store, _)| {
+                resolve_self_res(&store.0, &self.objects, &self.items, self.spells.as_deref())
+                    .map(|r| r.label().to_owned())
+            }),
         }
     }
 }
 
-/// Derive the death state from the self descriptor, push the snapshot, and fire the death events
-/// on its edges.
-fn feed_death(
-    // The death stores, which the death calls write: an engine turn, its events signalled after.
-    mut vm: crate::script_calls::VmWith<DeathView<'static, 'static>>,
-    mut feed: ResMut<DeathFeedState>,
-    names: Res<crate::names::NameCache>,
-    net: Res<NetCommands>,
-    map: Option<Res<benilla_world::world_map::CurrentMap>>,
-) {
-    vm.turn(|script, view| {
-        let Some(script) = script else {
+/// The death getters' family of the host's live reads.
+impl crate::script_calls::live::LiveFamily for DeathView<'_, '_> {
+    fn answer(&mut self, ask: &mut benilla_ui::script::live::LiveAsk<'_>) -> bool {
+        ask.answer(|_: &DeathQuery| Some(self.state()))
+            || ask.answer(|_: &ResSicknessLevelQuery| {
+                self.body()
+                    .map(|(_, store, _)| store.0.unit_level().unwrap_or(0))
+            })
+    }
+}
+
+/// What the corpse poll reads and writes beside the host: the self body and the session, the
+/// death stores, the latches and the map shown.
+type CorpsePoll = (
+    Query<'static, 'static, (&'static ObjectStore, &'static Transform), With<SelfPlayer>>,
+    Res<'static, SelfGuid>,
+    Res<'static, crate::net::NetStatus>,
+    Res<'static, DeathNet>,
+    ResMut<'static, DeathLatches>,
+    Option<Res<'static, benilla_world::world_map::CurrentMap>>,
+);
+
+/// `CheckCorpseRange 0x492130`, which the world frame's update runs every frame after its pick
+/// (`0x4818c5`, in `0x481790`'s unconditional tail): a ghost on the map shown within 40 yards of
+/// the cached corpse is in range (`0x492196`), and `SetCorpseInRange` signals a change in place
+/// ([`DeathLatches::set_in_range`]). Ahead of it, the corpse asks of the ghost bit's edges, which
+/// a `/reload` must not repeat.
+pub(crate) fn poll_corpse(mut vm: crate::script_calls::VmWith<CorpsePoll>, net: Res<NetCommands>) {
+    let signal = {
+        let (self_q, self_guid, status, death_net, mut latches, map) = vm.own();
+        // A disconnect keeps the self avatar with its frozen descriptor; only a live session's
+        // body counts.
+        let body = self_guid
+            .0
+            .filter(|_| status.connected)
+            .and_then(|guid| Some((guid, self_q.single().ok()?)));
+        let Some((guid, (store, self_t))) = body else {
             return;
         };
-        let Some((guid, store, self_t)) = view.body() else {
-            return;
-        };
-        let death_net = &view.death_net;
-        let now = view.time.elapsed_secs_f64();
         let dead = store.0.unit_is_dead();
         let ghost = store.0.player_is_ghost();
-
-        // ── The snapshot, set before the events fire so their handlers read current values ──
-        let snapshot = view.snapshot(script, store, self_t, feed.died_at);
-        script.set_death(snapshot);
-
-        // ── The world edges: the release window and the corpse asks, which a `/reload` must not
-        // repeat.
-        let prev = feed.mirror.filter(|&(g, ..)| g == guid);
-        feed.mirror = Some((guid, dead, ghost));
+        let prev = latches.mirror.filter(|&(g, ..)| g == guid);
+        latches.mirror = Some((guid, dead, ghost));
         match (prev, dead, ghost) {
-            // Alive to dead, or logging in dead: arm the release window.
-            (Some((_, false, false)) | None, true, false) => {
-                feed.died_at = Some(now);
-            }
-            // Dead to ghost (released), or to alive (a pre-release res).
-            (Some((_, true, false)), d, g) if g || !d => {
-                feed.died_at = None;
-                if g {
-                    // Now a ghost: ask where the corpse is.
-                    let _ = net.0.send(ClientCommand::CorpseQuery);
-                }
+            // Dead to ghost (released): ask where the corpse is.
+            (Some((_, true, false)), _, true) => {
+                let _ = net.0.send(ClientCommand::CorpseQuery);
             }
             // Ghost to alive: reclaim, spirit healer or an accepted res.
             (Some((_, _, true)), false, false) => {
-                feed.died_at = None;
                 // The not-found answer drops the map markers. The reference sends nothing on this
                 // edge: its ghost-bit watcher (`0x5ee990`) clears the corpse cache, and `0x491f50`
                 // queries only while a ghost. The server's own push needs a looter
                 // (`Map.cpp:3617-3629`).
                 let _ = net.0.send(ClientCommand::CorpseQuery);
             }
-            // Logging in a ghost: no edge, just the corpse ask.
-            (None, _, true) => {
-                let _ = net.0.send(ClientCommand::CorpseQuery);
-            }
             _ => {}
         }
-
-        // ── The VM edges: a fresh VM's memo is empty, so reloading dead re-fires PLAYER_DEAD
-        // (the Deviation on `DeathAnnounced`).
-        let memo = feed.vm.get(script);
-        let prev = memo.last.filter(|&(g, ..)| g == guid);
-        memo.last = Some((guid, dead, ghost));
-        fire_vm_edges(script, prev.map(|(_, d, g)| (d, g)), dead, ghost);
-
-        // ── The offer and confirm announcements ──
-        let ask = Ask::at(
-            std::mem::replace(&mut memo.offer_asked, death_net.resurrect_generation)
-                != death_net.resurrect_generation,
-            &net,
-        );
-        if let Some(name) =
-            offer_announcement(memo, death_net, store.0.is_dead_or_ghost(), |offer| {
-                // A player caster's name is empty on the wire; hold the popup until the cache
-                // resolves it.
-                if offer.name.is_empty() {
-                    names.resolve_player(offer.caster, ask).map(str::to_owned)
-                } else {
-                    Some(offer.name.clone())
-                }
-            })
-        {
-            script.fire_event("RESURRECT_REQUEST", vec![ScriptValue::Str(name)]);
-        }
-        if death_net.spirit_healer.is_some()
-            && memo.confirm_generation != death_net.confirm_generation
-        {
-            memo.confirm_generation = death_net.confirm_generation;
-            // `arg1` is the XP the res costs: `PLAYER_NEXT_LEVEL_XP` × 0.05, truncated
-            // (`0x5df837`), and 0 without the field, as `0x5df806` pushes 0 for a non-local object.
-            // No stock FrameXML reads it; `UIParent.lua:399` asks `GetResSicknessDuration()`.
-            let xp_cost = store
-                .0
-                .player_next_level_xp()
-                .map_or(0, |next| (f64::from(next) * 0.05) as i64);
-            script.fire_event("CONFIRM_XP_LOSS", vec![ScriptValue::Int(xp_cost)]);
-        }
-
-        // ── The corpse-run range gate: only a ghost, against the query's display position; the
-        // coordinate transform is isometric, so the Bevy-space compare is in yards.
-        let range = if ghost {
-            death_net.corpse.map(|cp| {
-                // Within range on the display map: IN_RANGE when it is the corpse's map, else
-                // IN_INSTANCE, at a dungeon's entrance (`0x492130`, `0x4920f0`).
+        // Against the query's display position; the coordinate transform is isometric, so the
+        // Bevy-space compare is in yards. The ghost test stands in for the ghost flag's clear of
+        // the corpse cache, which is not built (`0x5eeac1` → `0x491f50`, #392).
+        let corpse = death_net.corpse.as_ref();
+        let in_range = ghost
+            && corpse.is_some_and(|cp| {
+                // Deviation: `0x492130` compares the positions whatever map we stand on, so a
+                // ghost on another map at the corpse's coordinates reads in range for a reclaim
+                // the server refuses; here only the corpse's display map counts.
                 let on_display_map = map
                     .as_ref()
                     .is_some_and(|m| m.0 == u32::try_from(cp.display_map).unwrap_or(u32::MAX));
-                let near = on_display_map
+                on_display_map
                     && wow_to_bevy(cp.position).distance_squared(self_t.translation)
-                        <= CORPSE_RANGE_SQ;
-                let same_map = u32::try_from(cp.display_map) == Ok(cp.corpse_map);
-                match (near, same_map) {
-                    (false, _) => CorpseRange::Out,
-                    (true, true) => CorpseRange::In,
-                    (true, false) => CorpseRange::InInstance,
-                }
-            })
-        } else {
-            None
-        };
-        if memo.reclaim_generation != death_net.reclaim_generation {
-            memo.reclaim_generation = death_net.reclaim_generation;
-            memo.corpse_range = None; // re-announce whatever holds now
-        }
-        if range != memo.corpse_range {
-            match range {
-                Some(CorpseRange::In) => script.fire_event("CORPSE_IN_RANGE", vec![]),
-                Some(CorpseRange::InInstance) => script.fire_event("CORPSE_IN_INSTANCE", vec![]),
-                // Leaving range and the ghost state ending both fire the one hide event.
-                Some(CorpseRange::Out) | None if memo.corpse_range.is_some() => {
-                    script.fire_event("CORPSE_OUT_OF_RANGE", vec![]);
-                }
-                _ => {}
+                        <= CORPSE_RANGE_SQ
+            });
+        latches.set_in_range(in_range, corpse)
+    };
+    if let Some(signal) = signal {
+        vm.run(|script| {
+            if let Some(script) = script {
+                signal.fire(script);
             }
-            memo.corpse_range = range;
-        }
-    })
+        });
+    }
 }
 
 /// `SignalDeathState 0x495850`, where our own death's `PresentUnitDeath` ends (`0x6251cc`, for
 /// the active player alone, `0x5fa6d0` at `0x6251c2`): with our health 0 or less (`jg` at
 /// `0x495876`) `PLAYER_DEAD` (`0x113`, `0x49587d`), its handlers reading the timer the death armed,
 /// then `ClearCursor(1, 1)` (`0x495889` → `0x495190`); else `PLAYER_ALIVE` (`0x112`, `0x495893`).
-/// The VM's memo takes the state, so the feed signals no edge of it again.
-fn signal_death(
-    mut vm: crate::script_calls::VmWith<DeathView<'static, 'static>>,
-    mut feed: ResMut<DeathFeedState>,
-) {
+/// Its handlers read the timer the death armed through the host.
+pub(crate) fn signal_death(mut vm: crate::script_calls::VmWith<DeathView<'static, 'static>>) {
+    signal(&mut vm);
+}
+
+/// [`signal_death`]'s body; false with no VM or no live body, which signals nothing.
+fn signal(vm: &mut crate::script_calls::VmWith<DeathView<'static, 'static>>) -> bool {
     let dead = {
-        let (Some(script), set) = vm.parts() else {
-            return;
+        let (Some(_), set) = vm.parts() else {
+            return false;
         };
         let view = set.p0();
-        let Some((guid, store, self_t)) = view.body() else {
-            return;
+        let Some((_, store, _)) = view.body() else {
+            return false;
         };
-        let snapshot = view.snapshot(script, store, self_t, feed.died_at);
-        script.set_death(snapshot);
-        let memo = feed.vm.get(script);
-        memo.last = Some((guid, store.0.unit_is_dead(), store.0.player_is_ghost()));
         store.0.unit_health().unwrap_or(0) as i32 <= 0
     };
     // `0x495850`: the signal's listeners run before the cursor clears (`0x49587d`, `0x495889`).
@@ -425,13 +383,80 @@ fn signal_death(
             script.fire_event("PLAYER_ALIVE", vec![]);
         }
     });
+    true
 }
 
-/// [`signal_death`] in place, from our own death's handler (`crate::target`'s `died`).
+/// [`DeathNet::zero_release`] in `world`, from the interface load; a world without the death
+/// stores has no timer.
+pub(crate) fn zero_release_timer(world: &mut World) {
+    if let Some(mut death_net) = world.get_resource_mut::<DeathNet>() {
+        death_net.zero_release();
+    }
+}
+
+/// [`signal_death`] in place, from our own death's handler (`crate::target`'s `died`) and from our
+/// player's arrival (`0x5deb65`, [`crate::ui_world_enter`]).
 pub(crate) fn signal_death_state(world: &mut World) {
     if let Err(e) = world.run_system_cached(signal_death) {
         // A harness without the death state signals nothing.
         debug!("death: the death state was not signalled: {e}");
+    }
+}
+
+/// `CGPlayer_C::SendRepopRequest` (`0x5e0ae0`): `CMSG_REPOP_REQUEST` (0x15a, `0x5e0b1f`), only
+/// while dead or a ghost (`0x5e0ae6` → `0x605f30`).
+fn send_repop_request(store: &benilla_protocol::ObjectFields, net: &NetCommands) {
+    if store.is_dead_or_ghost() {
+        let _ = net.0.send(ClientCommand::RepopRequest);
+    }
+}
+
+/// The corpse cache and the range latch, beside the host.
+type CorpseStores = (
+    Option<ResMut<'static, DeathNet>>,
+    Option<ResMut<'static, DeathLatches>>,
+);
+
+/// `QueryCorpse 0x491f50` in the world-enter cascade (`0x490a28`), after its other sends: the
+/// corpse cache reset (`0x491f74` → `0x492010(-1, …)`), the range latch zeroed (`0x491f7b` →
+/// `0x4920f0(0)`), which signals `CORPSE_OUT_OF_RANGE` from a set latch, then, for a ghost
+/// (`PLAYER_FLAGS` bit 4, `0x491fad`), `MSG_CORPSE_QUERY` (`0x491fb2`). The flags watcher's
+/// release and revive asks are [`poll_corpse`]'s.
+pub(crate) fn query_corpse_on_world_enter(
+    self_q: Query<&ObjectStore, With<SelfPlayer>>,
+    mut vm: crate::script_calls::VmWith<CorpseStores>,
+    net: Res<NetCommands>,
+) {
+    let (death_net, feed) = vm.own();
+    if let Some(mut death_net) = death_net {
+        death_net.corpse = None;
+    }
+    let was_in = feed.is_some_and(|mut latches| std::mem::take(&mut latches.corpse_in_range));
+    if was_in {
+        vm.run(|script| {
+            if let Some(script) = script {
+                script.fire_event("CORPSE_OUT_OF_RANGE", vec![]);
+            }
+        });
+    }
+    if self_q.single().is_ok_and(|store| store.0.player_is_ghost()) {
+        let _ = net.0.send(ClientCommand::CorpseQuery);
+    }
+}
+
+/// The world-enter cascade's last test (`0x490a2d`-`0x490a38`): with our health 0 or less it
+/// releases the body (`0x490a3c` → `0x5e0ae0`), after its 38 calls and ahead of its tutorials. The
+/// cascade runs at an arrival, a `/reload` and a reactivation (`0x5deb60`, `0x490168`,
+/// `0x5e9c08`), so logging in or reloading dead and unreleased goes to the graveyard
+/// (`MiscHandler.cpp:48-67`).
+pub(crate) fn repop_on_world_enter(
+    self_q: Query<&ObjectStore, With<SelfPlayer>>,
+    net: Res<NetCommands>,
+) {
+    if let Ok(store) = self_q.single() {
+        if store.0.unit_is_dead() {
+            send_repop_request(&store.0, &net);
+        }
     }
 }
 
@@ -529,26 +554,6 @@ fn self_res(
     })
 }
 
-/// The sickness a spirit-healer res applies at `level`, per vmangos `Player::ResurrectPlayer`:
-/// none below 11, `level - 10` minutes through 19, 10 minutes from 20. Worded with `GENERIC_MIN`,
-/// the minute arm of the reference's formatter (`0x51a3a0` into `0x52fa50`).
-///
-/// Deviation: the minutes come from the server's table, not from spell 15007's `Spell.dbc`
-/// duration, because the aura the server applies is what the dialog must warn about.
-fn sickness_duration(level: u32, get: &dyn Fn(&str) -> Option<String>) -> Option<String> {
-    let minutes = match level {
-        0..=10 => return None,
-        11..=19 => level - 10,
-        _ => 10,
-    };
-    // `GetText(token, nil, ordinal)`'s plural pick, through the shared primitive.
-    let template = benilla_ui::strings::plural("GENERIC_MIN", Some(minutes), get)?;
-    Some(benilla_ui::strings::fill(
-        &template,
-        &[benilla_ui::strings::Arg::D(i64::from(minutes))],
-    ))
-}
-
 /// Drive the FFXDeath screen pass off `PLAYER_FLAGS_GHOST`, instant both ways; in the reference
 /// the flag's watcher `0x5ee990` also drives the death light and ambience.
 fn drive_death_look(
@@ -593,6 +598,8 @@ pub(crate) struct DeathSteps<'w, 's> {
     >,
     gate: crate::ui_bind_confirm::BindGate<'w>,
     ui_errors: Res<'w, crate::ui_action::UiErrorKeys>,
+    /// What the soulstone use's requirement gate reads, seated with the host out.
+    requirements: crate::ui_items::RequirementsLive<'w, 's>,
     guids: Option<Res<'w, crate::net::GuidIndex>>,
     transforms: Query<'w, 's, &'static Transform>,
     me: Query<'w, 's, Entity, With<SelfPlayer>>,
@@ -607,10 +614,9 @@ impl DeathSteps<'_, '_> {
             let _ = net.0.send(command);
         };
         match action {
-            // `0x5e0ae6`: only while dead or a ghost (`0x605f30`).
             DeathAction::Repop => {
-                if store.as_ref().is_some_and(|s| s.is_dead_or_ghost()) {
-                    send(&self.net, ClientCommand::RepopRequest);
+                if let Some(store) = &store {
+                    send_repop_request(store, &self.net);
                 }
             }
             // Ungated; with no corpse the guid is 0, which vmangos never reads: it resolves the
@@ -751,6 +757,7 @@ impl DeathSteps<'_, '_> {
             on_object: None,
             is_charter: false,
         };
+        self.requirements.seat(script);
         crate::ui_items::send_item_use(
             it,
             &ctx,
@@ -763,130 +770,89 @@ impl DeathSteps<'_, '_> {
     }
 }
 
-/// Clear [`DeathFeedState`]'s world scope on `DisconnectedMessage`, the edge [`DeathNet`] resets
-/// on: a relog as a ghost must find no mirror, or the corpse query is never re-sent.
-fn end_session_death_feed(
-    mut msgs: MessageReader<crate::net::DisconnectedMessage>,
-    mut feed: ResMut<DeathFeedState>,
-) {
-    if msgs.read().next().is_some() {
-        *feed = DeathFeedState::default();
+/// `SpiritHealerDialog 0x5df730(npc)` asking: for a ghost (`PLAYER_FLAGS` bit 0x10, `0x5df74a`),
+/// the healer `npc` held as a unit (`0x5df77a`) within the interaction range (`0x5df7c1`,
+/// `[0xc4c28c]`) is remembered (`0x5df7e6`), and `CONFIRM_XP_LOSS` (396, `0x5df837`) is owed with
+/// the XP the res costs, `PLAYER_NEXT_LEVEL_XP` × 0.05 truncated (`0x5df815`-`0x5df827`). No stock
+/// FrameXML reads the cost; `UIParent.lua:399` asks `GetResSicknessDuration()`.
+#[derive(bevy::ecs::system::SystemParam)]
+pub(crate) struct SpiritHealerAsk<'w, 's> {
+    death_net: ResMut<'w, DeathNet>,
+    me: Query<'w, 's, (&'static ObjectStore, &'static Transform), With<SelfPlayer>>,
+    objects: Objects<'w, 's>,
+    transforms: Query<'w, 's, &'static Transform>,
+}
+
+impl SpiritHealerAsk<'_, '_> {
+    /// The ask for `npc`; the cost the signal carries when its gates pass, else nothing is
+    /// remembered and nothing signals.
+    pub(crate) fn ask(&mut self, npc: u64) -> Option<i64> {
+        let (store, self_t) = self.me.single().ok()?;
+        if !store.0.player_is_ghost() {
+            return None;
+        }
+        let healer = self
+            .objects
+            .entity(npc)
+            .filter(|_| self.objects.store(npc).is_some_and(|s| s.is_unit()))
+            .and_then(|e| self.transforms.get(e).ok())?;
+        if healer.translation.distance_squared(self_t.translation) > SPIRIT_HEALER_RANGE_SQ {
+            return None;
+        }
+        self.death_net.spirit_healer = Some(npc);
+        Some(
+            store
+                .0
+                .player_next_level_xp()
+                .map_or(0, |next| (f64::from(next) * 0.05) as i64),
+        )
     }
 }
 
-/// The death stores, the feed into the UI, the intent drain and the root and water-walk messages.
+/// [`SpiritHealerAsk`] from the click on a spirit healer, which the reference raises with no
+/// packet (`0x5f0130` → `0x5df730`): `CONFIRM_XP_LOSS` signalled in place with the host.
+pub(crate) fn ask_spirit_healer(
+    In(npc): In<u64>,
+    mut vm: crate::script_calls::VmWith<SpiritHealerAsk<'static, 'static>>,
+) {
+    let Some(cost) = vm.own().ask(npc) else {
+        return;
+    };
+    vm.run(|script| {
+        if let Some(script) = script {
+            script.fire_event("CONFIRM_XP_LOSS", vec![ScriptValue::Int(cost)]);
+        }
+    });
+}
+
+/// The death stores, the corpse poll, the intent drain and the root and water-walk messages.
 pub(crate) struct DeathPlugin;
 
 impl Plugin for DeathPlugin {
     fn build(&self, app: &mut App) {
         net::register(app);
+        crate::ui_dialog_verbs::add_dialog_lane(app);
         app.init_resource::<DeathNet>()
-            .init_resource::<DeathFeedState>()
+            .init_resource::<DeathLatches>()
             .add_systems(
                 Update,
                 (
-                    feed_death.in_set(UiFeed),
+                    // The world frame's update, after its pick (`0x48184a`, then `0x4818c5`), as
+                    // the area spirit healer's poll; gated, as the poll re-derives every frame.
+                    poll_corpse
+                        .after(crate::target::TargetUpdate)
+                        .run_if(crate::ui_script::ingame_ui_up)
+                        .in_set(crate::client_state::InWorldGated),
                     drive_death_look,
-                    // Before the feed, so the frame a session ends carries no memory of it.
-                    end_session_death_feed.before(feed_death),
                 ),
             );
     }
-}
-
-/// The name `RESURRECT_REQUEST` fires with this frame, if any. Per message, and only while dead
-/// or a ghost (`0x5ded50` gated on `0x605f30`); an unresolved name holds without consuming it.
-fn offer_announcement(
-    memo: &mut DeathAnnounced,
-    death_net: &DeathNet,
-    dead_or_ghost: bool,
-    name_of: impl FnOnce(&ResurrectOffer) -> Option<String>,
-) -> Option<String> {
-    if !dead_or_ghost || memo.offer_generation == death_net.resurrect_generation {
-        return None;
-    }
-    let name = name_of(death_net.resurrect.as_ref()?)?;
-    memo.offer_generation = death_net.resurrect_generation;
-    Some(name)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use bevy::ecs::system::RunSystemOnce;
-
-    fn offer(caster: u64, name: &str) -> ResurrectOffer {
-        ResurrectOffer {
-            caster,
-            name: name.into(),
-            sickness: false,
-            has_timer: true,
-        }
-    }
-
-    /// The offer's packet looks a player caster's name up with the callback `0x5e7ca0`
-    /// (`0x5e7c82`); the frames the popup waits through read. A refused name is asked by no frame
-    /// after it, only by the next offer.
-    #[test]
-    fn a_refused_resurrecter_is_asked_by_the_next_offer_never_by_a_frame() {
-        use benilla_protocol::messages::ObjectType;
-        use benilla_protocol::ObjectFields;
-        const ME: u64 = 0x7;
-        const CASTER: u64 = 0x9;
-        let (tx, rx) = crossbeam_channel::unbounded();
-        let mut app = App::new();
-        app.insert_resource(NetCommands(tx))
-            .insert_resource(crate::net::NetStatus {
-                connected: true,
-                last_reason: None,
-            })
-            .init_resource::<SelfGuid>()
-            .init_resource::<DeathNet>()
-            .init_resource::<DeathFeedState>()
-            .init_resource::<crate::names::NameCache>()
-            .init_resource::<crate::net::GuidIndex>()
-            .init_resource::<crate::items::Items>()
-            .init_resource::<Time<Real>>()
-            .add_systems(Update, feed_death);
-        app.insert_non_send_resource(UiScript::new().unwrap());
-        // `UNIT_FIELD_HEALTH` 0 of a `UNIT_FIELD_MAXHEALTH` 100: dead.
-        let dead = ObjectFields::from_pairs(&[(22, 0), (28, 100)]).into_created(ObjectType::Player);
-        let me = app
-            .world_mut()
-            .spawn((ObjectStore(dead), Transform::default(), SelfPlayer))
-            .id();
-        app.world_mut()
-            .resource_mut::<crate::net::GuidIndex>()
-            .0
-            .insert(ME, me);
-        app.world_mut().resource_mut::<SelfGuid>().0 = Some(ME);
-        let offer = |app: &mut App| {
-            net::resurrect_request_for_tests(
-                CASTER,
-                &mut app.world_mut().resource_mut::<DeathNet>(),
-            );
-            app.update();
-        };
-        app.update();
-        offer(&mut app);
-        assert_eq!(crate::query_cache::queries(&rx).len(), 1);
-        app.world_mut()
-            .resource_mut::<crate::names::NameCache>()
-            .insert_player(CASTER, String::new(), None);
-        for _ in 0..600 {
-            app.update();
-        }
-        assert!(
-            crate::query_cache::queries(&rx).is_empty(),
-            "no frame asks a refusal"
-        );
-        offer(&mut app);
-        assert_eq!(
-            crate::query_cache::queries(&rx).len(),
-            1,
-            "the next offer asks again"
-        );
-    }
 
     /// `0x495850` signals `PLAYER_DEAD` (`0x49587d`) before it clears the cursor (`0x495889`): a
     /// listener still finds the coins it held.
@@ -904,7 +870,7 @@ mod tests {
             })
             .init_resource::<SelfGuid>()
             .init_resource::<DeathNet>()
-            .init_resource::<DeathFeedState>()
+            .init_resource::<DeathLatches>()
             .init_resource::<crate::net::GuidIndex>()
             .init_resource::<crate::items::Items>()
             .init_resource::<Time<Real>>();
@@ -933,48 +899,6 @@ mod tests {
         let script = app.world().non_send_resource::<UiScript>();
         assert_eq!(script.eval::<i64>("return HELD").unwrap(), 10);
         assert!(script.cursor_payload().is_none(), "then the clear");
-    }
-
-    /// PLAYER_UNGHOST hides the popup with `StaticPopup_Hide`, which runs no `OnCancel`, so no
-    /// Decline clears `resurrect`.
-    #[test]
-    fn every_resurrect_message_announces_while_dead_and_never_while_alive() {
-        let mut net = DeathNet::default();
-        let mut memo = DeathAnnounced::default();
-        let name = |o: &ResurrectOffer| Some(o.name.clone());
-
-        net.resurrect = Some(offer(1, "Healer"));
-        net.resurrect_generation += 1;
-        assert_eq!(
-            offer_announcement(&mut memo, &net, true, name).as_deref(),
-            Some("Healer")
-        );
-        assert_eq!(
-            offer_announcement(&mut memo, &net, true, name),
-            None,
-            "once per message"
-        );
-
-        // Alive with the offer unanswered: a fresh VM must not announce it.
-        let mut reloaded = DeathAnnounced::default();
-        assert_eq!(offer_announcement(&mut reloaded, &net, false, name), None);
-
-        // Dead again, a new priest offers.
-        net.resurrect = Some(offer(2, "Ptwo"));
-        net.resurrect_generation += 1;
-        assert_eq!(
-            offer_announcement(&mut memo, &net, true, name).as_deref(),
-            Some("Ptwo"),
-            "the second offer announces"
-        );
-
-        // A name still resolving holds the announcement without consuming it.
-        net.resurrect_generation += 1;
-        assert_eq!(offer_announcement(&mut memo, &net, true, |_| None), None);
-        assert_eq!(
-            offer_announcement(&mut memo, &net, true, name).as_deref(),
-            Some("Ptwo")
-        );
     }
 
     const STONE: u64 = 0x4000_0000_0000_5232;
@@ -1424,114 +1348,133 @@ mod tests {
         );
     }
 
-    /// A `/reload` must not restart the release window; a relog must clear it.
+    /// A `/reload` keeps the body's mirror, so it re-sends no corpse ask; a relog must clear it.
+    /// A `/logout` is a session edge although `session_over` is false for it.
     #[test]
-    fn the_session_edge_clears_the_world_scoped_death_memory_and_nothing_else_does() {
-        let mut app = App::new();
-        app.add_message::<crate::net::DisconnectedMessage>()
-            .insert_resource(DeathFeedState {
-                mirror: Some((0x1234, true, true)),
-                died_at: Some(12.0),
-                vm: crate::ui_script::VmMemo::default(),
-            });
-
-        // No session edge: the memory stands.
-        app.world_mut()
-            .run_system_once(end_session_death_feed)
+    fn the_session_edge_clears_the_world_scoped_death_memory() {
+        let mut world = World::new();
+        world.init_resource::<DeathNet>();
+        world.insert_resource(DeathLatches {
+            mirror: Some((0x1234, true, true)),
+            corpse_in_range: true,
+        });
+        world
+            .run_system_cached_with(
+                net::on_session_end,
+                benilla_protocol::SessionEvent::Disconnected {
+                    reason: "logged out".into(),
+                    end: benilla_protocol::SessionEnd::LoggedOut,
+                },
+            )
             .expect("the teardown runs");
-        assert_eq!(
-            app.world().resource::<DeathFeedState>().mirror,
-            Some((0x1234, true, true)),
-            "nothing but the session edge may clear the body's own state machine"
-        );
-
-        // A `/logout` is a session edge although `session_over` is false for it.
-        app.world_mut()
-            .write_message(crate::net::DisconnectedMessage::new(
-                "logged out".into(),
-                benilla_protocol::SessionEnd::LoggedOut,
-            ));
-        app.world_mut()
-            .run_system_once(end_session_death_feed)
-            .expect("the teardown runs");
-        let feed = app.world().resource::<DeathFeedState>();
+        let latches = world.resource::<DeathLatches>();
         assert!(
-            feed.mirror.is_none(),
+            latches.mirror.is_none() && !latches.corpse_in_range,
             "a relog must find no mirror, or the login-while-ghost arm cannot fire"
         );
-        assert!(
-            feed.died_at.is_none(),
-            "the release window is the dead session's, and re-arms at the next login"
-        );
     }
-}
 
-/// Run the death feed once on `world`, for a test of what it pushes.
-#[cfg(test)]
-pub(crate) fn run_feed_death_once(world: &mut World) {
-    use bevy::ecs::system::RunSystemOnce;
-    world
-        .run_system_once(feed_death)
-        .expect("the death feed runs");
-}
+    /// `PLAYER_FIELD_BYTES`, whose bit 0x8 our own death's timer reads (`0x5e9a27`).
+    const BYTES: u16 = 1222;
 
-/// The body's VM events between the last `(dead, ghost)` seen, if any, and this one.
-fn fire_vm_edges(script: &mut UiScript, prev: Option<(bool, bool)>, dead: bool, ghost: bool) {
-    match (prev, dead, ghost) {
-        // A VM's first sight of the body dead: logging in or reloading dead. A death seen alive
-        // signals inside its handler ([`signal_death_state`]).
-        (None, true, false) => {
-            script.fire_event("PLAYER_DEAD", vec![]);
-        }
-        (Some((true, false)), d, g) if g || !d => {
-            // The health edge out of 0 (`0x6047f0`) unlocks every item (`0x5fefae`), then fires
-            // `PLAYER_ALIVE` (`0x5fefb8`).
-            script.unlock_all_items();
-            script.fire_event("PLAYER_ALIVE", vec![]);
-        }
-        _ => {}
+    /// A world with our player at `health`, the release-timer bit set, the death stores and the
+    /// arrival's signal, and a VM that records each death-state event with the timer it reads.
+    fn arrival_app(health: u32) -> App {
+        use benilla_protocol::field::{FIELD_UNIT_HEALTH, FIELD_UNIT_MAXHEALTH};
+        use benilla_protocol::messages::ObjectType;
+        use benilla_protocol::ObjectFields;
+        const ME: u64 = 0x7;
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut app = App::new();
+        app.insert_resource(NetCommands(tx))
+            .insert_resource(crate::net::NetStatus {
+                connected: true,
+                last_reason: None,
+            })
+            .init_resource::<SelfGuid>()
+            .init_resource::<DeathNet>()
+            .init_resource::<DeathLatches>()
+            .init_resource::<crate::names::NameCache>()
+            .init_resource::<crate::net::GuidIndex>()
+            .init_resource::<crate::items::Items>()
+            .init_resource::<Time<Real>>()
+            .insert_resource(State::new(crate::client_state::ClientState::InWorld))
+            .add_plugins(crate::ui_world_enter::WorldEnterPlugin);
+        app.insert_non_send_resource(recording_vm());
+        let body = ObjectFields::from_pairs(&[
+            (FIELD_UNIT_HEALTH, health),
+            (FIELD_UNIT_MAXHEALTH, 100),
+            (BYTES, 0x8),
+        ])
+        .into_created(ObjectType::Player);
+        let me = app
+            .world_mut()
+            .spawn((ObjectStore(body), Transform::default(), SelfPlayer))
+            .id();
+        app.world_mut()
+            .resource_mut::<crate::net::GuidIndex>()
+            .0
+            .insert(ME, me);
+        app.world_mut().resource_mut::<SelfGuid>().0 = Some(ME);
+        crate::ui_world_enter::push_arrival(app.world_mut());
+        app
     }
-}
 
-#[cfg(test)]
-mod edge_tests {
-    use benilla_ui::script::UiScript;
+    fn recording_vm() -> UiScript {
+        let script = UiScript::new().unwrap();
+        script
+            .run(
+                "SEEN = {} local f = CreateFrame('Frame') f:RegisterEvent('PLAYER_DEAD') \
+                 f:RegisterEvent('PLAYER_ALIVE') f:SetScript('OnEvent', function() \
+                 table.insert(SEEN, event .. ' ' .. GetReleaseTimeRemaining()) end)",
+            )
+            .unwrap();
+        script
+    }
 
-    /// The revive edge unlocks every item, its one `ITEM_LOCK_CHANGED` ahead of `PLAYER_ALIVE`
-    /// (`0x5fefae`, `0x5fefb8`); the ghost's own revive, no health edge, unlocks nothing.
+    fn seen(app: &App) -> Vec<String> {
+        app.world()
+            .non_send_resource::<UiScript>()
+            .eval("return SEEN")
+            .unwrap()
+    }
+
+    /// Our player's arrival signals the death state after its cascade (`0x5deb60`, `0x5deb65` →
+    /// `0x495850`): `PLAYER_DEAD` for a dead body, `PLAYER_ALIVE` for any other, each once. No
+    /// death since `UI_Init` armed the timer (`0x490131`), so it reads 0 (`0x4962b6`) and
+    /// `UIParent.lua:240` shows no DEATH popup.
     #[test]
-    fn the_revive_edge_unlocks_every_item_before_player_alive() {
-        const ITEM: u64 = 0x4000_0000_0000_0042;
-        let mut s = UiScript::new().unwrap();
-        s.run(
-            "SEEN = {} local f = CreateFrame('Frame') \
-             f:RegisterEvent('ITEM_LOCK_CHANGED') f:RegisterEvent('PLAYER_ALIVE') \
-             f:RegisterEvent('PLAYER_UNGHOST') \
-             f:SetScript('OnEvent', function() table.insert(SEEN, event) end)",
-        )
-        .unwrap();
-        let seen = |s: &UiScript| {
-            let out = s.eval::<Vec<String>>("return SEEN").unwrap();
-            s.run("SEEN = {}").unwrap();
-            out
-        };
-        s.lock_item(ITEM);
-        let _ = seen(&s);
-        super::fire_vm_edges(&mut s, Some((true, false)), true, true);
-        assert_eq!(
-            seen(&s),
-            ["ITEM_LOCK_CHANGED", "PLAYER_ALIVE"],
-            "the release"
-        );
-        assert!(!s.item_locked(ITEM));
-        s.lock_item(ITEM);
-        let _ = seen(&s);
-        super::fire_vm_edges(&mut s, Some((true, true)), false, false);
-        assert!(
-            seen(&s).is_empty(),
-            "the corpse run's end: its event is the ghost bit's (`0x5de9c0`)"
-        );
-        assert!(s.item_locked(ITEM));
+    fn an_arrival_signals_the_death_state_once_over_a_zero_timer() {
+        for (health, expected) in [(0, "PLAYER_DEAD 0"), (100, "PLAYER_ALIVE 0")] {
+            let mut app = arrival_app(health);
+            app.update();
+            app.update();
+            assert_eq!(seen(&app), [expected], "health {health}");
+        }
+    }
+
+    /// A `/reload`'s cascade signals no death state (`0x490168` never reaches `0x495850`): the new
+    /// VM, dead and unreleased, hears neither event, and the timer `UI_Init` zeroed reads 0
+    /// (`0x490131`, `0x4962b6`) whatever the bit says, so no DEATH popup shows.
+    #[test]
+    fn a_reload_dead_signals_nothing_and_reads_a_zero_timer() {
+        let mut app = arrival_app(0);
+        app.world_mut()
+            .resource_mut::<DeathNet>()
+            .arm_release(true, 0.0);
+        app.update();
+        // The reload: a fresh VM over the same body, the timer zeroed by its load.
+        app.insert_non_send_resource(recording_vm());
+        zero_release_timer(app.world_mut());
+        app.update();
+        app.update();
+        assert_eq!(seen(&app), Vec::<String>::new());
+        let left: f64 = app
+            .world()
+            .non_send_resource::<UiScript>()
+            .eval("return GetReleaseTimeRemaining()")
+            .unwrap();
+        assert_eq!(left, 0.0);
     }
 }
 

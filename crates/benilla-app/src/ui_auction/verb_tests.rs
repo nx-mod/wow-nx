@@ -3,10 +3,7 @@
 //! their own bodies, and the script's next line reads what the verb did.
 
 use benilla_protocol::ObjectFields;
-use benilla_ui::script::{
-    AuctionItemRow, AuctionListState, AuctionState, ContainerSlot, ContainerState, UiScript, LIST,
-    OWNER,
-};
+use benilla_ui::script::{AuctionItemRow, AuctionListState, AuctionState, UiScript, LIST, OWNER};
 use bevy::prelude::*;
 use crossbeam_channel::Receiver;
 
@@ -41,6 +38,28 @@ struct House {
 }
 
 impl House {
+    /// Linen, object `0x4001`, in backpack slot 1, with `durability` (current, max).
+    fn seat_linen(&mut self, durability: Option<(u32, u32)>) {
+        const LINEN: u64 = 0x4001;
+        let world = self.app.world_mut();
+        let (now, max) = durability.unwrap_or((0, 0));
+        crate::items::test_spawn_item(
+            world,
+            LINEN,
+            ObjectFields::from_pairs(&[(2, 0x3), (3, 2589), (14, 1), (46, now), (47, max)]),
+            false,
+        );
+        world
+            .resource_mut::<crate::items::Items>()
+            .insert_template(2589, Some(crate::items::test_template("Linen Cloth")));
+        let me = world.resource::<GuidIndex>().0[&ME];
+        world
+            .get_mut::<ObjectStore>(me)
+            .expect("our store")
+            .0
+            .merge(ObjectFields::from_pairs(&[(532, LINEN as u32), (533, 0)]));
+    }
+
     fn new(money: u32) -> Self {
         let mut app = crate::game_plugins::schedule_tests::headless_client_unrun();
         let (tx, rx) = crossbeam_channel::unbounded();
@@ -409,28 +428,7 @@ fn usable_and_quality_read_as_numbers() {
 #[test]
 fn a_start_sends_and_empties_the_slot_inside_the_call() {
     let mut h = House::new(0);
-    {
-        let mut script = h.app.world_mut().non_send_resource_mut::<UiScript>();
-        script.set_container(
-            0,
-            Some(ContainerState {
-                name: None,
-                num_slots: 16,
-                slots: [(
-                    1,
-                    ContainerSlot {
-                        item_id: 2589,
-                        count: 1,
-                        quality: Some(1),
-                        guid: 0x4001,
-                        ..Default::default()
-                    },
-                )]
-                .into_iter()
-                .collect(),
-            }),
-        );
-    }
+    h.seat_linen(None);
     h.run("PickupContainerItem(0, 1) ClickAuctionSellItemButton() HEARD = {}");
     let _ = h.sent();
     h.run("StartAuction(100, 0, 480) AFTER = table.getn(HEARD) StartAuction(100, 0, 480)");
@@ -457,29 +455,7 @@ fn a_start_sends_and_empties_the_slot_inside_the_call() {
 #[test]
 fn a_damaged_items_start_is_refused_inside_the_call() {
     let mut h = House::new(0);
-    {
-        let mut script = h.app.world_mut().non_send_resource_mut::<UiScript>();
-        script.set_container(
-            0,
-            Some(ContainerState {
-                name: None,
-                num_slots: 16,
-                slots: [(
-                    1,
-                    ContainerSlot {
-                        item_id: 2589,
-                        count: 1,
-                        quality: Some(1),
-                        guid: 0x4001,
-                        durability: Some((10, 40)),
-                        ..Default::default()
-                    },
-                )]
-                .into_iter()
-                .collect(),
-            }),
-        );
-    }
+    h.seat_linen(Some((10, 40)));
     h.run("PickupContainerItem(0, 1) ClickAuctionSellItemButton() HEARD = {}");
     let _ = h.sent();
     h.run("StartAuction(100, 0, 480) AFTER = table.getn(LINES)");
@@ -499,11 +475,11 @@ fn a_damaged_items_start_is_refused_inside_the_call() {
 /// `0x4cc460` shows a placed bid's line (`0x4cc507`) before it removes the outbid pair
 /// (`0x4cc517`), arms the bidder flag (`0x4cc522`) and sends the bidder request (`0x4cc528`), so
 /// the line's `CHAT_MSG_SYSTEM` listener calls `GetBidderAuctionItems` on the house as it stood:
-/// the flag the hello armed, both pairs, the offset 0. Here the handlers run first and send in
-/// their own order, the next packet's handler reading what the first wrote; the listener's call
-/// then sends at its page with both ids, and its offset stands after the frame.
+/// the flag the hello armed, both pairs, the offset 0. Its request goes first, at its page with
+/// both ids; the handler's own then reads the offset the listener saved (`0x4cc51c`), and the
+/// second bid's finds the flag spent and its own request the house's last pair gone (#2426).
 #[test]
-fn a_placed_bids_line_listener_reads_the_requests_as_its_handler_found_them() {
+fn a_placed_bids_line_listener_sends_ahead_of_its_handler() {
     use benilla_protocol::messages::{auction_action, auction_error, AuctionCommandTail};
     let mut h = House::new(1_000_000);
     h.house().outbid = vec![(1, 7), (1, 9)];
@@ -532,11 +508,11 @@ fn a_placed_bids_line_listener_reads_the_requests_as_its_handler_found_them() {
     assert_eq!(
         text(h.sent()),
         text([
-            bidder(0, vec![9]),
-            wave(),
-            bidder(0, vec![]),
-            wave(),
             bidder(100, vec![7, 9]),
+            bidder(100, vec![9]),
+            wave(),
+            bidder(100, vec![]),
+            wave(),
         ])
     );
     let house = h.house();
@@ -551,8 +527,8 @@ fn a_placed_bids_line_listener_reads_the_requests_as_its_handler_found_them() {
 }
 
 /// A started auction's line (`0x4cc4c7`) comes before the owner request (`0x4cc4da`,
-/// `0x4cc4e0`), which spends the flag: its listener's `GetOwnerAuctionItems` finds the flag the
-/// hello armed and sends at its page, whose offset then stands.
+/// `0x4cc4e0`): its listener's `GetOwnerAuctionItems` finds the flag the hello armed and sends at
+/// its page first, and the handler's request then goes at the offset it saved (`0x4cc4d1`).
 #[test]
 fn a_started_auctions_line_listener_reads_the_owner_flag_before_its_request() {
     use benilla_protocol::messages::{auction_action, auction_error, AuctionCommandTail};
@@ -579,7 +555,7 @@ fn a_started_auctions_line_listener_reads_the_owner_flag_before_its_request() {
         auctioneer: AUCTIONEER,
         list_from,
     };
-    assert_eq!(text(h.sent()), text([owner(0), owner(50)]));
+    assert_eq!(text(h.sent()), text([owner(50), owner(50)]));
     let house = h.house();
     assert_eq!((house.owner_armed, house.owner_offset), (false, 50));
 }

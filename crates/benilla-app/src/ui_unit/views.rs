@@ -2,11 +2,11 @@
 //! packet's handler runs whole before the next (`0x537aa0` calls it at `0x537ae5`), its watchers
 //! fire inside it (`0x465570` → `0x4655dc`), and `UnitHealth` reads the live object
 //! (`0x5174d0`, `[obj+0x110]+0x40` at `0x517553`), so a listener sees the state its own packet
-//! left, never a later packet's. The unit feed pushes the frame's last state, so here each update
-//! packet logs what it moved ([`ViewLog`]); the views lane rewinds the stores the tokens name and
-//! the group's records and roster cells to the frame's start and replays the log in stamp order
-//! among the other lanes, rebuilding the tokens' views once per gap between events
-//! ([`UnitViews`]).
+//! left, never a later packet's. The lanes fire after every packet of the frame is applied, so
+//! here each update packet logs what it moved ([`ViewLog`]); the views lane rewinds the stores the
+//! tokens name and the group's records and roster cells to the frame's start and replays the log
+//! in stamp order among the other lanes ([`UnitViews`]), so the getters read each as of their
+//! listener's packet ([`ViewStores`]).
 //!
 //! The unit of "as of" is the packet: the update handler `0x4651a0` runs both write passes over
 //! every block (`0x46520e`, `0x465222`) before its notify pass (`0x46522d`-`0x46528b`), so a
@@ -14,29 +14,31 @@
 //! member's group record before it signals (`0x5e5110`: `0x5e54c4`, `0x5e54d8`, then `0x5e54fa`),
 //! so the log holds the records too, and the roster cells a group list or ending writes (its party
 //! slots before its first signal `0x5e6c66`, its leader, loot and raid rows after), whole per
-//! packet; and the views built over them: the group tokens, the pet, the units a `target` chain
-//! ends on and every unit's aura list ([`families`]).
+//! packet, which the group tokens and the pet read at the call ([`super::live`]).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use benilla_protocol::messages::PartyMemberStatsInfo;
 use benilla_protocol::ObjectFields;
-use benilla_ui::script::{UiScript, UnitState};
+use benilla_ui::script::UiScript;
+#[cfg(test)]
+use benilla_ui::script::UnitState;
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 
 use crate::lanes::{Stamp, Until};
+#[cfg(test)]
 use crate::names::NameCache;
-use crate::net::{Guid, GuidIndex, NetCommands, ObjectStore, SelfPlayer};
-use crate::target::{RelationWorld, Selection};
+#[cfg(test)]
+use crate::net::NetCommands;
+use crate::net::{Guid, GuidIndex, ObjectStore, SelfPlayer};
+#[cfg(test)]
+use crate::target::RelationWorld;
+use crate::target::Selection;
 use crate::ui_party::RosterCells;
 
-mod families;
-
-/// The four tokens [`super::feed_units`] pushes and this lane versions, in [`Tokens`]' order.
-const TOKENS: [&str; 4] = ["player", "target", "targettarget", "npc"];
-
-/// One value per token of [`TOKENS`].
+/// One value per token of the four [`token_views`] builds.
+#[cfg(test)]
 pub(super) type Tokens<T> = [T; 4];
 
 /// One change an update packet made to a store.
@@ -188,18 +190,16 @@ impl ViewLog {
         self.open = false;
     }
 
-    /// The world left at once (a worldport, a disconnect, a logout): every unit the object manager
-    /// holds is logged as its store stands, a destroy for each the teardown takes. For one it
-    /// keeps, the entry holds the store unchanged, which undoing and replaying leaves as it is.
+    /// The world left at once (a worldport, a disconnect, a logout): every object the object
+    /// manager holds is logged as its store stands, a destroy for each the teardown takes. For one
+    /// it keeps, the entry holds the store unchanged, which undoing and replaying leaves as it is.
     pub(crate) fn torn_down<'a>(
         &mut self,
         index: &GuidIndex,
         store: impl Fn(Entity) -> Option<&'a ObjectStore>,
     ) {
         for (&guid, &e) in &index.0 {
-            if !benilla_protocol::guid::is_item(guid) {
-                self.replaced(guid, store(e).cloned());
-            }
+            self.replaced(guid, store(e).cloned());
         }
         self.close();
     }
@@ -288,31 +288,11 @@ pub(crate) struct UnitViews {
     records: Option<HashMap<u64, PartyMemberStatsInfo>>,
     /// The group's roster cells as of the drain's place, while the frame changed them.
     roster: Option<RosterCells>,
-    /// An entry the drain applied moved the roster cells since the views were last built.
-    roster_moved: bool,
-    /// The frame changed the roster cells.
-    roster_touched: bool,
-    /// The guids whose store or record the frame changed, of those some view reads.
-    touched: HashSet<u64>,
-    /// The guids some view reads: every unit a token can name, its target's targets through the
-    /// frame, the group's members and pets and our pet.
-    readable: Readable,
     /// The drain has fired the lane's start.
     started: bool,
-    /// The guids `"target"` and `"npc"` named as the drain began: a call during it that moves one
-    /// seats that token itself, and the lane leaves it to the next frame's feed.
-    named: (Option<u64>, Option<u64>),
-    /// What the VM held of each view before the lane pushed its own, put back as the drain ends.
-    saved: families::Saved,
-    /// The builds made, for the tests.
-    #[cfg(test)]
-    pub(crate) builds: usize,
     /// The stores checked against the live ones at the end of a drain, for the tests.
     #[cfg(test)]
     pub(crate) checked: usize,
-    /// The views pushed, for the tests.
-    #[cfg(test)]
-    pub(crate) pushes: usize,
     /// The stores the rewind checked against the frame-start snapshot, for the tests.
     #[cfg(test)]
     pub(crate) starts_checked: usize,
@@ -341,9 +321,8 @@ impl UnitViews {
         scratch_as_of(&self.scratch, guid, live)
     }
 
-    /// Apply every entry `until` admits; the guids they changed.
-    fn apply(&mut self, until: Until) -> HashSet<u64> {
-        let mut applied = HashSet::new();
+    /// Apply every entry `until` admits.
+    fn apply(&mut self, until: Until) {
         while self.pending.front().is_some_and(|e| until.admits(e.at)) {
             let Some(mut entry) = self.pending.pop_front() else {
                 break;
@@ -351,11 +330,7 @@ impl UnitViews {
             for (guid, change) in &mut entry.changes {
                 if let Change::Roster(other) = change {
                     std::mem::swap(&mut self.roster, other);
-                    self.roster_moved = true;
                     continue;
-                }
-                if !benilla_protocol::guid::is_item(*guid) {
-                    applied.insert(*guid);
                 }
                 if let Change::Record(other) = change {
                     if let Some(records) = self.records.as_mut() {
@@ -366,7 +341,6 @@ impl UnitViews {
                 }
             }
         }
-        applied
     }
 
     /// The drain's end for this lane: every store and record is back to the live one.
@@ -410,12 +384,7 @@ impl UnitViews {
         self.scratch.clear();
         self.records = None;
         self.roster = None;
-        self.roster_moved = false;
-        self.roster_touched = false;
-        self.touched.clear();
-        self.readable = Readable::default();
         self.started = false;
-        self.saved = Default::default();
     }
 }
 
@@ -533,6 +502,7 @@ impl ViewStores<'_, '_> {
 }
 
 /// What the four tokens' snapshots read beside their stores.
+#[cfg(test)]
 pub(super) struct TokenSources<'a, 'w, 's> {
     pub(super) tables: &'a super::SnapshotTables<'w>,
     pub(super) names: &'a NameCache,
@@ -543,6 +513,7 @@ pub(super) struct TokenSources<'a, 'w, 's> {
 }
 
 /// The stores the four tokens read, each as of the place they are built for.
+#[cfg(test)]
 pub(super) struct TokenStores<'a> {
     /// Our own store and guid.
     pub(super) me: Option<(&'a ObjectStore, u64)>,
@@ -555,6 +526,7 @@ pub(super) struct TokenStores<'a> {
 }
 
 /// What a held unit's snapshot reads, off `stores`.
+#[cfg(test)]
 fn held_units<'a>(
     src: &TokenSources<'a, '_, '_>,
     stores: &TokenStores<'a>,
@@ -562,7 +534,6 @@ fn held_units<'a>(
     let world = src.world;
     super::held::HeldUnits {
         names: src.names,
-        commands: src.commands,
         group: src.group,
         self_store: stores.me.map(|(s, _)| s),
         unit_names: src.tables.unit_names(),
@@ -582,21 +553,25 @@ fn held_units<'a>(
 /// The four tokens' snapshots off `stores`: `"player"` off our descriptor, `"target"` and
 /// `"npc"` off theirs, and `"targettarget"` one hop off the target's `UNIT_FIELD_TARGET`, streamed
 /// guids only, for the stock frame's poll (`TargetofTarget_OnUpdate`, `TargetFrame.lua:494-538`).
+#[cfg(test)]
 pub(super) fn token_views<'a>(
     src: &TokenSources<'a, '_, '_>,
     stores: &TokenStores<'a>,
 ) -> Tokens<Option<UnitState>> {
     let world = src.world;
     let player = stores.me.map(|(store, guid)| {
+        // The unit's create looked its name up with a callback (`0x5dec12`); a frame asks only a
+        // name the cache holds nothing for, as one invalidated since.
         let mut s = super::player_snapshot(
             store,
             guid,
             src.tables,
             src.names,
-            src.commands,
+            crate::query_cache::Ask::New(src.commands),
             src.group,
             world.factions(),
-            src.guild,
+            // `GetGuildInfo`: the public guild fields (191/192) joined against the lazy cache.
+            crate::ui_guild::unit_guild(&store.0, src.guild, src.commands),
         );
         if let Some(me) = world.me() {
             s.is_pvp_ffa = super::pvp_free_for_all(&world.get(), &me);
@@ -604,12 +579,23 @@ pub(super) fn token_views<'a>(
         s
     });
     let held = held_units(src, stores);
-    let target = stores.target.map(|(store, guid)| held.state(store, guid));
+    let state = |store: &ObjectStore, guid: u64| {
+        let name = src
+            .names
+            .resolve_unit(
+                guid,
+                Some(store),
+                crate::query_cache::Ask::New(src.commands),
+            )
+            .map(str::to_string);
+        held.state_named(store, guid, name)
+    };
+    let target = stores.target.map(|(store, guid)| state(store, guid));
     let tot = stores
         .target
         .and_then(|(store, _)| store.0.unit_target())
         .filter(|guid| *guid != 0)
-        .and_then(|guid| Some(held.state((stores.by_guid)(guid)?, guid)));
+        .and_then(|guid| Some(state((stores.by_guid)(guid)?, guid)));
     // Not a game object's or an item's: those exist for nobody (`0x515fee`), and are named live.
     let npc = stores
         .npc
@@ -619,7 +605,7 @@ pub(super) fn token_views<'a>(
                 .object_type_mask()
                 .is_none_or(|mask| mask & 0x8 != 0 || mask & 0x22 == 0)
         })
-        .map(|(store, guid)| held.state(store, guid));
+        .map(|(store, guid)| state(store, guid));
     [player, target, tot, npc]
 }
 
@@ -702,11 +688,6 @@ fn readable_guids<'a>(
     live: &impl Fn(u64) -> Option<&'a ObjectStore>,
 ) -> Readable {
     let g = script.unit_guids_view();
-    let mut grouped: HashSet<u64> = (g.party.into_iter().chain(g.party_pets))
-        .chain(g.raid.iter().copied())
-        .chain(g.raid_pets.iter().copied())
-        .collect();
-    grouped.remove(&0);
     let mut out: HashSet<u64> = [g.player, g.pet, g.target, g.mouseover, g.npc, pet]
         .into_iter()
         .chain(g.party)
@@ -728,27 +709,28 @@ fn readable_guids<'a>(
         out.extend(live(m.guid).and_then(|s| s.0.unit_pet_guid()));
     }
     out.remove(&0);
-    Readable { all: out, grouped }
+    Readable { all: out }
 }
 
-/// The guids some view reads ([`readable_guids`]), and of them those a group token names, whose
-/// aura list a roster record stands in for (`0x519735`).
+/// The guids some view reads ([`readable_guids`]).
 #[derive(Default)]
 struct Readable {
     all: HashSet<u64>,
-    grouped: HashSet<u64>,
 }
 
-/// The items a store's seats name that the getters walk at mask 0 (`0x622420`): the active
-/// player's equipment and equipped bags (0-22), backpack and keyring, private fields only its store
-/// carries, whose weapons the stat getters read (`UnitAttackSpeed` `0x518f19`, `HasWandEquipped`
-/// `0x4c99c2`) and whose whole set the bar's worn and reagent walks read; and a container's slots.
+/// The items a store's seats name: the active player's equipment and equipped bags (0-22),
+/// backpack, bank seats, bank bags and keyring, private fields only its store carries, whose
+/// weapons the stat getters read (`UnitAttackSpeed` `0x518f19`, `HasWandEquipped` `0x4c99c2`),
+/// whose whole set the bar's worn and reagent walks read (`0x622420`) and the bag getters find by
+/// seat (`0x6228a0`); and a container's slots.
 fn carried(f: &ObjectFields) -> Vec<Option<u64>> {
     use benilla_protocol::messages::ObjectType;
     match f.created_as() {
         Some(ObjectType::Player) => (0..23)
             .map(|i| f.player_inv_slot(i))
             .chain((0..16).map(|i| f.player_pack_slot(i)))
+            .chain((0..24).map(|i| f.player_bank_slot(i)))
+            .chain((0..6).map(|i| f.player_bank_bag_slot(i)))
             .chain((0..32).map(|i| f.player_keyring_slot(i)))
             .collect(),
         Some(ObjectType::Container) => (0..36).map(|i| f.container_slot(i)).collect(),
@@ -869,42 +851,13 @@ fn undo_roster(
 }
 
 /// The drain's end, however it ended: one that stopped before this lane replayed all it took
-/// leaves no rewound store for a later read, and the VM back on the views it held.
+/// leaves no rewound store for a later read.
 fn end_drain(world: &mut World) {
-    use bevy::ecs::system::RunSystemOnce;
-    if !world.get_resource::<UnitViews>().is_some_and(|v| v.started) {
-        return;
-    }
-    if let Err(e) = world.run_system_once(restore_after_stop) {
-        error!("views: the stopped drain's views are not put back: {e}");
-        if let Some(mut views) = world.get_resource_mut::<UnitViews>() {
+    if let Some(mut views) = world.get_resource_mut::<UnitViews>() {
+        if views.started {
             views.clear();
         }
     }
-}
-
-/// [`end_drain`]'s putting back.
-fn restore_after_stop(
-    mut vm: crate::script_calls::VmWith<(
-        ResMut<'static, UnitViews>,
-        Option<Res<'static, Selection>>,
-    )>,
-    interact: Option<Res<crate::ui_session::InteractNpc>>,
-) {
-    vm.turn(|script, (mut views, selection)| {
-        if let Some(script) = script {
-            let target = selection.as_deref().and_then(|s| s.guid);
-            let npc = interact.as_deref().and_then(|i| i.1);
-            let skip = views.frozen(target, npc);
-            let views = &mut *views;
-            let _pushes = views.saved.restore(script, &skip);
-            #[cfg(test)]
-            {
-                views.pushes += _pushes;
-            }
-        }
-        views.clear();
-    });
 }
 
 impl UnitViews {
@@ -931,20 +884,15 @@ impl UnitViews {
             start
         };
         let entity_of = |guid: u64| seats.entity_of(guid).unwrap_or_else(|| by_guid(guid));
-        let mut touched = HashSet::new();
         let mut stores = Vec::new();
         let mut records = false;
         let mut roster = false;
         for (guid, change) in entries.iter().flat_map(|e| &e.changes) {
             match change {
                 Change::Record(_) => records = true,
-                Change::Roster(_) => {
-                    roster = true;
-                    continue;
-                }
+                Change::Roster(_) => roster = true,
                 _ => stores.push(*guid),
             }
-            touched.insert(*guid);
         }
         stores.sort_unstable();
         stores.dedup();
@@ -973,7 +921,13 @@ impl UnitViews {
                 _ => {}
             }
         }
-        queue.extend(stores.iter().filter(|g| readable.all.contains(g)));
+        // Every item the frame changed too: the bag getters find an item by its seat or a bag's
+        // slot as its packet left them, wherever the item came from.
+        queue.extend(
+            stores
+                .iter()
+                .filter(|g| readable.all.contains(g) || benilla_protocol::guid::is_item(**g)),
+        );
         while let Some(guid) = queue.pop() {
             if scratch.contains_key(&guid) {
                 continue;
@@ -1010,7 +964,6 @@ impl UnitViews {
         let rewound =
             (roster || checked_roster).then(|| undo_roster(live_roster, &mut entries, start));
         self.roster = rewound.filter(|_| roster);
-        self.roster_touched = roster;
         self.pending = entries
             .into_iter()
             .filter_map(|mut entry| {
@@ -1020,85 +973,48 @@ impl UnitViews {
                 (!entry.changes.is_empty()).then_some(entry)
             })
             .collect();
-        // An item no view reads: it is rewound for the getters alone, and builds nothing.
-        touched.retain(|&g| {
-            !benilla_protocol::guid::is_item(g)
-                && (scratch.contains_key(&g) || readable.all.contains(&g))
-        });
-        self.named = (seats.target.map(|(g, _)| g), seats.npc.map(|(g, _)| g));
         self.scratch = scratch;
-        self.touched = touched;
-        self.readable = readable;
         #[cfg(test)]
         {
             self.starts_checked += checked.get();
         }
-    }
-
-    /// The tokens a call during the drain seated itself, by moving the selection from the guid
-    /// the drain began with to `target` or the interaction to `npc`: the lane leaves them.
-    fn frozen(&self, target: Option<u64>, npc: Option<u64>) -> Vec<&'static str> {
-        let mut frozen = Vec::new();
-        if target != self.named.0 {
-            frozen.extend(["target", "targettarget"]);
-        }
-        if npc != self.named.1 {
-            frozen.push("npc");
-        }
-        frozen
     }
 }
 
 /// What the lane's firing reads beside the VM and the stores it rewinds.
 #[derive(SystemParam)]
 pub(crate) struct ViewSources<'w, 's> {
-    tables: super::SnapshotTables<'w>,
-    names: Res<'w, NameCache>,
-    commands: Res<'w, NetCommands>,
-    guild: Res<'w, crate::ui_guild::GuildState>,
     index: Option<Res<'w, GuidIndex>>,
     interact: Option<Res<'w, crate::ui_session::InteractNpc>>,
     all: Query<'w, 's, &'static ObjectStore>,
     self_q: Query<'w, 's, (Entity, &'static Guid), With<SelfPlayer>>,
-    /// What the group tokens read beside the roster: the faction table and the area names.
-    factions: Option<Res<'w, crate::target::Factions>>,
-    areas: Option<Res<'w, crate::area::AreaTableRes>>,
-    auras: crate::ui_aura::AuraViews<'w>,
     start: Option<Res<'w, FrameStart>>,
+    selection: Res<'w, Selection>,
+    group: Res<'w, crate::ui_party::GroupState>,
 }
 
 /// The lane's `fire_until` ([`crate::lanes`]). Its start takes the frame's log and rewinds
-/// ([`UnitViews::rewind`]). Each firing applies every entry `until` admits, then pushes the views
-/// as of there, one build for the whole gap: at the start every view the frame's changes reach,
-/// then those the gap's do. A start that admits every entry finds nothing due before the feeds'
-/// pushes, and builds nothing; the last entry puts back what the VM held, the feeds' own views.
-#[allow(clippy::type_complexity)] // the snapshots' inputs, as the feeds read them
+/// ([`UnitViews::rewind`]). Each firing applies every entry `until` admits, so the getters read
+/// the stores, records and roster cells as of there ([`ViewStores`]); the last entry ends the
+/// replay, every store the live one again.
 fn fire_unit_views(
     In(until): In<Until>,
+    // Inside the set: the call host holds some of what the views read.
     mut vm: crate::script_calls::VmWith<(
         ResMut<'static, UnitViews>,
-        Res<'static, Selection>,
-        RelationWorld<'static, 'static>,
-        ResMut<'static, crate::ui_party::GroupState>,
-        // Inside the set: the call host holds some of what the views read.
         ViewSources<'static, 'static>,
     )>,
     mut log: ResMut<ViewLog>,
 ) {
-    vm.turn(|script, (mut views, selection, world, mut group, src)| {
+    vm.turn(|script, (mut views, src)| {
         let ViewSources {
-            tables,
-            names,
-            commands,
-            guild,
             index,
             interact,
             all,
             self_q,
-            factions,
-            areas,
-            auras,
             start,
+            selection,
+            group,
         } = &src;
         let live = |e: Entity| all.get(e).ok().cloned();
         let by_guid = |guid: u64| index.as_ref().and_then(|i| i.0.get(&guid).copied());
@@ -1108,8 +1024,7 @@ fn fire_unit_views(
             views.clear();
             return;
         };
-        let first = !views.started;
-        if first {
+        if !views.started {
             #[cfg(debug_assertions)]
             let start = start.as_deref().filter(|s| s.epoch == log.epoch);
             #[cfg(not(debug_assertions))]
@@ -1126,7 +1041,7 @@ fn fire_unit_views(
             let live_store = |guid: u64| by_guid(guid).and_then(|e| all.get(e).ok());
             let me = self_q.iter().next().and_then(|(e, _)| all.get(e).ok());
             let pet = crate::ui_unit::pet_token_guid(me);
-            let readable = readable_guids(script, &seats, &group, pet, &live_store);
+            let readable = readable_guids(script, &seats, group, pet, &live_store);
             views.rewind(
                 entries,
                 seats,
@@ -1139,145 +1054,10 @@ fn fire_unit_views(
             );
             views.started = true;
         }
-        let applied = views.apply(until);
-        // The roster cells moved: the group tokens name other members.
-        let roster_moved = views.roster_moved || (first && views.roster_touched);
-        views.roster_moved = false;
-        let last = views.pending.is_empty();
-        let live_store = |e: Entity| all.get(e).ok();
-        if first && last {
-            views.finish(live_store, &group.stats, group.cells());
-            return;
+        views.apply(until);
+        if views.pending.is_empty() {
+            views.finish(|e: Entity| all.get(e).ok(), &group.stats, group.cells());
         }
-        let frozen = views.frozen(selection.guid, npc_seat.map(|(g, _)| g));
-        if last {
-            let views = &mut *views;
-            let _pushes = views.saved.restore(script, &frozen);
-            #[cfg(test)]
-            {
-                views.pushes += _pushes;
-            }
-            views.finish(live_store, &group.stats, group.cells());
-            return;
-        }
-        let dirty = if first {
-            views.touched.clone()
-        } else {
-            applied
-        };
-        // A gap whose entries no view reads builds nothing.
-        if dirty.is_empty() && !roster_moved {
-            return;
-        }
-        #[cfg(test)]
-        {
-            views.builds += 1;
-        }
-        // The records and the cells as of here stand in the roster while the views are built.
-        let mut records = views.records.take();
-        if let Some(records) = records.as_mut() {
-            std::mem::swap(&mut group.bypass_change_detection().stats, records);
-        }
-        let mut roster = views.roster.take();
-        if let Some(roster) = roster.as_mut() {
-            group.bypass_change_detection().swap_cells(roster);
-        }
-        let UnitViews {
-            scratch,
-            saved,
-            readable,
-            ..
-        } = &mut *views;
-        let scratch = &*scratch;
-        let object =
-            |guid: u64| scratch_as_of(scratch, guid, by_guid(guid).and_then(|e| all.get(e).ok()));
-        let held = |guid: u64, entity: Option<Entity>| {
-            let live = entity.and_then(|e| all.get(e).ok());
-            Some((scratch_as_of(scratch, guid, live)?, guid))
-        };
-        let me = self_q.iter().next().and_then(|(e, g)| held(g.0, Some(e)));
-        let src = TokenSources {
-            tables,
-            names,
-            commands,
-            group: &group,
-            guild,
-            world: &world,
-        };
-        let stores = TokenStores {
-            me,
-            target: selection
-                .target
-                .zip(selection.guid)
-                .and_then(|(e, g)| held(g, Some(e))),
-            npc: interact
-                .as_deref()
-                .and_then(|i| Some((i.0?, i.1?)))
-                .and_then(|(e, g)| held(g, Some(e))),
-            by_guid: &object,
-        };
-        let mut pushes = 0;
-        // The four tokens when one of their units moved: ours, the target, its target, the NPC.
-        let hop = stores.target.and_then(|(s, _)| s.0.unit_target());
-        let tokens_moved = [
-            self_q.iter().next().map(|(_, g)| g.0),
-            selection.guid,
-            hop,
-            npc_seat.map(|(g, _)| g),
-        ]
-        .into_iter()
-        .flatten()
-        .any(|g| dirty.contains(&g));
-        if tokens_moved {
-            for (i, view) in token_views(&src, &stores).into_iter().enumerate() {
-                // `"player"` is pushed only while its descriptor exists, as the feed pushes it.
-                if frozen.contains(&TOKENS[i]) || (i == 0 && view.is_none()) {
-                    continue;
-                }
-                pushes += usize::from(saved.token(script, TOKENS[i], view));
-            }
-        }
-        let held_units = held_units(&src, &stores);
-        let rel = world.get();
-        let ffa = |guid: u64| {
-            object(guid).is_some_and(|store| super::pvp_free_for_all_of(&rel, guid, store))
-        };
-        let ctx = families::Families {
-            dirty: &dirty,
-            grouped: &readable.grouped,
-            object: &object,
-            me: me.map(|(s, g)| (g, s)),
-            live_me: self_q
-                .iter()
-                .next()
-                .and_then(|(e, g)| Some((g.0, all.get(e).ok()?))),
-            group: &group,
-            roster_moved,
-            tables,
-            names,
-            commands,
-            guild,
-            factions: factions.as_deref(),
-            areas: areas.as_deref().map(|a| &a.0),
-            auras,
-            world: &world,
-            ffa: &ffa,
-            held: &held_units,
-        };
-        pushes += families::push(script, saved, &ctx);
-        if let Some(records) = records.as_mut() {
-            std::mem::swap(&mut group.bypass_change_detection().stats, records);
-        }
-        if let Some(roster) = roster.as_mut() {
-            group.bypass_change_detection().swap_cells(roster);
-        }
-        views.records = records;
-        views.roster = roster;
-        #[cfg(test)]
-        {
-            views.pushes += pushes;
-        }
-        let _ = pushes;
     });
 }
 

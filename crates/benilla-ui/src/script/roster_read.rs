@@ -1,8 +1,9 @@
 //! The group getters' questions of the roster, asked of the lent host at the call
 //! ([`crate::script::live::ask`]): the reference's getters read the party slots (`0xbc6f48`), the
 //! leader cell (`0xbc75f8`), the loot cells and the raid rows (`0xb712a8`) as they stand when they
-//! run, so a listener reads the roster its own packet left. With no host free to ask, the
-//! snapshot ([`super::PartyState`]) answers.
+//! run, so a listener reads the roster its own packet left. With no host free to ask, the no-host
+//! default ([`super::PartyState`]) answers: ungrouped, as the app never pushes one, unless a
+//! host-less test seats it.
 
 use mlua::Lua;
 
@@ -164,6 +165,23 @@ pub struct GroupRow {
 
 impl LiveQuery for RowQuery {
     type Answer = GroupRow;
+}
+
+/// Every group row the token walk reads as an event names its unit (`0x515c50`): party rows 1 to
+/// 4 (`0x491920`, `0x491930`) and raid rows 1 to 40 (`0x491940`, `0x491960`), each as
+/// [`RowQuery`] answers it, at the call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GroupRowsQuery;
+
+/// The party rows and the raid rows, an empty row past the roster's end.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GroupRows {
+    pub party: [GroupRow; 4],
+    pub raid: Vec<GroupRow>,
+}
+
+impl LiveQuery for GroupRowsQuery {
+    type Answer = GroupRows;
 }
 
 /// `guid`'s place in the group, live where a host answers, else off the snapshot: the active

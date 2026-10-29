@@ -1,7 +1,7 @@
 //! What a packet handler signals inside itself, at the packet's place among the frame's other
 //! packets (`0x5384d0`, `0x537aa0`): the pet's spell list and mode, the area spirit healer's time,
-//! a game object's page text, and the trainer list's open, each interleaved with a fall's
-//! `UNIT_COMBAT` from the chat lane.
+//! a game object's page text, the trainer list's open and our control flag, each interleaved with a
+//! fall's `UNIT_COMBAT` from the chat lane.
 
 use benilla_protocol::{EntityKind, SessionEvent};
 use benilla_ui::script::UiScript;
@@ -252,6 +252,41 @@ fn a_game_objects_page_text_begins_at_its_packet() {
     );
 }
 
+/// A gossip menu's register closes the latched reader inside its handler (`0x4e26e0` →
+/// `0x4930d0` → `0x493310` → `0x4e32e0(0, 0)`), so `ITEM_TEXT_CLOSED` (`0x4e33a2`) fires at the
+/// menu's place among the frame's packets, though the reader's lane holds nothing then.
+#[test]
+fn a_register_at_a_packet_closes_the_reader_at_its_place() {
+    const NPC: u64 = 0xF130_0000_0000_0043;
+    let mut app = client();
+    tablet(&mut app, true);
+    frame(
+        &mut app,
+        vec![SessionEvent::GameObjectPageText { guid: TABLET }],
+    );
+    spy(&mut app, &["ITEM_TEXT_CLOSED"]);
+    let seen = frame(
+        &mut app,
+        vec![
+            fall(5),
+            SessionEvent::GossipMenu {
+                npc: NPC,
+                text_id: 7,
+                options: Vec::new(),
+                quests: Vec::new(),
+            },
+            fall(5),
+        ],
+    );
+    assert_eq!(seen, [FELL, "ITEM_TEXT_CLOSED", FELL]);
+    assert_eq!(
+        app.world()
+            .resource::<crate::ui_item_text::ItemTextOpen>()
+            .object(),
+        None
+    );
+}
+
 /// With the first page not cached the open asks for it and returns (`0x4e348b` → `0x4e35a0`); the
 /// page's answer runs the callback `0x4e3280`, which opens again (`0x4e32a5`), so
 /// `ITEM_TEXT_BEGIN` fires at the answer's place.
@@ -277,11 +312,12 @@ fn an_uncached_page_begins_at_its_answer() {
     assert_eq!(seen, [FELL, "ITEM_TEXT_BEGIN", FELL]);
 }
 
-/// The session's end drops the reads the item-text lane holds, as the other lanes' ends drop
-/// theirs; so does a worldport's leave-world sweep in the same frame, which closes the reader
-/// (`0x490abc` → `0x4e3240`) ahead of the lanes' drain.
+/// The session's end drops the signals the item-text lane holds, as the other lanes' ends drop
+/// theirs, and its shutdown's sweep closes the reader the packet opened; so does the leave-world
+/// sweep run ahead of the drain (a `/reload`'s), which closes the reader (`0x490abc` →
+/// `0x4e3240`).
 #[test]
-fn the_session_end_and_a_worldport_drop_the_item_text_lane() {
+fn the_session_end_and_a_sweep_drop_the_item_text_lane() {
     let reader = |app: &App| {
         app.world()
             .resource::<crate::ui_item_text::ItemTextOpen>()
@@ -292,6 +328,9 @@ fn the_session_end_and_a_worldport_drop_the_item_text_lane() {
     tablet(&mut app, true);
     let world = app.world_mut();
     crate::net::handlers::dispatch(world, page_text());
+    world
+        .resource_mut::<crate::ui_script::LeavingWorldArmed>()
+        .arm();
     world.init_resource::<crate::player::CameraControl>();
     world.run_schedule(OnExit(crate::client_state::ClientState::InWorld));
     crate::lanes::fire_in_order(world);
@@ -306,7 +345,7 @@ fn the_session_end_and_a_worldport_drop_the_item_text_lane() {
         .resource_mut::<crate::ui_script::LeavingWorldArmed>()
         .arm();
     crate::ui_script::run_leave_world_sweep(world);
-    assert!(frame(&mut app, vec![]).is_empty(), "the worldport's sweep");
+    assert!(frame(&mut app, vec![]).is_empty(), "the sweep");
     assert_eq!(reader(&app), None);
 }
 
@@ -347,4 +386,113 @@ fn a_trainer_list_opens_only_the_trainer_asked_or_the_gossip_npc() {
         .npc = None;
     frame(&mut app, vec![list(0)]);
     assert_eq!(open(&app), Some(0), "a zero guid against no gossip");
+}
+
+/// `SMSG_CLIENT_CONTROL_UPDATE` for us (`0x5fa6b1` → `SetPlayerControl 0x4958e0`): each change of
+/// the flag signals at its packet, `PLAYER_CONTROL_LOST` (`0x49590b`) reading `HasFullControl()`
+/// as the packet left it, then the usable refresh's `SPELL_UPDATE_USABLE` (`0x495910`); a packet
+/// that changes nothing signals nothing (`0x4958e6`), nor one naming another unit, as `0x5fa600`
+/// tells the interface for the active player alone (`0x5fa6a4`).
+#[test]
+fn each_control_change_signals_at_its_packet() {
+    let mut app = client();
+    app.world_mut()
+        .non_send_resource_mut::<UiScript>()
+        .run(
+            r#"
+            local f = CreateFrame("Frame")
+            for _, e in ipairs({"PLAYER_CONTROL_LOST", "PLAYER_CONTROL_GAINED",
+                "SPELL_UPDATE_USABLE"}) do f:RegisterEvent(e) end
+            f:SetScript("OnEvent", function()
+                if event == "SPELL_UPDATE_USABLE" then
+                    table.insert(Seen, event)
+                else
+                    table.insert(Seen, event .. ":" .. tostring(HasFullControl()))
+                end
+            end)
+            "#,
+        )
+        .unwrap();
+    let control = |mover, allow_move| SessionEvent::ClientControl { mover, allow_move };
+    let seen = frame(
+        &mut app,
+        vec![
+            fall(5),
+            control(ME, false),
+            control(ME, false),
+            control(STRANGER, true),
+            fall(5),
+            control(ME, true),
+        ],
+    );
+    assert_eq!(
+        seen,
+        [
+            FELL,
+            "PLAYER_CONTROL_LOST:nil",
+            "SPELL_UPDATE_USABLE",
+            FELL,
+            "PLAYER_CONTROL_GAINED:1",
+            "SPELL_UPDATE_USABLE",
+        ]
+    );
+}
+
+/// `UNIT_FIELD_SUMMON` and `UNIT_FIELD_POWER5`, the happiness.
+const SUMMON: u16 = 8;
+const HAPPINESS: u16 = 27;
+
+/// The pet's happiness watch (the bridge's id 21, signalled through `0x515e7a`) runs inside its
+/// update packet, so `UNIT_HAPPINESS` fires at that packet's place among the frame's other
+/// packets, once per token naming the pet; under its `Deviation:` only a change of the bucket
+/// (or its figures) signals, so a move within one bucket is silent.
+#[test]
+fn the_pets_happiness_signals_at_its_packet() {
+    use benilla_formats::{PetLoyaltyNames, PetPersonalities, PetPersonality};
+    let mut app = client();
+    let row = PetPersonality {
+        thresholds: [0, 333_000, 666_000],
+        damage: [0.75, 1.0, 1.25],
+        loyalty_rate: [-1.0, 0.0, 1.0],
+    };
+    app.world_mut()
+        .insert_resource(crate::ui_pet_stats::PetStatTables {
+            personalities: PetPersonalities::from_rows([(1, row)].into()),
+            loyalty: PetLoyaltyNames::from_names(Default::default()),
+        });
+    frame(
+        &mut app,
+        vec![
+            created(PET, EntityKind::Unit, &[(HAPPINESS, 500_000)]),
+            values(
+                ME,
+                &[(SUMMON, PET as u32), (SUMMON + 1, (PET >> 32) as u32)],
+            ),
+        ],
+    );
+    app.world_mut()
+        .non_send_resource_mut::<UiScript>()
+        .run(
+            r#"
+            local f = CreateFrame("Frame")
+            f:RegisterEvent("UNIT_HAPPINESS")
+            f:SetScript("OnEvent", function() table.insert(Seen, event .. ":" .. arg1) end)
+            "#,
+        )
+        .unwrap();
+    let happy = |raw: u32| values(PET, &[(HAPPINESS, raw)]);
+    let seen = frame(
+        &mut app,
+        vec![
+            fall(5),
+            happy(900_000),
+            happy(950_000),
+            fall(5),
+            happy(100_000),
+        ],
+    );
+    assert_eq!(
+        seen,
+        [FELL, "UNIT_HAPPINESS:pet", FELL, "UNIT_HAPPINESS:pet"]
+    );
 }

@@ -660,37 +660,6 @@ fn a_channel_notice_fires_its_token_and_the_reference_reads_arg7_and_arg10_bare(
     assert_eq!(lines_in_window(&s), 1);
 }
 
-/// The notice switch's MODE_CHANGE arm (`0x49c24d`) calls `0x49e910` and returns before the fire.
-#[test]
-fn a_mode_change_notice_never_becomes_an_event() {
-    let _data = benilla_formats::wow_data_or_skip!();
-    use benilla_protocol::messages::{channel_notice, ChannelNoticeTail};
-
-    let log = super::feed::ChatLog::default();
-    log.push_channel_notice(
-        channel_notice::MODE_CHANGE,
-        "World".into(),
-        &ChannelNoticeTail::ModeChange {
-            guid: 42,
-            old_flags: 0,
-            new_flags: 1,
-        },
-    );
-    assert_eq!(
-        log.pending_len(),
-        0,
-        "MODE_CHANGE is dropped at the feed — the reference's 0x0C arm fires nothing"
-    );
-
-    // The control: a notice that fires is queued.
-    log.push_channel_notice(
-        channel_notice::YOU_JOINED,
-        "World".into(),
-        &ChannelNoticeTail::YouJoined { flags: 0 },
-    );
-    assert_eq!(log.pending_len(), 1);
-}
-
 /// arg4, arg7, arg8 and arg9 are one channel record in the reference, defaulted together
 /// (`0x49b12f`).
 #[test]
@@ -1125,7 +1094,7 @@ fn a_session_end_empties_the_window_and_the_boxs_memory() {
 }
 
 /// Each token names a `CHAT_<X>_NOTICE` string (`ChatFrame.lua:1416`, `:1424`); the tokenless bytes
-/// are MODE_CHANGE (`0x0C`), which fires nothing, and the member lines JOINED and LEFT.
+/// are MODE_CHANGE (`0x0C`), whose lines `0x49e8a0` names itself, and the member lines JOINED and LEFT.
 #[test]
 fn every_notice_token_resolves_and_the_tokenless_bytes_stay_silent() {
     let _data = benilla_formats::wow_data_or_skip!();
@@ -1882,6 +1851,14 @@ fn an_addon_message_survives_its_own_send_and_receive() {
     let _data = benilla_formats::wow_data_or_skip!();
     let mut s = benilla_ui::script::UiScript::new().unwrap();
     s.keep_calls();
+    // The send needs the player object (`0x49f94b`).
+    s.set_unit(
+        "player",
+        Some(benilla_ui::script::UnitState {
+            exists: true,
+            ..Default::default()
+        }),
+    );
     s.run(r#"SendAddonMessage("oRA", "SYNC\t1\t2", "PARTY")"#)
         .unwrap();
     assert!(s.errors().is_empty(), "send raised: {:?}", s.errors());
@@ -2001,7 +1978,7 @@ fn a_speaker_that_cannot_animate_queues_no_talk_gesture() {
     let laugh_words = |n: u32| (n == 1).then(|| "lol".to_string());
     let speak = |tries: u16, flags: Option<u32>| {
         select_gesture(CHAT_MSG_SAY, "lol", laugh_words)
-            .filter(|_| !gesture_prevented(tries, flags))
+            .filter(|_| !gesture_prevented(tries == 0, flags))
             .into_iter()
             .count()
     };
@@ -2728,9 +2705,8 @@ fn a_channel_send_carries_the_numbered_slots_name() {
         ],
         ..Default::default()
     };
-    let mut script = in_world_vm();
-    script.set_joined_channels(channels.names());
-    let (mut world, rx) = super::chat_world(script);
+    let (mut world, rx) = super::chat_world(in_world_vm());
+    world.insert_resource(channels);
     super::run_chat(
         &mut world,
         r#"
@@ -2831,9 +2807,11 @@ fn a_channel_number_sends_as_the_walk_and_the_notices_leave_its_slot() {
             super::feed::deliver(script, &mut windows, channels, &mut notice(name, byte));
         }
     };
-    // One `SendChatMessage` to channel 1, and what reached the wire.
-    let send_to_1 = |script: benilla_ui::script::UiScript| {
+    // One `SendChatMessage` to channel 1 against the slots `channels` hold, and what reached the
+    // wire.
+    let send_to_1 = |script: benilla_ui::script::UiScript, channels: &ChannelState| {
         let (mut world, rx) = super::chat_world(script);
+        world.insert_resource(channels.clone());
         super::run_chat(&mut world, r#"SendChatMessage("lf1m", "CHANNEL", nil, 1)"#).expect("lua");
         let sent: Vec<_> = rx
             .try_iter()
@@ -2869,7 +2847,7 @@ fn a_channel_number_sends_as_the_walk_and_the_notices_leave_its_slot() {
         false,
         &crossing,
     );
-    let (sent, _) = send_to_1(script);
+    let (sent, _) = send_to_1(script, &channels);
     assert_eq!(
         sent,
         to("General - Elwynn Forest"),
@@ -2897,7 +2875,7 @@ fn a_channel_number_sends_as_the_walk_and_the_notices_leave_its_slot() {
         false,
         &[("Trade - City", "3")],
     );
-    let (sent, mut script) = send_to_1(script);
+    let (sent, mut script) = send_to_1(script, &channels);
     assert_eq!(sent, [], "a suspended slot sends nothing");
     cross(
         &mut script,
@@ -2906,7 +2884,7 @@ fn a_channel_number_sends_as_the_walk_and_the_notices_leave_its_slot() {
         true,
         &[("Trade - City", "2")],
     );
-    let (sent, _) = send_to_1(script);
+    let (sent, _) = send_to_1(script, &channels);
     assert_eq!(sent, to("Trade - City"), "confirmed again");
 }
 
@@ -2919,15 +2897,11 @@ fn an_empty_line_sends_nothing_but_afk_and_dnd() {
     use super::edit::{ChannelSlot, ChannelState};
     use crate::net::ChatKind;
 
-    let mut script = in_world_vm();
-    script.set_joined_channels(
-        ChannelState {
-            joined: vec![ChannelSlot::confirmed("General - Elwynn Forest", 1).into()],
-            ..Default::default()
-        }
-        .names(),
-    );
-    let (mut world, rx) = super::chat_world(script);
+    let (mut world, rx) = super::chat_world(in_world_vm());
+    world.insert_resource(ChannelState {
+        joined: vec![ChannelSlot::confirmed("General - Elwynn Forest", 1).into()],
+        ..Default::default()
+    });
     world.insert_resource(super::away::AfkMirror(2));
     super::run_chat(&mut world, SYSTEM_TAP).expect("lua");
     super::run_chat(
@@ -3319,27 +3293,17 @@ fn every_line_past_the_dead_check_acknowledges_the_chat_tutorial() {
             "{line}"
         );
     }
-    // The VM reads the bank the call wrote on its next line: the bit is set.
+    // The call writes the bank before it returns, so `TutorialsEnabled`, which reads it through
+    // the host (`crate::tutorial::TutorialLive`), finds the bit set on the next line.
     let last_open = [0xff, 0xff, 0xbf, 0xff, 0xff, 0xff, 0xff, 0xff];
-    world
-        .resource::<crate::tutorial::Tutorials>()
-        .lock()
-        .apply_flags(&last_open);
-    world
-        .non_send_resource_mut::<benilla_ui::script::UiScript>()
-        .set_tutorial_bank(Some(last_open.to_vec()));
-    super::run_chat(
-        &mut world,
-        r#"assert(TutorialsEnabled() == 1) SendChatMessage("hi") ENABLED = TutorialsEnabled()"#,
-    )
-    .expect("lua");
-    let enabled: Option<i64> = world
-        .non_send_resource::<benilla_ui::script::UiScript>()
-        .lua()
-        .globals()
-        .get("ENABLED")
-        .expect("a global");
-    assert_eq!(enabled, None, "the last open bit, acknowledged in the call");
+    let tutorials = || world.resource::<crate::tutorial::Tutorials>();
+    tutorials().lock().apply_flags(&last_open);
+    assert!(tutorials().enabled());
+    super::run_chat(&mut world, r#"SendChatMessage("hi")"#).expect("lua");
+    assert!(
+        !world.resource::<crate::tutorial::Tutorials>().enabled(),
+        "the last open bit, acknowledged in the call"
+    );
 }
 
 /// `SMSG_CHANNEL_LIST` (`0x49c690`) prints the members by name, with their prefixes, under the
@@ -3506,6 +3470,8 @@ fn the_call_host_applies_the_chat_calls_inside_the_verb() {
     let (tx, rx) = crossbeam_channel::unbounded();
     app.insert_resource(NetCommands(tx));
     app.world_mut().insert_non_send_resource(in_world_vm());
+    // `SendChatMessage` needs the player object (`0x49f219`).
+    crate::test_support::hold_self_player(app.world_mut(), 0x7, &[]);
     let sent_at_each_line = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
     let seen = sent_at_each_line.clone();
     crate::script_calls::with_hosted_vm(app.world_mut(), |s| {

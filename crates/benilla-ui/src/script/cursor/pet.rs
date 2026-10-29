@@ -15,12 +15,13 @@ use crate::script::pet::StoredPetAction;
 use crate::script::tick::verb;
 use crate::script::{Model, PetActionView};
 
-use super::{clear_cursor, set_cursor, CursorPayload, CursorPetAction};
+use super::{clear_cursor, set_cursor, CursorPayload, CursorPetAction, Setter};
 
 /// Pet bar slots (`NUM_PET_ACTION_SLOTS`, vmangos `MAX_UNIT_ACTION_BAR_INDEX`). Deviation: slot
-/// 11 is refused, because the reference's gate (`cmp esi,0xa; jbe`) admits it and neither
-/// `0x4bce00` nor `0x4bc9a0` bounds-checks again, so it writes one dword past the array, and the
-/// autocast toggle (`0x4bcbb0`) reads that word (`[0xb71438+0x28]`) with no bounds check.
+/// 11 is refused, because the reference's gate (`cmp esi,0xa; jbe`) admits it; `0x4bce00` checks
+/// its bound (`0x4bce14`) but `0x4bc9a0` does not, so it writes one dword past the array
+/// (`0x4bcad9`), and the autocast toggle (`0x4bcbb0`) reads that word (`[0xb71438+0x28]`) with
+/// no bounds check.
 const PET_SLOTS: u32 = 10;
 
 /// The slot type as the client masks it.
@@ -110,6 +111,8 @@ fn assign(slots: &mut [u32], target: usize, source: u32, passive: bool) -> Optio
 /// is copied, not moved; the blank comes after the setter's events, so they read the slot as it
 /// was. Returns whether to repaint.
 pub(super) fn pickup_pet_action(lua: &Lua, slot: u32) -> mlua::Result<bool> {
+    // The gate and the words as they stand.
+    crate::script::pet::seat_bar(lua);
     {
         let model = lua.app_data_ref::<Model>().expect("model app_data");
         if !model.pet_bar.pickup_allowed {
@@ -173,6 +176,8 @@ pub(in crate::script) fn clear_and_drop(lua: &Lua, slot: u32) -> mlua::Result<Op
     let Some(held) = held else {
         return Ok(None);
     };
+    // The core runs on the words as they stand (`0x4bc9a0`).
+    crate::script::pet::seat_bar(lua);
     let (entries, displaced) = verb(lua, |model| place_pet_action(model, slot, &held));
     let wrote = entries.is_some();
     if let Some(entries) = entries {
@@ -188,7 +193,9 @@ pub(in crate::script) fn clear_and_drop(lua: &Lua, slot: u32) -> mlua::Result<Op
 /// the clear and the set run as their own segments ([`set_cursor`]).
 fn set_pet_action(lua: &Lua, mut payload: CursorPetAction) {
     resolve_token_icon(lua, &mut payload);
-    set_cursor(lua, true, |_| Some(CursorPayload::PetAction(payload)));
+    set_cursor(lua, true, Setter::Controlled, |_| {
+        Some(CursorPayload::PetAction(payload))
+    });
 }
 
 /// The slot's word as a payload past the binding's clear (`0x4be23e`): the bar must exist and the
@@ -310,6 +317,10 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         lua.create_function(|lua, slot: Value| {
             // `is-number` else `Usage: PickupPetAction(index)` (`0x84793c`, `0x4be196`).
             let slot = binding_abi::index_arg32(lua, slot, "Usage: PickupPetAction(index)")?;
+            // `slot - 1` above 10 unsigned raises before the pet lookup (`0x4be1c0`, `0x84791c`).
+            if slot.wrapping_sub(1) > 10 {
+                return Err(mlua::Error::runtime("Invalid slot in PickupPetAction"));
+            }
             pickup_pet_action(lua, slot)?;
             Ok(())
         })?,
@@ -421,6 +432,38 @@ mod tests {
         s.keep_calls();
         s.set_pet_actions(true, true, true, hunter_bar());
         s
+    }
+
+    /// `slot - 1` is compared unsigned with 10 (`0x4be1bf`-`0x4be1c3`): 0, a negative or 12 and up
+    /// raise `Invalid slot in PickupPetAction` (`0x84791c`) before the pet lookup, and 11 passes.
+    #[test]
+    fn a_slot_outside_one_to_eleven_raises_invalid_slot() {
+        let s = bar_script();
+        for i in ["0", "-1", "12", "'-2.5'"] {
+            let e = s
+                .run(&format!("PickupPetAction({i})"))
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("Invalid slot in PickupPetAction"), "{i}: {e}");
+        }
+        assert!(s.cursor_payload().is_none());
+        s.run("PickupPetAction(11)").unwrap();
+    }
+
+    /// The pet-action setter needs control (`0x494e26`): without it the binding's own clear
+    /// (`0x4be220`) runs and nothing goes on.
+    #[test]
+    fn a_pet_action_goes_on_the_cursor_only_with_control() {
+        let mut s = bar_script();
+        s.set_player_control(false);
+        s.run("PickupPetAction(2)").unwrap();
+        assert!(s.cursor_payload().is_none(), "the setter refused");
+        s.set_player_control(true);
+        s.run("PickupPetAction(2)").unwrap();
+        assert!(matches!(
+            s.cursor_payload(),
+            Some(CursorPayload::PetAction(_))
+        ));
     }
 
     /// A drop clears first (`0x4be220`): its grid hide and `CURSOR_UPDATE` read the bar before the

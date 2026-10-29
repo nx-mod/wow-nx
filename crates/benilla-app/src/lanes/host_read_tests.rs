@@ -1,16 +1,35 @@
 //! The readiness guard for firing each packet's lanes inside the net dispatch, after its handlers,
 //! with the host lent: the reference's handler signals inside itself (`0x703e50`) and runs whole
 //! before the next packet's (`0x537ae5`), so a listener reads the live state its packet left and
-//! its sends go out in packet order. That move is right only once a lane's listener reads nothing
-//! a later system of the frame writes or pushes, which two lists name, each the whole of that
-//! remaining work and only shrinking; the move needs both empty.
+//! its sends go out in packet order. That move is right once five lists are empty, each the whole
+//! of its remaining work and only shrinking; [`flip_readiness`] prints where they stand.
 //!
-//! - The feeds that push a view of what a handler writes, which a getter reads in place of the
-//!   live state through the host: [`super::guard_tests::READS_FRAME_FINAL`], held here to its
-//!   count. A family's getters going live ([`crate::script_calls::live`]) drops its feed's row.
-//! - [`BETWEEN_THE_DISPATCH_AND_THE_DRAIN`]: the systems that may run after the dispatch and
-//!   ahead of the drain and write what the host's live reads read, or push a view the drain waits
-//!   for.
+//! - [`super::guard_tests::READS_FRAME_FINAL`], held here to its count: the feeds that push a
+//!   view of what a handler writes, which a getter reads in place of the live state. A family's
+//!   getters going live ([`crate::script_calls::live`]) drops its feed's row; a hover's build the
+//!   reference too makes outside every packet is
+//!   [`super::guard_tests::BUILT_OUTSIDE_THE_PACKETS_IN_THE_REFERENCE`]'s, which stays.
+//! - [`BETWEEN_THE_DISPATCH_AND_THE_DRAIN`]: the systems after the dispatch and ahead of the drain
+//!   that write what a call or a handler reads inside a packet (the host's live reads, the rest of
+//!   the call host's state, and what the handlers read without writing), or push a view the drain
+//!   waits for, where the reference writes inside a packet. A listener fired inside the dispatch
+//!   would read each as the frame before left it. The writers the reference too runs after the
+//!   packets, and those no listener can see, are [`AFTER_THE_PACKETS_IN_THE_REFERENCE`]'s, which
+//!   stays.
+//! - [`super::guard_tests::NOT_YET_ON_A_LANE`]: what fires off a handler's queue or edge from a
+//!   feed, ahead of every lane. Once the lanes fire inside the dispatch, each such event moves
+//!   from ahead of every packet event of its frame to behind them all.
+//! - [`super::guard_tests::NOT_YET_PLACED`]: the systems outside the phase that fire off a
+//!   handler queue in system order.
+//! - [`super::guard_tests::PLACED_OUTSIDE_THE_DISPATCH`]: the systems that push lane items off a
+//!   placed queue's field edges after the dispatch, at the edge's earlier stamp, which the
+//!   dispatch's own firing would already have passed, or at their own.
+//!
+//! [`super::guard_tests::LANE_READS_FRAME_FINAL`] empties at the flip itself, which makes the
+//! world a lane firing reads its packet's, and every entry of
+//! [`super::guard_tests::HOST_HELD_UNREAD`] is read first, as quiet or as a row of its own.
+//! [`super::guard_tests::QUEUED_FOR_THE_TICK`] holds the calls that queue an event for the VM's
+//! next tick, which fires behind every packet's events before the flip and after it.
 
 use std::any::TypeId;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -24,73 +43,129 @@ use crate::game_plugins::schedule_tests::{census, type_names_available, SyncPoin
 
 /// The most rows [`super::guard_tests::READS_FRAME_FINAL`] may hold, and the most inputs across
 /// them: each only falls, so lower it when a row or an input goes.
-const FRAME_FINAL_FEEDS: usize = 89;
-const FRAME_FINAL_INPUTS: usize = 426;
+const FRAME_FINAL_FEEDS: usize = 7;
+const FRAME_FINAL_INPUTS: usize = 30;
 
 /// The systems that may run after the dispatch (`apply_net_updates`) and run ahead of the drain
-/// (`fire_in_order`), by a suffix of the system's name, with what each writes of the host's live
-/// reads ([`crate::script_calls::live::LiveReads`]), by its name in the crate, and why. A listener
-/// fired inside the dispatch would read each of these as the frame before left it. `UiScript`
+/// (`fire_in_order`), by a suffix of the system's name, with what each writes of the state a
+/// listener's call or a handler reads inside a packet, by its name in the crate, and why: the
+/// host's live reads ([`crate::script_calls::live::LiveReads`]), the rest of the call host's
+/// state, which its verbs read, and what the handlers read without writing
+/// ([`super::guard_tests::READ_ONLY_TO_HANDLERS`]), the queues apart. These are the
+/// obstacles to the flip, each a write the reference makes inside a packet, or a view pushed in
+/// its place. A listener fired inside the dispatch would read each of these as the frame before
+/// left it. The writers the reference also runs after the packets are
+/// [`AFTER_THE_PACKETS_IN_THE_REFERENCE`]'s, not these. `UiScript`
 /// names a view the drain waits for ([`crate::ui_unit::field_events::FieldEventPushes`]);
 /// `Commands` names a component a system filters out and may add with its commands, which
 /// access does not show; `exclusive` a system whose access Bevy does not report.
 #[rustfmt::skip]
 const BETWEEN_THE_DISPATCH_AND_THE_DRAIN: &[(&str, &[&str], &str)] = &[
-    ("::net::apply::tag_self_player", &["Commands net::SelfPlayer"],
-        "tags our created entity as the player, which the token resolver finds it by; the \
-         reference makes it the active player inside its create (`0x5dea50`)"),
-    ("::query_cache::release_on_enter<benilla_app::go_templates::GameObjectTemplates>",
-        &["go_templates::GameObjectTemplates"],
-        "clears the object cache's in-flight asks on world entry, so each is asked again; the \
-         npc's object name reads the cache (`0x5f8100`)"),
-    ("::query_cache::release_on_enter<benilla_app::items::Items>", &["items::Items"],
-        "clears the item cache's in-flight asks on world entry, so each is asked again"),
-    ("::query_cache::release_on_enter<benilla_app::names::NameCache>", &["names::NameCache"],
-        "clears the name cache's in-flight asks on world entry, so each is asked again"),
-    ("::query_cache::release_on_enter<benilla_app::ui_guild::GuildState>", &["ui_guild::GuildState"],
-        "clears the guild cache's in-flight asks on world entry, so each is asked again"),
-    ("::spell::group_relation::publish_group_roster", &["spell::group_relation::GroupRoster"],
-        "copies the group's roster, which the relation reads take, once the packets are in"),
-    ("::ui_action::cooldown_lane::drop_cooldown_log<benilla_app::spell::cooldowns::Cooldowns>",
-        &["spell::cooldowns::Cooldowns"],
-        "drops the player's cooldown log with no in-game interface up; it goes with the log"),
-    ("::ui_action::cooldown_lane::drop_cooldown_log<benilla_app::ui_pet::PetBar>",
-        &["ui_pet::PetBar"],
-        "drops the pet's cooldown log with no in-game interface up; it goes with the log"),
-    ("::ui_action::state::feed_action_state", &["spell::cooldowns::Cooldowns",
-        "ui_action::state::ActionStateMemory"],
-        "keeps the frame's `GetTime` clock the cooldown reads map each start through, and \
-         writes the list as it walks the slots"),
-    ("::ui_aura::feed_auras", &["ui_aura::AuraFeedMemory"],
-        "rebuilds the raid filter's books and the world entry's player the aura walk reads, and \
-         keeps the clock pair the buff timers map the duration stamps through"),
-    ("::ui_char::feed_char", &["UiScript"], "a field event's listeners read its push"),
-    ("::ui_char::feed_skills", &["UiScript"], "a field event's listeners read its push"),
-    ("::ui_honor::feed_honor", &["UiScript"], "a field event's listeners read its push"),
-    ("::ui_inspect::feed_inspect", &["UiScript"], "a field event's listeners read its push"),
-    ("::ui_items::feed::feed_item_stats", &["items::Items"],
-        "takes the item cache's fresh and dropped records as it pushes them"),
-    ("::ui_items::feed::feed_random_properties", &["items::RandomProperties"],
-        "writes the random-suffix table as it pushes it, once per VM"),
-    ("::ui_party::feed::feed_party", &["UiScript"], "a field event's listeners read its push"),
-    ("::ui_pet::drain::arm_owed_pet_gcds", &["ui_pet::PetBar"],
-        "puts the GCDs the pet's sends owe into its list, which the reference arms at the send \
-         (`0x6e58fb`)"),
-    ("::ui_pet::unit::feed_pet_unit", &["UiScript", "names::NameCache"],
-        "a field event's listeners read its push; it watches the name cache's record of the pet's name"),
-    ("::ui_pet_stats::feed_pet_stats", &["UiScript"], "a field event's listeners read its push"),
-    ("::ui_reputation::drop_reputation_log", &["net::reputations::Reputations"],
-        "drops the reputation log with no in-game interface up; it goes with the log"),
-    ("::ui_tooltip::spell_feed::feed_spell_tooltips", &["items::Items"],
-        "writes the item cache as it builds the spell tooltips"),
-    ("::ui_unit::feed_units", &["UiScript", "ui_pet::PetBar"],
-        "a field event's listeners read its push; the world entry's pet reset writes the bar (`0x4bc6f0`)"),
-    ("::ui_unit::views::drop_unit_views", &["ui_unit::views::UnitViews"],
-        "drops the unit views' log with no in-game interface up; it goes with the log"),
+    ("::player::camera_saved::load_camera_pose", &["player::camera::CameraControl",
+        "player::camera::FlyCam", "player::state::Player"],
+        "restores the rig's distances and the camera's pitch from the per-character file once the \
+         roster names the character, which `SaveView` reads inside its call (`0x50fa30`); the \
+         reference reads the file as the world frame constructs its camera at the interface load \
+         (`0x481b4e` → `0x50c0e0`, `LoadSettings 0x50c5a0` at `0x50c3ea`), before any listener"),
+    ("::net::motion::remote::extrapolate_remote_units", &["Commands net::motion::spline::Spline",
+        "Transform", "net::motion::remote::RemoteMotion"],
+        "the arrival snap `0x7c6420` (`0x618dfc`) is written inside the packet"),
+    ("::transport::compose_riders", &["Transform", "net::motion::remote::RemoteMotion"],
+        "the arrival snap `0x7c6420` (`0x618dfc`) is written inside the packet"),
+    ("::ui_char::feed_char", &["UiScript", "ui_char::AmmoRecordHits"],
+        "a field event's listeners read its push, and it takes the ammo getters' record hits, a \
+         `UNIT_INVENTORY_CHANGED` each behind it, where the reference's hit registers no callback \
+         and the call reads the record itself (`0x4c83bc`, `0x4c89cf`)"),
+    ("::ui_chat::language::feed_language_skills", &["ui_chat::language::ChatLanguages"],
+        "recomputes the language skills off the book and the skill lines, which a page's show \
+         reads inside its packet (`0x4e3856`), where the reference reads the skill live at the \
+         show (`0x4e3837`)"),
+    ("::ui_item_text::apply_reads", &["ui_item_text::ItemTextOpen"],
+        "a click's or a bag use's read, queued in its input or its call, which the reference \
+         opens inside them (`0x5f58c0`, `0x4e32e0`), ahead of the packets (`0x420d23`)"),
+    ("::ui_macro::load_macros", &["ui_action::ActionSlots"],
+        "the macro reader (`LoadMacroFiles` `0x4f0600`), run as its sections settle, moves a \
+         character's buttons off benilla's older numbering through the bar verbs, a move with no \
+         reference fact; the reference runs the reader inside the account-data settle \
+         (`0x5afaca`, `0x5afd19`)"),
+    ("::ui_session::feed_interact_npc", &["ui_session::InteractNpc"],
+        "copies the interaction latch into the `npc` unit the token lookups read, where the \
+         reference's `npc` is the latch itself (`0x515c00`), set inside the handlers through \
+         `SetInteractionTarget` `0x4930d0`"),
 ];
 
-/// The systems [`BETWEEN_THE_DISPATCH_AND_THE_DRAIN`] holds to, with what each writes of the
-/// host's live reads, by suffix; see its doc for the kinds.
+/// The systems between the dispatch and the drain that write what the host's live reads read,
+/// as [`BETWEEN_THE_DISPATCH_AND_THE_DRAIN`]'s, but where the reference too runs them after the
+/// packets, or where no listener can read them: they stay after the flip, and a listener fired
+/// inside the dispatch reads them as the frame before left them, as 1.12.1's does. Same shape,
+/// held to its systems' access by the same test.
+#[rustfmt::skip]
+const AFTER_THE_PACKETS_IN_THE_REFERENCE: &[(&str, &[&str], &str)] = &[
+    ("::net::motion::facing::drive_display_facing", &["Commands net::motion::remote::RemoteMotion",
+        "Commands net::motion::spline::Spline", "Transform"],
+        "turns the units' models toward their facing; unit movement is \
+         frame time, which the reference runs after the packets (`0x420d63` after `0x420d55`)"),
+    ("::net::motion::spline::ground_clamp_creatures", &["Transform"],
+        "settles the creatures on the ground; unit movement is \
+         frame time, which the reference runs after the packets (`0x420d63` after `0x420d55`)"),
+    ("::net::motion::remote::drain_pending_moves", &["Commands net::motion::spline::Spline",
+        "net::motion::remote::RemoteMotion"],
+        "fires the relayed moves queued past their arrival in the movement tick (event 5's \
+         `0x616800` → `0x615b10` → `0x616620` → `0x615c30`), frame time, which the reference \
+         runs after the packets (`0x420d63` after `0x420d55`)"),
+    ("::net::game_time::tick_game_time", &["net::game_time::ServerTime"],
+        "steps the game clock by the frame time, the category 5 handler `0x401ec0` → `0x6c5d50` \
+         → `0x6435a0`, which the reference runs after the packets (`0x420d63` after \
+         `0x420d55`)"),
+    ("::net::motion::spline::sample_splines", &["Commands net::motion::spline::Spline",
+        "Transform"],
+        "moves the units along their splines; unit movement is \
+         frame time, which the reference runs after the packets (`0x420d63` after `0x420d55`)"),
+    ("::transport::ground_deck_riders", &["Transform", "net::motion::remote::RemoteMotion"],
+        "settles the riders on their decks; unit movement is \
+         frame time, which the reference runs after the packets (`0x420d63` after `0x420d55`)"),
+    ("::transport::tick_transports", &["Transform"],
+        "moves the transports along their paths; unit movement is \
+         frame time, which the reference runs after the packets (`0x420d63` after `0x420d55`)"),
+    ("::ui_action::cooldown_lane::drop_cooldown_log<benilla_app::spell::cooldowns::Cooldowns>",
+        &["spell::cooldowns::Cooldowns"],
+        "drops the player's cooldown log, run only while no in-game interface \
+         is up, so no listener exists; it goes with the log"),
+    ("::ui_action::cooldown_lane::drop_cooldown_log<benilla_app::ui_pet::PetBar>",
+        &["ui_pet::PetBar"],
+        "drops the pet's cooldown log, run only while no in-game interface \
+         is up, so no listener exists; it goes with the log"),
+    ("::ui_cast::views::drop_cast_views", &["ui_cast::views::CastViews"],
+        "drops the cast views' log, run only while no in-game interface \
+         is up, so no listener exists; it goes with the log"),
+    ("::ui_chat::language::load_language_words", &["ui_chat::language::ChatLanguages"],
+        "loads `LanguageWords.dbc` once, the first frame the install is open, ahead of every \
+         world packet, as the reference loads it at startup (`StaticDBLoadAll` `0x53f8b0` → \
+         `0x548990`, from `ClientDBInitialize` `0x53f4f0`): no listener reads the pools before \
+         it"),
+    ("::ui_mail::step_pending_mail", &["ui_mail::pending::MailPending"],
+        "steps the pending-mail time in the world frame's update (its slot `0x38`, `0x4818d0` → \
+         `0x4ade60`), which the frame pass runs after the packets (`0x420d6a` after `0x420d55`)"),
+    ("::ui_loot::drop_loot_steps", &["ui_loot::LootState"],
+        "drops the loot lane's window signals, its pushes kept, run only while no in-game \
+         interface is up, so no listener exists"),
+    ("::ui_loot_roll::lane::drop_roll_events", &["ui_loot_roll::LootRolls"],
+        "drops the rolls' lane, run only while no in-game interface is up, so no listener \
+         exists"),
+    ("::ui_mail::lane::drop_mail_events", &["ui_mail::pending::MailPending"],
+        "drops the mail lane, a parked close's tail with its query kept, run only while no \
+         in-game interface is up, so no listener exists"),
+    ("::ui_reputation::drop_reputation_log", &["net::reputations::Reputations"],
+        "drops the reputation log, run only while no in-game interface \
+         is up, so no listener exists; it goes with the log"),
+    ("::ui_unit::views::drop_unit_views", &["ui_unit::views::UnitViews"],
+        "drops the unit views' log, run only while no in-game interface \
+         is up, so no listener exists; it goes with the log"),
+];
+
+/// The systems [`BETWEEN_THE_DISPATCH_AND_THE_DRAIN`] and [`AFTER_THE_PACKETS_IN_THE_REFERENCE`]
+/// hold to, with what each writes of the state a call or a handler reads, by suffix; see the
+/// first's doc for that state and the kinds.
 fn writers_between(app: &mut App) -> Option<BTreeMap<String, BTreeSet<String>>> {
     let world = app.world_mut();
     use bevy::ecs::system::System;
@@ -105,6 +180,47 @@ fn writers_between(app: &mut App) -> Option<BTreeMap<String, BTreeSet<String>>> 
         .to_vec();
     let mut read_resources = HashSet::new();
     let mut read_components = HashSet::new();
+    // What a listener inside the dispatch reads past the live families: every resource and
+    // component a call's verbs touch through the host, and what the handlers read without writing
+    // ([`super::guard_tests::READ_ONLY_TO_HANDLERS`]), each a read made inside a packet in the
+    // reference. The queues are not state: the lanes, the message buffers and what a handler fills
+    // through a shared reference.
+    crate::net::handlers::measure(world);
+    let queues: HashSet<ComponentId> = super::guard_tests::lane_types()
+        .into_iter()
+        .filter_map(|t| world.components().get_resource_id(t))
+        .collect();
+    let is_state = |world: &World, id: ComponentId| {
+        let n = super::guard_tests::name(world, id);
+        !queues.contains(&id)
+            && !super::guard_tests::is_messages(world, id)
+            && !super::guard_tests::ends_with_any(&n, super::guard_tests::FILLED_THROUGH_A_READ)
+    };
+    let handlers = world.resource::<crate::net::handlers::NetHandlers>();
+    let mut handler_reads = HashSet::new();
+    for (_, access) in handlers.accesses() {
+        let access = access.combined_access();
+        handler_reads.extend(
+            access
+                .resource_reads()
+                .filter(|id| !access.has_resource_write(*id)),
+        );
+    }
+    read_resources.extend(handler_reads.into_iter().filter(|id| is_state(world, *id)));
+    for fa in &host {
+        read_resources.extend(
+            fa.access()
+                .resource_reads_and_writes()
+                .filter(|id| is_state(world, *id)),
+        );
+        if let Ok(kinds) = fa.access().try_iter_component_access() {
+            read_components.extend(kinds.map(|k| match k {
+                ComponentAccessKind::Archetypal(id)
+                | ComponentAccessKind::Shared(id)
+                | ComponentAccessKind::Exclusive(id) => id,
+            }));
+        }
+    }
     for fa in &live {
         read_resources.extend(fa.access().resource_reads_and_writes());
         if let Ok(kinds) = fa.access().try_iter_component_access() {
@@ -235,8 +351,17 @@ fn writers_between(app: &mut App) -> Option<BTreeMap<String, BTreeSet<String>>> 
     Some(found)
 }
 
-/// Every system between the dispatch and the drain that writes what the host's live reads read
-/// has its row, as it stands, and a row whose system no longer does is stale.
+/// Every row between the dispatch and the drain: the obstacles, then the writers that stay.
+fn rows_between(
+) -> impl Iterator<Item = &'static (&'static str, &'static [&'static str], &'static str)> {
+    BETWEEN_THE_DISPATCH_AND_THE_DRAIN
+        .iter()
+        .chain(AFTER_THE_PACKETS_IN_THE_REFERENCE)
+}
+
+/// Every system between the dispatch and the drain that writes what a call or a handler reads has
+/// its row, in one of the two lists, as it stands, and a row whose system no longer does is stale:
+/// a feed that rewrites once a frame what a listener's call reads inside its packet cannot hide.
 #[test]
 fn every_writer_between_the_dispatch_and_the_drain_is_listed() {
     let mut app = crate::game_plugins::schedule_tests::headless_client();
@@ -244,11 +369,17 @@ fn every_writer_between_the_dispatch_and_the_drain_is_listed() {
         eprintln!("skipped: this build carries no type names");
         return;
     };
-    let row = |system: &str| {
-        BETWEEN_THE_DISPATCH_AND_THE_DRAIN
-            .iter()
-            .find(|(s, _, _)| format!("::{system}").ends_with(s))
-    };
+    let twice: Vec<&str> = BETWEEN_THE_DISPATCH_AND_THE_DRAIN
+        .iter()
+        .filter(|(s, _, _)| {
+            AFTER_THE_PACKETS_IN_THE_REFERENCE
+                .iter()
+                .any(|(a, _, _)| a == s)
+        })
+        .map(|(s, _, _)| *s)
+        .collect();
+    assert!(twice.is_empty(), "rows in both lists: {twice:?}");
+    let row = |system: &str| rows_between().find(|(s, _, _)| format!("::{system}").ends_with(s));
     let wrong: Vec<String> = found
         .iter()
         .filter(|(system, writes)| {
@@ -265,8 +396,7 @@ fn every_writer_between_the_dispatch_and_the_drain_is_listed() {
             format!("(\"::{system}\", &[{}], \"\"),", writes.join(", "))
         })
         .collect();
-    let stale: Vec<&str> = BETWEEN_THE_DISPATCH_AND_THE_DRAIN
-        .iter()
+    let stale: Vec<&str> = rows_between()
         .filter(|(s, _, _)| {
             !found
                 .keys()
@@ -276,14 +406,14 @@ fn every_writer_between_the_dispatch_and_the_drain_is_listed() {
         .collect();
     assert!(
         wrong.is_empty(),
-        "these run between the dispatch and the drain and write what the host's live reads read: \
-         move the write into its handler, or give each its row in \
-         BETWEEN_THE_DISPATCH_AND_THE_DRAIN as it stands:\n  {}",
+        "these run between the dispatch and the drain and write what a call or a handler reads: \
+         move the write into its handler, or give each its row as it stands: in \
+         AFTER_THE_PACKETS_IN_THE_REFERENCE when the reference too writes it after the packets, \
+         else in BETWEEN_THE_DISPATCH_AND_THE_DRAIN:\n  {}",
         wrong.join("\n  ")
     );
     assert!(stale.is_empty(), "stale rows: {stale:?}");
-    let empty: Vec<&str> = BETWEEN_THE_DISPATCH_AND_THE_DRAIN
-        .iter()
+    let empty: Vec<&str> = rows_between()
         .filter(|(_, _, why)| why.is_empty())
         .map(|(s, _, _)| *s)
         .collect();
@@ -302,4 +432,73 @@ fn the_frame_final_views_only_shrink() {
          {FRAME_FINAL_INPUTS}: read the new state live through the host instead",
         rows.len()
     );
+}
+
+/// Where the flip stands: every list's count, printed, failing nothing (`cargo test
+/// flip_readiness -- --nocapture`). The flip needs the first five empty; the rest are context.
+#[test]
+fn flip_readiness() {
+    use super::guard_tests as g;
+    let inputs: usize = g::READS_FRAME_FINAL.iter().map(|(_, i)| i.len()).sum();
+    let lane_inputs: usize = g::LANE_READS_FRAME_FINAL.iter().map(|(_, i)| i.len()).sum();
+    let needs = [
+        (
+            "READS_FRAME_FINAL",
+            g::READS_FRAME_FINAL.len(),
+            format!(" ({inputs} inputs)"),
+        ),
+        (
+            "BETWEEN_THE_DISPATCH_AND_THE_DRAIN",
+            BETWEEN_THE_DISPATCH_AND_THE_DRAIN.len(),
+            String::new(),
+        ),
+        (
+            "NOT_YET_ON_A_LANE",
+            g::NOT_YET_ON_A_LANE.len(),
+            String::new(),
+        ),
+        ("NOT_YET_PLACED", g::NOT_YET_PLACED.len(), String::new()),
+        (
+            "PLACED_OUTSIDE_THE_DISPATCH",
+            g::PLACED_OUTSIDE_THE_DISPATCH.len(),
+            String::new(),
+        ),
+    ];
+    let context = [
+        (
+            "HOST_HELD_UNREAD (read, each quiet; stays)",
+            g::HOST_HELD_UNREAD.len(),
+            String::new(),
+        ),
+        (
+            "LANE_READS_FRAME_FINAL (empties at the flip)",
+            g::LANE_READS_FRAME_FINAL.len(),
+            format!(" ({lane_inputs} inputs)"),
+        ),
+        (
+            "AFTER_THE_PACKETS_IN_THE_REFERENCE (stays)",
+            AFTER_THE_PACKETS_IN_THE_REFERENCE.len(),
+            String::new(),
+        ),
+        (
+            "BUILT_OUTSIDE_THE_PACKETS_IN_THE_REFERENCE (stays)",
+            g::BUILT_OUTSIDE_THE_PACKETS_IN_THE_REFERENCE.len(),
+            String::new(),
+        ),
+        (
+            "QUEUED_FOR_THE_TICK (behind every packet, flip or not)",
+            g::QUEUED_FOR_THE_TICK.len(),
+            String::new(),
+        ),
+    ];
+    let left: usize = needs.iter().map(|(_, n, _)| n).sum();
+    let mut out = format!("flip readiness: {left} rows to empty\n");
+    for (list, n, extra) in &needs {
+        out += &format!("  {n:>4}  {list}{extra}\n");
+    }
+    out += "  context:\n";
+    for (list, n, extra) in &context {
+        out += &format!("  {n:>4}  {list}{extra}\n");
+    }
+    eprint!("{out}");
 }

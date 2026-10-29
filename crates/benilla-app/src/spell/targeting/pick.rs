@@ -131,12 +131,19 @@ pub(crate) struct UnitPick {
 /// Publish [`UnitPick`] in the feed, after the packets and the clicks, beside
 /// [`super::PicksSelf`].
 pub(crate) fn publish_unit_pick(targeting: Res<SpellTargeting>, mut pick: ResMut<UnitPick>) {
-    let flags = targeting
-        .0
-        .as_ref()
-        .map(|targeting| PickFlags::of(targeting.word));
-    if pick.flags != flags {
-        pick.flags = flags;
+    pick.publish(&targeting);
+}
+
+impl UnitPick {
+    /// The flags of the word `targeting` stands at.
+    pub(crate) fn publish(&mut self, targeting: &SpellTargeting) {
+        let flags = targeting
+            .0
+            .as_ref()
+            .map(|targeting| PickFlags::of(targeting.word));
+        if self.flags != flags {
+            self.flags = flags;
+        }
     }
 }
 
@@ -160,13 +167,20 @@ pub(crate) struct GoPickWord {
 
 /// Publish [`GoPick`] in the feed, beside [`UnitPick`].
 pub(crate) fn publish_go_pick(targeting: Res<SpellTargeting>, mut pick: ResMut<GoPick>) {
-    let now = targeting.0.as_ref().map(|t| GoPickWord {
-        word: t.word,
-        spell_id: t.spell_id,
-        item: t.commit.item_guid(),
-    });
-    if pick.0 != now {
-        pick.0 = now;
+    pick.publish(&targeting);
+}
+
+impl GoPick {
+    /// The word `targeting` stands at, its spell and its cast item.
+    pub(crate) fn publish(&mut self, targeting: &SpellTargeting) {
+        let now = targeting.0.as_ref().map(|t| GoPickWord {
+            word: t.word,
+            spell_id: t.spell_id,
+            item: t.commit.item_guid(),
+        });
+        if self.0 != now {
+            self.0 = now;
+        }
     }
 }
 
@@ -310,7 +324,7 @@ impl PickChecks<'_, '_> {
 mod tests {
     use super::*;
     use crate::net::{GuidIndex, Reputations};
-    use crate::spell::group_relation::publish_group_roster;
+    use crate::spell::group_relation::publish_in;
     use crate::spell::targeting::corpse_fixture as fx;
     use benilla_protocol::messages::GroupMemberEntry;
     use benilla_protocol::ObjectFields;
@@ -610,7 +624,7 @@ mod tests {
             });
     }
 
-    /// The pick under `word` and the roster as it stands, published as a frame does.
+    /// The pick under `word` and the roster as it stands, published as a group packet does.
     fn asked(world: &mut World, word: u16, entity: Entity) -> bool {
         world.resource_mut::<SpellTargeting>().enter(
             fx::RESURRECTION,
@@ -620,9 +634,7 @@ mod tests {
         world
             .run_system_once(publish_unit_pick)
             .expect("the word publishes");
-        world
-            .run_system_once(publish_group_roster)
-            .expect("the roster publishes");
+        publish_in(world);
         world
             .run_system_once(move |checks: PickChecks, stores: Query<&ObjectStore>| {
                 checks.admits_unit(entity, stores.get(entity).ok())

@@ -206,32 +206,154 @@ fn slot_is_broken(v: &InvSlotView, durability: Option<(u32, u32)>) -> bool {
     v.flags & 0x10 != 0 || matches!(durability, Some((0, max)) if max > 0)
 }
 
-/// One region's `GetInventoryAlertStatus` (`0x4c7ee0`): 4 when force-red or broken, 3 with 1..=5
-/// durability points left (an absolute count, not a percentage), else 0. Statuses 1 and 2, the
-/// temporary-enchant alerts, are not fed; stock gives them no color (`DurabilityFrame.lua:18-19`).
-fn alert_status(slot: &Option<InvSlotView>) -> u8 {
-    let Some(v) = slot.as_ref().filter(|v| v.item_id != 0) else {
+/// What `0x4c7ee0` reads of one worn item: `ITEM_FIELD_FLAGS` (`+0x3c`), `DURABILITY` (`+0xa0`)
+/// and `MAXDURABILITY` (`+0xa4`); for the temporary-enchant arm, the record's flags (the `+0x110`
+/// table's slot 0, `0x4c8039`, 0 while the record is not cached), the temporary enchantment's id
+/// (`ITEM_FIELD_ENCHANTMENT` slot 1, `+0x4c`, `0x4c8043`) and its milliseconds left
+/// (`0x5d9d00(1)`, `0x4c805b`: the deadline less now, 0 when unset or run out).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AlertItem {
+    pub flags: u32,
+    pub durability: u32,
+    pub max_durability: u32,
+    pub record_flags: u32,
+    pub temp_enchant: u32,
+    pub temp_enchant_left_ms: u32,
+}
+
+/// `0x4c7ee0`'s reads: the item `GetItemInSlot` (`0x6228a0`) finds in each of the 11 worn regions,
+/// in `0x806eb8`'s order, and, while `PLAYER_AMMO_ID` is set, the carried count of that ammunition
+/// (`0x622130(id, 0)`, `0x4c7f73`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AlertInputs {
+    pub worn: [Option<AlertItem>; 11],
+    pub ammo: Option<u32>,
+}
+
+/// The live question of the alert recompute: its reads as of here, `None` while no active player
+/// is held, when the recompute does nothing (`0x4c7f06`).
+pub struct InventoryAlertInputs;
+
+impl super::live::LiveQuery for InventoryAlertInputs {
+    type Answer = Option<AlertInputs>;
+}
+
+/// One worn region's status (`0x4c7faa`-`0x4c806d`): 4 when force-red (`0x10`); else, unless
+/// wrapped (`0x08`) or without a maximum, 4 at durability 0 and 3 with 1..=5 points left (an
+/// absolute count, not a fraction); else the temporary-enchant arm (`0x4c8035`): with record flag
+/// `0x2000` clear (`0x4c803b`) and a temporary enchantment (`0x4c8046`), 1, or 2 with 30000 ms or
+/// fewer left (`0x4c8060`, unsigned); else 0.
+fn alert_status(item: Option<AlertItem>) -> u8 {
+    let Some(v) = item else {
         return 0;
     };
     if v.flags & 0x10 != 0 {
         return 4;
     }
-    if v.flags & 0x08 != 0 {
+    if v.flags & 0x08 == 0 && v.max_durability != 0 {
+        match v.durability {
+            0 => return 4,
+            1..=5 => return 3,
+            _ => {}
+        }
+    }
+    if v.record_flags & 0x2000 != 0 || v.temp_enchant == 0 {
         return 0;
     }
-    match v.durability {
-        Some((0, max)) if max > 0 => 4,
-        Some((1..=5, max)) if max > 0 => 3,
-        _ => 0,
+    if v.temp_enchant_left_ms <= 30_000 {
+        2
+    } else {
+        1
     }
 }
 
-/// The low-ammo region (`0x4c7ee0`'s slot -1 arm): 3 when the carried ammo is 20 or fewer, else 0.
-fn ammo_alert_status(slot: &Option<InvSlotView>) -> u8 {
-    match slot.as_ref().filter(|v| v.item_id != 0) {
-        Some(v) if v.count <= 20 => 3,
-        _ => 0,
+/// Each region's status off `inputs`, in `0x806eb8`'s order, with the tutorial its arm fires: a
+/// region broken by durability fires Broken Items (`0x4c8002`) and a damaged one Damaged Items
+/// (`0x4c802e`); the force-red arm (`0x4c7fb0`), the temporary-enchant arm and the ammo arm
+/// (`0x4c7f78`: 3 at 20 or fewer) fire nothing.
+fn alert_statuses(inputs: &AlertInputs) -> [(u8, Option<u32>); 12] {
+    let mut out = [(0u8, None); 12];
+    for (i, &item) in inputs.worn.iter().enumerate() {
+        let status = alert_status(item);
+        let forced = item.is_some_and(|v| v.flags & 0x10 != 0);
+        let tutorial = match status {
+            4 if !forced => Some(TUTORIAL_BROKEN_ITEMS),
+            3 => Some(TUTORIAL_DAMAGED_ITEMS),
+            _ => None,
+        };
+        out[i] = (status, tutorial);
     }
+    out[11].0 = match inputs.ammo {
+        Some(count) if count <= 20 => 3,
+        _ => 0,
+    };
+    out
+}
+
+/// The doll snapshot's reads, for a VM with no host to ask: each worn region's view, and the ammo
+/// view's count.
+fn snapshot_alert_inputs(model: &Model) -> AlertInputs {
+    let slots = &model.inventory_slots;
+    let worn = std::array::from_fn(|i| {
+        slots[ALERT_SLOTS[i]]
+            .as_ref()
+            .filter(|v| v.item_id != 0)
+            .map(|v| {
+                let (durability, max_durability) = v.durability.unwrap_or((0, 0));
+                // The snapshot holds no temporary enchantment: its arm reads none.
+                AlertItem {
+                    flags: v.flags,
+                    durability,
+                    max_durability,
+                    ..AlertItem::default()
+                }
+            })
+    });
+    let ammo = slots[ALERT_SLOTS[11]]
+        .as_ref()
+        .filter(|v| v.item_id != 0)
+        .map(|v| v.count);
+    AlertInputs { worn, ammo }
+}
+
+/// The recompute's reads through the lent host, as of here, else off the doll snapshot; `None`
+/// while no active player is held.
+fn alert_inputs(lua: &Lua) -> Option<AlertInputs> {
+    match super::live::ask(lua, &InventoryAlertInputs) {
+        Some(inputs) => inputs,
+        None => {
+            let model = lua.app_data_ref::<Model>().expect("model app_data");
+            Some(snapshot_alert_inputs(&model))
+        }
+    }
+}
+
+/// `0x4c7ee0`'s pass over the stored statuses (`0xb71f60`), region by region: each set to 0 and
+/// recomputed (`0x4c7f1b`), its tutorial fired at once (`0x4b5390` with delay 0), so a
+/// `TUTORIAL_TRIGGER` listener reads the regions before it recomputed and those after it as the
+/// last pass left them; the caller signals. The caller holds no borrow of the model.
+fn store_inventory_alerts(lua: &Lua, inputs: &AlertInputs) {
+    for (i, (status, tutorial)) in alert_statuses(inputs).into_iter().enumerate() {
+        lua.app_data_mut::<Model>()
+            .expect("model app_data")
+            .inventory_alerts[i] = status;
+        if let Some(id) = tutorial {
+            super::tutorial::trigger_in_place(lua, id);
+        }
+    }
+}
+
+/// The alert recompute in a verb's call (`UpdateInventoryAlertStatus`, `0x4c9560`): the statuses
+/// stored and `UPDATE_INVENTORY_ALERTS` raised at the pass's end (`0x4c8085`); nothing while no
+/// active player is held.
+pub(super) fn recompute_inventory_alerts_in_verb(lua: &Lua) {
+    let Some(inputs) = alert_inputs(lua) else {
+        return;
+    };
+    store_inventory_alerts(lua, &inputs);
+    super::tick::verb(lua, |model| {
+        model.raise("UPDATE_INVENTORY_ALERTS", Vec::new());
+    });
 }
 
 impl super::UiScript {
@@ -249,15 +371,23 @@ impl super::UiScript {
         })
     }
 
-    /// Push the doll snapshot, recompute the 12 alert statuses and fire `UPDATE_INVENTORY_ALERTS`.
+    /// Push the doll snapshot. The alert statuses are the recompute's alone
+    /// ([`Self::recompute_inventory_alerts`]).
     pub fn set_inventory_slots(&mut self, slots: InventorySlots) {
-        {
-            let mut model = self.model_mut();
-            model.inventory_slots = slots;
-            recompute_inventory_alerts(&mut model);
-        }
-        // Every recompute fires it, never diffed against the last (`0x4c7ee0`); the app pushes
-        // only on a real change.
+        self.model_mut().inventory_slots = slots;
+    }
+
+    /// The alert recompute `0x4c7ee0`, where a field watcher, the world entry's set-up
+    /// (`0x4c6d30`) or the verb runs it: its reads as of here through the lent host
+    /// ([`InventoryAlertInputs`]), else off the doll snapshot; the 12 statuses stored, their
+    /// tutorials, and `UPDATE_INVENTORY_ALERTS` on every pass, whether or not a status changed
+    /// (`0x4c8085`). Nothing while no active player is held (`0x4c7f06`).
+    pub fn recompute_inventory_alerts(&mut self) {
+        let lua = self.lua().clone();
+        let Some(inputs) = alert_inputs(&lua) else {
+            return;
+        };
+        store_inventory_alerts(&lua, &inputs);
         self.fire_event("UPDATE_INVENTORY_ALERTS", vec![]);
     }
 
@@ -274,36 +404,6 @@ impl super::UiScript {
             super::ScriptCall::UseInventoryItem { slot, .. } => Some(*slot),
             _ => None,
         })
-    }
-}
-
-/// The 12 alert statuses off the doll snapshot (`0x4c7ee0`'s recompute), without the event. A
-/// slot it finds broken by durability triggers Broken Items (`0x4c8002`) and one it finds damaged
-/// Damaged Items (`0x4c802e`); the force-red arm (`0x4c7fb0`) and the ammo arm trigger nothing.
-pub(super) fn recompute_inventory_alerts(model: &mut Model) {
-    let slots = &model.inventory_slots;
-    let alerts: [u8; 12] = std::array::from_fn(|i| {
-        if i == 11 {
-            ammo_alert_status(&slots[ALERT_SLOTS[i]])
-        } else {
-            alert_status(&slots[ALERT_SLOTS[i]])
-        }
-    });
-    let forced = |i: usize| {
-        slots[ALERT_SLOTS[i]]
-            .as_ref()
-            .is_some_and(|v| v.flags & 0x10 != 0)
-    };
-    let owed: Vec<u32> = (0..11)
-        .filter_map(|i| match alerts[i] {
-            4 if !forced(i) => Some(TUTORIAL_BROKEN_ITEMS),
-            3 => Some(TUTORIAL_DAMAGED_ITEMS),
-            _ => None,
-        })
-        .collect();
-    model.inventory_alerts = alerts;
-    for id in owed {
-        model.tutorial_triggers.push(id);
     }
 }
 
@@ -436,7 +536,7 @@ fn player_inv_slot(lua: &Lua, token: &Option<String>, slot: i64) -> Option<InvSl
     let idx = usize::try_from(slot).ok()?;
     let model = lua.app_data_ref::<Model>().expect("model app_data");
     let reader = inventory_reader(lua, &model, token);
-    model.inv_slot_as(reader?, idx)
+    model.inv_slot_as(lua, reader?, idx)
 }
 
 /// [`player_inv_slot`] for the getters that read the unit's item table (`0x6228a0`), which only
@@ -509,140 +609,129 @@ pub(super) enum InvReader {
 
 /// [`InvReader`] for `token`, `None` for a unit the getters may not read or no unit at all, the
 /// token resolved at the call ([`super::unit::guid_of`]). `"player"` is the active player whatever
-/// its guid reads.
+/// its guid reads, and none while no active player is held (`0x4944c9`), as in a
+/// `PLAYER_LOGOUT` handler, which runs after the objects are freed.
 pub(super) fn inventory_reader(lua: &Lua, model: &Model, token: &str) -> Option<InvReader> {
     if token.eq_ignore_ascii_case("player") {
-        return Some(InvReader::Own);
+        return active_player_held(lua).then_some(InvReader::Own);
     }
-    model.inventory_reader_of(super::unit::guid_of(lua, model, token).ok().flatten()?)
+    let guid = super::unit::guid_of(lua, model, token).ok().flatten()?;
+    if guid == model.unit_guids.player {
+        return active_player_held(lua).then_some(InvReader::Own);
+    }
+    let reach = super::inspect::reach_of(lua, model, guid)?;
+    (reach.inspectable && super::inspect::in_inspect_range(&reach))
+        .then_some(InvReader::Visible(guid))
+}
+
+/// Whether an active player is held now (`0x4944af` → `0x468460`): through the lent host, the
+/// VM's copy standing in without one. Borrows no [`Model`], so a caller may hold it.
+pub(super) fn active_player_held(lua: &Lua) -> bool {
+    let mut held = None;
+    super::host::read_host(lua, |h| h.read_self(&mut |own| held = Some(own.held())));
+    held.unwrap_or(true)
 }
 
 impl Model {
-    /// [`InvReader`] for the unit `guid`, `None` for one the getters may not read.
-    fn inventory_reader_of(&self, guid: u64) -> Option<InvReader> {
-        if guid == self.unit_guids.player {
-            return Some(InvReader::Own);
-        }
-        let reach = self.unit_reach.get(&guid)?;
-        (reach.inspectable && super::inspect::in_inspect_range(reach))
-            .then_some(InvReader::Visible(guid))
-    }
-
-    /// The active player's item at live-API id `slot` ([`Self::inv_slot_as`] of our own).
-    pub(super) fn own_inv_view(&self, slot: usize) -> Option<InvSlotView> {
-        self.inv_slot_as(InvReader::Own, slot)
-    }
-
     /// The item `reader`'s unit exposes at live-API id `slot`, the one routing the
     /// `GetInventoryItem*` getters and `GameTooltip:SetInventoryItem` share. Stock paints the bank
     /// through this API (`BankFrame.lua:35`) and hovers a key through it
     /// (`ContainerFrame.lua:616-619`), so the bank and keyring bands are answered from the
-    /// container snapshots. Another player answers its visible items alone, slots 1-19
-    /// (`0x5f0d60`).
-    pub(super) fn inv_slot_as(&self, reader: InvReader, slot: usize) -> Option<InvSlotView> {
+    /// container slots. Another player answers its visible items alone, slots 1-19
+    /// (`0x5f0d60`), read through the lent host ([`super::inspect::visible_slot`]).
+    pub(super) fn inv_slot_as(
+        &self,
+        lua: &Lua,
+        reader: InvReader,
+        slot: usize,
+    ) -> Option<InvSlotView> {
         match reader {
-            InvReader::Own => self.own_inv_slot(slot),
+            InvReader::Own => own_inv_view(lua, self, slot),
             InvReader::Visible(guid) => (1..=19)
                 .contains(&slot)
-                .then(|| self.visible_equipment.get(&guid)?.get(slot)?.clone())
+                .then(|| super::inspect::visible_slot(lua, self, guid, slot))
                 .flatten(),
         }
     }
 
-    /// The active player's item at live-API id `slot`. The bank bands are the player list's
-    /// slots 39 to 68, which `GetItemInSlot` (`0x6228a0`) answers empty while no banker is open
-    /// (`0x6228ad`-`0x6228cf`, the banker guid `[0xbdd038]`), and every getter here reads through
-    /// it (`0x4c8449`, `0x4c8cd3`, `SetInventoryItem` at `0x53314e`).
-    fn own_inv_slot(&self, slot: usize) -> Option<InvSlotView> {
-        let bank_band = BANK_INV_SLOTS.contains(&slot) || BANK_BAG_INV_SLOTS.contains(&slot);
-        if bank_band && self.bank.is_none() {
-            return None;
-        }
-        self.player_slot_object(slot)
-    }
-
-    /// The item object at the active player's live-API id `slot`, with no bank gate: what the
-    /// client finds by the held item's guid (the object manager, not `GetItemInSlot`), so an item
-    /// held from a bank slot is still found after the banker closes. For the readers that stand in
-    /// for that guid lookup; a slot getter reads [`Self::inv_slot_as`].
-    pub(crate) fn player_slot_object(&self, slot: usize) -> Option<InvSlotView> {
-        if let Some(view) = self.bank_inv_slot(slot) {
-            return Some(view);
-        }
-        if KEYRING_INV_SLOTS.contains(&slot) {
-            let n = (slot - KEYRING_INV_SLOTS.start() + 1) as u32;
-            let keyring = self.containers.get(&KEYRING_CONTAINER)?;
-            return keyring.slots.get(&n).map(InvSlotView::from_container_slot);
-        }
-        self.inventory_slots.get(slot)?.clone()
-    }
-
-    /// The bag-slot item object behind the player's live id `slot` in the vault and keyring bands,
-    /// which `SetInventoryItem` resolves through the player's slot list as it does a worn item
-    /// (`0x53314e` → `0x6228a0`); `None` for every other band.
-    pub(super) fn inv_container_slot(
-        &self,
-        slot: usize,
-    ) -> Option<&super::container::ContainerSlot> {
-        let (bag, first) = if BANK_INV_SLOTS.contains(&slot) {
-            (BANK_CONTAINER, *BANK_INV_SLOTS.start())
+    /// The player's repair cost at live id `slot` now (`0x5332e1`), the vault and keyring bands by
+    /// their container slots.
+    pub(super) fn inv_repair_cost(&self, lua: &mlua::Lua, slot: usize) -> u32 {
+        let (bag, n) = if BANK_INV_SLOTS.contains(&slot) {
+            (BANK_CONTAINER, slot - BANK_INV_SLOTS.start() + 1)
         } else if KEYRING_INV_SLOTS.contains(&slot) {
-            (KEYRING_CONTAINER, *KEYRING_INV_SLOTS.start())
+            (KEYRING_CONTAINER, slot - KEYRING_INV_SLOTS.start() + 1)
         } else {
-            return None;
+            (super::EQUIPMENT_BAG, slot)
         };
-        let n = (slot - first + 1) as u32;
-        self.containers.get(&bag)?.slots.get(&n)
-    }
-
-    /// The player's repair cost at live id `slot`, the vault and keyring bands by their container
-    /// slots.
-    pub(super) fn inv_repair_cost(&self, slot: usize) -> u32 {
-        let costs = &self.repair_costs;
-        let cost = if BANK_INV_SLOTS.contains(&slot) {
-            let n = (slot - BANK_INV_SLOTS.start() + 1) as u32;
-            costs.bags.get(&(BANK_CONTAINER, n))
-        } else if KEYRING_INV_SLOTS.contains(&slot) {
-            let n = (slot - KEYRING_INV_SLOTS.start() + 1) as u32;
-            costs.bags.get(&(KEYRING_CONTAINER, n))
-        } else {
-            u32::try_from(slot)
-                .ok()
-                .and_then(|s| costs.equipped.get(&s))
+        let Ok(n) = u32::try_from(n) else {
+            return 0;
         };
-        cost.copied().unwrap_or(0)
+        super::merchant::repair_cost_at(lua, self, bag, n)
     }
+}
 
-    /// The use cooldown `(start, duration, enabled)` in `GetTime` seconds of the player's item at
-    /// live id `slot`: the vault and keyring bands by their container slots, the doll's from the
-    /// worn push.
-    pub(super) fn inv_slot_cooldown(&self, slot: usize) -> Option<(f64, f64, bool)> {
-        if BANK_INV_SLOTS.contains(&slot) {
-            let n = (slot - BANK_INV_SLOTS.start() + 1) as u32;
-            self.container_cooldowns.get(&(BANK_CONTAINER, n)).copied()
-        } else if KEYRING_INV_SLOTS.contains(&slot) {
-            let n = (slot - KEYRING_INV_SLOTS.start() + 1) as u32;
-            self.container_cooldowns
-                .get(&(KEYRING_CONTAINER, n))
-                .copied()
-        } else {
-            self.worn_cooldowns.get(&slot).copied()
-        }
+/// The active player's item at live-API id `slot`. The bank bands are the player list's slots 39
+/// to 68, which `GetItemInSlot` (`0x6228a0`) answers empty while no banker is open (`0x6228ad`-
+/// `0x6228cf`, the banker guid `[0xbdd038]`), and every getter here reads through it (`0x4c8449`,
+/// `0x4c8cd3`, `SetInventoryItem` at `0x53314e`).
+pub(super) fn own_inv_view(lua: &Lua, model: &Model, slot: usize) -> Option<InvSlotView> {
+    let bank_band = BANK_INV_SLOTS.contains(&slot) || BANK_BAG_INV_SLOTS.contains(&slot);
+    if bank_band && model.bank.is_none() {
+        return None;
     }
+    player_slot_object(lua, model, slot)
+}
 
-    fn bank_inv_slot(&self, slot: usize) -> Option<InvSlotView> {
-        if BANK_INV_SLOTS.contains(&slot) {
-            let vault = self.containers.get(&BANK_CONTAINER)?;
-            let n = (slot - BANK_INV_SLOTS.start() + 1) as u32;
-            return vault.slots.get(&n).map(InvSlotView::from_container_slot);
-        }
-        if BANK_BAG_INV_SLOTS.contains(&slot) {
-            // A bank bag is a container, not a slot in one, so this band is its own store; stock
-            // picks it up and describes it through this API.
-            let i = slot - BANK_BAG_INV_SLOTS.start();
-            return self.bank_bag_slots.get(i)?.clone();
-        }
-        None
+/// The item object at the active player's live-API id `slot`, with no bank gate: what the client
+/// finds by the held item's guid (the object manager, not `GetItemInSlot`), so an item held from
+/// a bank slot is still found after the banker closes. For the readers that stand in for that
+/// guid lookup; a slot getter reads [`Model::inv_slot_as`].
+pub(crate) fn player_slot_object(lua: &Lua, model: &Model, slot: usize) -> Option<InvSlotView> {
+    if let Some(s) = inv_container_slot(lua, model, slot) {
+        return Some(InvSlotView::from_container_slot(&s));
+    }
+    if BANK_INV_SLOTS.contains(&slot) || KEYRING_INV_SLOTS.contains(&slot) {
+        return None;
+    }
+    if BANK_BAG_INV_SLOTS.contains(&slot) {
+        // A bank bag is a container, not a slot in one, so this band is its own store; stock
+        // picks it up and describes it through this API.
+        let i = slot - BANK_BAG_INV_SLOTS.start();
+        return model.bank_bag_slots.get(i)?.clone();
+    }
+    model.inventory_slots.get(slot)?.clone()
+}
+
+/// The bag-slot item object behind the player's live id `slot` in the vault and keyring bands,
+/// which `SetInventoryItem` resolves through the player's slot list as it does a worn item
+/// (`0x53314e` → `0x6228a0`), as it stands now; `None` for every other band.
+pub(super) fn inv_container_slot(
+    lua: &Lua,
+    model: &Model,
+    slot: usize,
+) -> Option<super::container::ContainerSlot> {
+    let (bag, first) = if BANK_INV_SLOTS.contains(&slot) {
+        (BANK_CONTAINER, *BANK_INV_SLOTS.start())
+    } else if KEYRING_INV_SLOTS.contains(&slot) {
+        (KEYRING_CONTAINER, *KEYRING_INV_SLOTS.start())
+    } else {
+        return None;
+    };
+    let n = (slot - first + 1) as u32;
+    super::held::held_slot(lua, model, bag, n)
+}
+
+/// The use cooldown `(start, duration, enabled)` in `GetTime` seconds of the player's item at
+/// live id `slot`: the vault and keyring bands by their container slots, the doll's from the worn
+/// copy a harness seats.
+pub(super) fn inv_slot_cooldown(lua: &Lua, model: &Model, slot: usize) -> Option<(f64, f64, bool)> {
+    if BANK_INV_SLOTS.contains(&slot) || KEYRING_INV_SLOTS.contains(&slot) {
+        inv_container_slot(lua, model, slot)
+            .as_ref()
+            .and_then(super::container::slot_cooldown)
+    } else {
+        model.worn_cooldowns.get(&slot).copied()
     }
 }
 
@@ -1273,11 +1362,12 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                 let live = usize::try_from(slot0 + 1).ok();
                 let own = inventory_reader(lua, &model, &token) == Some(InvReader::Own);
                 let asked = live.filter(|_| own).filter(|&live| {
-                    model
-                        .own_inv_view(live)
+                    crate::script::char_stats::own_inv_view(lua, &model, live)
                         .is_some_and(|v| v.item_id != 0 && v.spell_0)
                 });
-                let snapshot = asked.and_then(|live| model.inv_slot_cooldown(live));
+                let snapshot = asked.and_then(|live| {
+                    crate::script::char_stats::inv_slot_cooldown(lua, &model, live)
+                });
                 (asked, snapshot, model.now)
             };
             // A worn item's query reads the list inside the call (`0x4c8b86` → `0x6e2ed0`),
@@ -1313,10 +1403,15 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         })?,
     )?;
 
-    // OffhandHasWeapon() → 1 or nil: whether the off hand holds a weapon (item class 2).
+    // OffhandHasWeapon() → 1 or nil: whether the off hand holds a weapon (item class 2). The
+    // active player is looked up first (`0x4c9578`, `0x4c9589` → `0x468460`) and nil is pushed with
+    // none held (`je 0x4c95c4` at `0x4c9590`), as in a `PLAYER_LOGOUT` handler.
     g.set(
         "OffhandHasWeapon",
         lua.create_function(|lua, (): ()| {
+            if !active_player_held(lua) {
+                return Ok(None);
+            }
             let (held, snapshot_class) = {
                 let model = lua.app_data_ref::<Model>().expect("model app_data");
                 let held = model.inventory_slots[17].clone().filter(|v| v.item_id != 0);
@@ -1335,22 +1430,25 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         })?,
     )?;
 
+    // `0x848894`, verbatim.
+    const INVALID_SLOT: &str = "Invalid inventory slot in GetInventorySlotInfo";
     // GetInventorySlotInfo(slotName) → (slotId, textureName, checkRelic) from `SLOT_INFO`.
     // `checkRelic` is a property of the slot; stock pairs it with `UnitHasRelicSlot("player")`
     // (`PaperDollFrame.lua:680`, `:744`).
     g.set(
         "GetInventorySlotInfo",
-        lua.create_function(|lua, name: String| {
+        lua.create_function(|lua, name: Value| {
+            // A non-string misses `is-number-or-string` and takes the unknown name's raise
+            // (`0x4c81ca` → `0x4c822c`).
+            let name = crate::script::binding_abi::string_arg(lua, name, INVALID_SLOT)?;
             // A full-string ASCII case-insensitive match: `0x4c8215` calls `_strnicmp` (`0x64a4c0`
             // -> `0x414310`) with no length limit. The 36 names stay distinct after folding.
             let Some((_, id, art)) = SLOT_INFO
                 .iter()
                 .find(|(n, _, _)| n.eq_ignore_ascii_case(&name))
             else {
-                // An unknown name raises, never nil; the string is `0x848894`'s, verbatim.
-                return Err(mlua::Error::runtime(
-                    "Invalid inventory slot in GetInventorySlotInfo",
-                ));
+                // An unknown name raises, never nil.
+                return Err(mlua::Error::runtime(INVALID_SLOT));
             };
             Ok((
                 *id,
@@ -1377,7 +1475,8 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        weapon_subclass_skill, RESISTANCE_INDEX_ERROR, SKILL_UNARMED, STAT_INDEX_ERROR, STAT_USAGE,
+        weapon_subclass_skill, AlertInputs, AlertItem, InventoryAlertInputs,
+        RESISTANCE_INDEX_ERROR, SKILL_UNARMED, STAT_INDEX_ERROR, STAT_USAGE,
     };
     use crate::script::{InvSlotView, UiScript, UnitCombatStats, UnitGuids, UnitState};
 
@@ -1388,7 +1487,7 @@ mod tests {
     const BOB: u64 = 0x20;
 
     /// A VM with the active player seated: its snapshot under `"player"` and its guid among the
-    /// resolver's inputs, as the unit feed and the aura feed seat them.
+    /// resolver's inputs, as the unit feed and the resolver feed seat them.
     fn seated() -> UiScript {
         let mut s = UiScript::new().unwrap();
         s.set_unit(
@@ -2679,7 +2778,8 @@ mod tests {
                 },
             );
             s.set_container(bag, Some(state));
-            let view = s.model_ref().own_inv_view(live_id).unwrap();
+            let view =
+                crate::script::char_stats::own_inv_view(s.lua(), &s.model_ref(), live_id).unwrap();
             assert_eq!(view.item_id, 7000, "bag {bag}");
             assert_eq!(view.field_duration, 3_600_000, "bag {bag}");
         }
@@ -2707,15 +2807,146 @@ mod tests {
             ..Default::default()
         });
         s.set_inventory_slots(slots.clone());
+        s.recompute_inventory_alerts();
         assert!(
             s.take_tutorial_triggers().is_empty(),
             "force-red and low ammo"
         );
         slots[3] = worn((4, 50), 0);
         s.set_inventory_slots(slots.clone());
+        s.recompute_inventory_alerts();
         assert_eq!(s.take_tutorial_triggers(), [0x23], "damaged");
         slots[3] = worn((0, 50), 0);
         s.set_inventory_slots(slots);
+        s.recompute_inventory_alerts();
         assert_eq!(s.take_tutorial_triggers(), [0x24], "broken");
+    }
+
+    /// The recompute reads the lent host as it runs, never the doll snapshot, and signals
+    /// `UPDATE_INVENTORY_ALERTS` on every pass whether or not a status moved (`0x4c8085`); with no
+    /// active player it stores and signals nothing (`0x4c7f06`). So does the verb (`0x4c9560`).
+    #[test]
+    fn the_recompute_reads_the_host_and_signals_every_pass() {
+        use crate::script::live::LiveAsk;
+        use crate::script::{CallHost, CallTail, ScriptCall};
+        struct Host(Option<AlertInputs>);
+        impl CallHost for Host {
+            fn apply(&mut self, _: &mut UiScript, _: ScriptCall) -> Option<CallTail> {
+                None
+            }
+            fn read_live(&mut self, ask: &mut LiveAsk<'_>) -> bool {
+                let inputs = self.0;
+                ask.answer(|_: &InventoryAlertInputs| Some(inputs))
+            }
+        }
+        let mut s = UiScript::new().unwrap();
+        s.run(
+            r#"Heard = {}
+               local f = CreateFrame("Frame")
+               f:RegisterEvent("UPDATE_INVENTORY_ALERTS")
+               f:SetScript("OnEvent", function()
+                   table.insert(Heard, GetInventoryAlertStatus(1) .. GetInventoryAlertStatus(12))
+               end)"#,
+        )
+        .unwrap();
+        // The snapshot's helm is whole; the host's is broken.
+        let mut slots: crate::script::InventorySlots = Default::default();
+        slots[1] = Some(InvSlotView {
+            item_id: 7366,
+            durability: Some((40, 40)),
+            ..Default::default()
+        });
+        s.set_inventory_slots(slots);
+        let mut worn = [None; 11];
+        worn[0] = Some(AlertItem {
+            durability: 0,
+            max_durability: 40,
+            ..AlertItem::default()
+        });
+        let mut host = Host(Some(AlertInputs {
+            worn,
+            ammo: Some(20),
+        }));
+        s.hosted(&mut host, |s| {
+            s.recompute_inventory_alerts();
+            s.recompute_inventory_alerts();
+            s.run("UpdateInventoryAlertStatus()").unwrap();
+        });
+        let mut none = Host(None);
+        s.hosted(&mut none, |s| {
+            s.recompute_inventory_alerts();
+            s.run("UpdateInventoryAlertStatus()").unwrap();
+        });
+        assert_eq!(
+            s.eval::<Vec<String>>("return Heard").unwrap(),
+            ["43", "43", "43"],
+            "the host's statuses, once a pass, none with no player"
+        );
+    }
+
+    /// The temporary-enchant arm (`0x4c8035`-`0x4c806d`): a worn item no durability arm claims
+    /// reads 1 with a temporary enchantment, 2 at 30000 ms or fewer left, the boundary included
+    /// and an unset or run-out deadline (0) too; a charter record's (`0x2000`) or no enchantment
+    /// reads 0, and a damaged or broken item keeps its 3 or 4.
+    #[test]
+    fn the_temporary_enchant_arm_reads_one_or_two() {
+        let status = |item: AlertItem| {
+            let mut worn = [None; 11];
+            worn[8] = Some(item);
+            super::alert_statuses(&AlertInputs { worn, ammo: None })[8].0
+        };
+        let enchanted = |left: u32| AlertItem {
+            durability: 40,
+            max_durability: 40,
+            temp_enchant: 7,
+            temp_enchant_left_ms: left,
+            ..AlertItem::default()
+        };
+        assert_eq!(status(enchanted(30_001)), 1);
+        assert_eq!(status(enchanted(30_000)), 2);
+        assert_eq!(status(enchanted(0)), 2, "unset or run out");
+        assert_eq!(
+            status(AlertItem {
+                flags: 0x08,
+                ..enchanted(60_000)
+            }),
+            1,
+            "wrapped skips the durability arms"
+        );
+        assert_eq!(
+            status(AlertItem {
+                max_durability: 0,
+                ..enchanted(60_000)
+            }),
+            1
+        );
+        assert_eq!(
+            status(AlertItem {
+                record_flags: 0x2000,
+                ..enchanted(60_000)
+            }),
+            0
+        );
+        assert_eq!(
+            status(AlertItem {
+                temp_enchant: 0,
+                ..enchanted(10)
+            }),
+            0
+        );
+        assert_eq!(
+            status(AlertItem {
+                durability: 5,
+                ..enchanted(10)
+            }),
+            3
+        );
+        assert_eq!(
+            status(AlertItem {
+                flags: 0x10,
+                ..enchanted(10)
+            }),
+            4
+        );
     }
 }

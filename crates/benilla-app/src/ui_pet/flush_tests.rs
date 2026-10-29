@@ -106,8 +106,14 @@ impl Rig {
             .world_mut()
             .resource_mut::<crate::ui_script::UiClock>();
         let anchor = Instant::now() + ahead;
-        clock.ui_now += anchor.duration_since(clock.anchor).as_secs_f64();
+        let step = anchor.duration_since(clock.anchor).as_secs_f64();
+        clock.ui_now += step;
         clock.anchor = anchor;
+        // The VM's `GetTime` moves with the frame's clock, as the script tick moves it.
+        self.app
+            .world_mut()
+            .non_send_resource_mut::<benilla_ui::script::UiScript>()
+            .tick(step as f32);
     }
 }
 
@@ -353,9 +359,11 @@ fn a_teardown_and_a_new_bar_do_not_hide_the_next_flush() {
 /// of a cooldown: an elapsed record moves neither the list nor the events.
 #[test]
 fn a_natural_expiry_fires_nothing() {
+    // Ten minutes, far longer than any run, so the cooldown is still running at the first
+    // read however slow the machine; the clock is then stepped past it.
     let brief = || SpellDisplay {
         name: "Brief".into(),
-        recovery_ms: 30,
+        recovery_ms: 600_000,
         ..Default::default()
     };
     let mut rig = rig(vec![(GROWL, brief())], &[GROWL], Some(summoned_pet()));
@@ -363,7 +371,7 @@ fn a_natural_expiry_fires_nothing() {
     assert_eq!(rig.frame(), FLUSH);
     assert!(rig.cooldown(1).1 > 0.0, "running");
 
-    rig.step_clock(Duration::from_millis(80));
+    rig.step_clock(Duration::from_secs(601));
 
     assert!(
         rig.frame().is_empty(),
@@ -428,8 +436,13 @@ fn a_pet_gcd_sweeps_the_spellbooks_pet_tab_button() {
 
     // The book arrives, and the window opens on its pet tab.
     rig.frame();
+    // With the host lent, as the key binding's entry lends it: the tab reads the book at the call.
+    crate::script_calls::with_hosted_vm(rig.app.world_mut(), |s| {
+        s.expect("a VM")
+            .run("ToggleSpellBook(BOOKTYPE_PET)")
+            .unwrap();
+    });
     let mut s = ui(&mut rig);
-    s.run("ToggleSpellBook(BOOKTYPE_PET)").unwrap();
     s.resolve();
     assert!(
         s.eval::<bool>("return SpellBookFrame.bookType == BOOKTYPE_PET")
@@ -495,11 +508,12 @@ fn let_the_gcds_run_out() {
     std::thread::sleep(Duration::from_millis(120));
 }
 
-/// Every pet GCD and every recovery the GO leg inserts is a record, and the insert is where the
-/// list is bounded: after forty presses whose GCDs have all run out, the next press leaves the
-/// list with its live records and its own, a running recovery and a parked record among them.
+/// Every pet GCD and every recovery the GO leg inserts is a record, and an insert sweeps nothing
+/// (`0x6e12c0`): after forty presses whose GCDs have all run out, the next press adds its own, and
+/// a running recovery and a parked record read as before. The go's sweep bounds the list
+/// (`0x6e862b`).
 #[test]
-fn an_insert_leaves_the_pets_list_its_live_records_alone() {
+fn an_insert_sweeps_nothing_from_the_pets_list() {
     let mut rig = rig(
         vec![(CLAW, brisk_claw()), (GROWL, growl()), (PARKED, parked())],
         &[CLAW, GROWL, PARKED],
@@ -527,11 +541,11 @@ fn an_insert_leaves_the_pets_list_its_live_records_alone() {
 
     rig.press(1);
 
-    assert!(!rig.elapsed_pending(pressed), "the insert dropped them");
+    assert!(rig.elapsed_pending(pressed), "the insert swept nothing");
     assert_eq!(
         rig.record_count(),
-        3,
-        "Growl's recovery, the parked record and the new GCD"
+        43,
+        "Growl's recovery, the parked record and the forty-one GCDs"
     );
     rig.frame();
     assert_eq!(rig.cooldown(2).1, 5.0, "Growl still sweeps its 5 s");
@@ -542,11 +556,53 @@ fn an_insert_leaves_the_pets_list_its_live_records_alone() {
     );
 }
 
-/// The reference flushes no event for a cooldown's end, and the insert's prune is that end: the
-/// insert is the list's one mutation, so the frame fires the flush once, for it, and nothing
-/// else. An insert that arms nothing changes nothing.
+/// The go's sweep, due at the session's first go, runs over the pet's list too (`0x6e8606`-
+/// `0x6e862b` sweeps `0xcecaec` and `0xcecb04`): the forty run-out GCDs go, while Growl's running
+/// recovery, inserted by the same go, and the parked record stay and read as before.
 #[test]
-fn an_inserts_prune_fires_only_the_inserts_own_flush() {
+fn the_gos_sweep_frees_the_pets_run_out_records() {
+    let mut rig = rig(
+        vec![(CLAW, brisk_claw()), (GROWL, growl()), (PARKED, parked())],
+        &[CLAW, GROWL, PARKED],
+        Some(summoned_pet()),
+    );
+    rig.receive(vec![SessionEvent::SpellCooldowns {
+        caster: PET,
+        cooldowns: vec![(PARKED, 10)],
+    }]);
+    for _ in 0..40 {
+        rig.press(1);
+    }
+    rig.frame();
+    let parked_read = rig.cooldown(3);
+    assert!(
+        parked_read.1 > 0.0 && parked_read.2 == 0,
+        "the parked record shows disabled: {parked_read:?}"
+    );
+    let_the_gcds_run_out();
+    assert_eq!(rig.record_count(), 41, "the parked record and forty GCDs");
+
+    rig.receive(vec![go(PET, GROWL)]);
+
+    assert!(
+        !rig.elapsed_pending(Instant::now()),
+        "the go swept the pet's list"
+    );
+    assert_eq!(
+        rig.record_count(),
+        2,
+        "Growl's recovery and the parked record"
+    );
+    rig.frame();
+    assert_eq!(rig.cooldown(2).1, 5.0, "Growl sweeps its 5 s");
+    assert_eq!(rig.cooldown(3), parked_read, "the parked record");
+}
+
+/// The reference flushes no event for a cooldown's end: the insert is the list's one mutation, so
+/// the frame fires the flush once, for it, and nothing else. An insert that arms nothing changes
+/// nothing.
+#[test]
+fn an_insert_fires_only_its_own_flush() {
     let mut rig = rig(
         vec![(CLAW, brisk_claw()), (GROWL, growl())],
         &[CLAW, GROWL],
@@ -561,7 +617,7 @@ fn an_inserts_prune_fires_only_the_inserts_own_flush() {
     let pressed = Instant::now();
     assert!(rig.elapsed_pending(pressed));
 
-    // Growl has no GCD pair: nothing is armed, so nothing is dropped or flushed.
+    // Growl has no GCD pair: nothing is armed, so nothing is flushed.
     rig.press(2);
     assert!(
         rig.frame().is_empty(),
@@ -570,17 +626,12 @@ fn an_inserts_prune_fires_only_the_inserts_own_flush() {
     assert_eq!(rig.generation(), held);
 
     rig.press(1);
-    assert!(!rig.elapsed_pending(pressed), "the insert dropped the five");
     assert_eq!(rig.frame(), FLUSH, "the insert's flush, once");
-    assert_eq!(
-        rig.generation(),
-        held + 1,
-        "the prune is no mutation of its own"
-    );
+    assert_eq!(rig.generation(), held + 1, "one mutation, the insert's");
     assert!(rig.frame().is_empty(), "and nothing follows");
 }
 
-/// An insert's prune is invisible to `GetPetActionCooldown`: a running recovery and a parked
+/// An insert is invisible to `GetPetActionCooldown`'s other reads: a running recovery and a parked
 /// record whose timers have run down push what they pushed before, the same start included.
 #[test]
 fn an_insert_changes_no_bar_read_of_the_records_that_stay() {
@@ -615,7 +666,6 @@ fn an_insert_changes_no_bar_read_of_the_records_that_stay() {
     assert!(rig.elapsed_pending(pressed));
 
     rig.press(1);
-    assert!(!rig.elapsed_pending(pressed), "the insert pruned");
     rig.frame();
 
     assert_eq!(
@@ -716,13 +766,7 @@ fn the_world_entry_reset_clears_the_guid_and_keeps_the_book() {
     }
     rig.receive(vec![go(PET, GROWL)]);
     rig.frame();
-    let book = |rig: &mut Rig| -> Option<f64> {
-        rig.app
-            .world_mut()
-            .non_send_resource_mut::<benilla_ui::script::UiScript>()
-            .eval("return (HasPetSpells())")
-            .unwrap()
-    };
+    let book = |rig: &mut Rig| -> Option<f64> { rig.eval("return (HasPetSpells())") };
     assert_eq!(book(&mut rig), Some(1.0), "the book before");
     let before = rig.app.world().resource::<PetBar>().spells.clone();
 
@@ -730,20 +774,12 @@ fn the_world_entry_reset_clears_the_guid_and_keeps_the_book() {
     world.resource_scope(|world, mut bar: bevy::prelude::Mut<PetBar>| {
         world.resource_scope(
             |world, mut latch: bevy::prelude::Mut<super::PetAttackLatch>| {
-                world.resource_scope(|world, mut feed: bevy::prelude::Mut<super::PetBarFeed>| {
-                    let mut script = world.non_send_resource_mut::<benilla_ui::script::UiScript>();
-                    assert!(super::drop_bar(
-                        &mut script,
-                        &mut bar,
-                        &mut latch,
-                        Some(&mut feed),
-                        None
-                    ));
-                })
+                let mut script = world.non_send_resource_mut::<benilla_ui::script::UiScript>();
+                assert!(super::drop_bar(&mut script, &mut bar, &mut latch));
             },
         )
     });
-    assert_eq!(rig.frame(), Vec::<String>::new(), "the feed adds no signal");
+    assert_eq!(rig.frame(), Vec::<String>::new(), "nothing else signals");
 
     {
         let bar = rig.app.world().resource::<PetBar>();
@@ -761,12 +797,8 @@ fn the_world_entry_reset_clears_the_guid_and_keeps_the_book() {
         assert!(growl_cd > 0, "the pet's cooldown list stays");
     }
     assert_eq!(book(&mut rig), Some(1.0), "the book stays");
-    let (bar_shown, info): (Option<f64>, Option<String>) = rig
-        .app
-        .world_mut()
-        .non_send_resource_mut::<benilla_ui::script::UiScript>()
-        .eval("return PetHasActionBar(), (GetPetActionInfo(1))")
-        .unwrap();
+    let (bar_shown, info): (Option<f64>, Option<String>) =
+        rig.eval("return PetHasActionBar(), (GetPetActionInfo(1))");
     assert_eq!(
         (bar_shown, info),
         (None, None),

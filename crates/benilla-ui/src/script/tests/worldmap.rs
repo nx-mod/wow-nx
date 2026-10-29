@@ -327,13 +327,47 @@ fn worldmap_navigation_and_map_info() {
     );
 }
 
+/// `GetMapInfo`'s second value is `ftol(H * 1002 / W)` (`0x4a6d50`), the span the
+/// `WorldMapContinent` tile counts at continent level and the loc rect at zone level; the third
+/// rounds its low byte up to a power of two (`0x4a7e69`). The world sheet answers 0, 0.
+#[test]
+fn get_map_info_answers_the_texture_height_and_its_power_of_two_round() {
+    let mut s = script();
+    push_catalog(&mut s);
+    let info = |s: &UiScript| {
+        s.eval::<(i64, i64)>("local _, h, p = GetMapInfo() return h, p")
+            .unwrap()
+    };
+    assert_eq!(info(&s), (0, 0), "the world sheet");
+    // Kalimdor's tiles are 26 wide and 44 high: 1695, low byte 159 rounds to 256.
+    s.run("SetMapZoom(1)").unwrap();
+    assert_eq!(info(&s), (1695, 1792));
+    // Eastern Kingdoms: 25 by 47 tiles, 1883, low byte 91 rounds to 128.
+    s.run("SetMapZoom(2)").unwrap();
+    assert_eq!(info(&s), (1883, 1920));
+    // Durotar: a 5000 by 4700 rect, 941, low byte 173 rounds to 256.
+    s.run("SetMapZoom(1, 1)").unwrap();
+    assert_eq!(info(&s), (941, 1024));
+    // The Barrens: 10000 by 11500, 1152, whose low byte 128 is a power of two already.
+    s.run("SetMapZoom(1, 2)").unwrap();
+    assert_eq!(info(&s), (1152, 1152));
+}
+
 /// `SetMapToCurrentZone` lands on the app-fed player zone, and the feed surfaces through
-/// `GetPlayerMapPosition` for the player and `party1..4`. A `raid` token
-/// answers the off-map sentinel; the reference reads raid positions (`WorldMapFrame.lua:379`).
+/// `GetPlayerMapPosition` for the player, `party1..4` and the raid rows, by the token's guid
+/// (`0x4a8658` → `0x515970`): any case, a `target` that names a member, and "Unknown unit name"
+/// for a token the resolver does not know. A string or number is required (`0x4a861e`).
 #[test]
 fn worldmap_current_zone_and_player_feed() {
     let mut s = script();
     push_catalog(&mut s);
+    s.set_unit_guids(&crate::script::UnitGuids {
+        player: 1,
+        target: 10,
+        party: [10, 11, 0, 0],
+        raid: vec![20, 1],
+        ..Default::default()
+    });
 
     s.set_world_map_feed(
         Some((1, 2)),
@@ -341,7 +375,7 @@ fn worldmap_current_zone_and_player_feed() {
         1.5,
         None,
         vec![Some((0.1, 0.2)), None],
-        Vec::new(),
+        vec![Some((0.3, 0.4)), Some((0.25, 0.75))],
     );
     s.run("SetMapToCurrentZone()").unwrap();
     assert_eq!(
@@ -349,24 +383,41 @@ fn worldmap_current_zone_and_player_feed() {
             .unwrap(),
         (1, 2)
     );
-    let (x, y) = s
-        .eval::<(f64, f64)>(r#"return GetPlayerMapPosition("player")"#)
-        .unwrap();
-    assert!((x - 0.25).abs() < 1e-6 && (y - 0.75).abs() < 1e-6);
-    let (px, py) = s
-        .eval::<(f64, f64)>(r#"return GetPlayerMapPosition("party1")"#)
-        .unwrap();
-    assert!(
-        (px - 0.1).abs() < 1e-6 && (py - 0.2).abs() < 1e-6,
-        "a party slot reads its own projection"
-    );
-    for token in ["party2", "party5", "party0", "raid1", "nonsense"] {
-        assert_eq!(
-            s.eval::<(f64, f64)>(&format!(r#"return GetPlayerMapPosition("{token}")"#))
-                .unwrap(),
-            (0.0, 0.0),
-            "{token} answers the off-map sentinel"
+    let near = |token: &str, want: (f64, f64)| {
+        let (x, y) = s
+            .eval::<(f64, f64)>(&format!(r#"return GetPlayerMapPosition("{token}")"#))
+            .unwrap();
+        assert!(
+            (x - want.0).abs() < 1e-6 && (y - want.1).abs() < 1e-6,
+            "{token}: {x},{y}"
         );
+    };
+    near("player", (0.25, 0.75));
+    near("Player", (0.25, 0.75));
+    near("party1", (0.1, 0.2));
+    near("PARTY1", (0.1, 0.2));
+    near("target", (0.1, 0.2));
+    near("raid1", (0.3, 0.4));
+    near("raid2", (0.25, 0.75));
+    for token in ["party2", "party5", "party0", "raid3", "pet", "mouseover"] {
+        near(token, (0.0, 0.0));
+    }
+    for (call, want) in [
+        (
+            r#"GetPlayerMapPosition("nonsense")"#,
+            "Unknown unit name: nonsense",
+        ),
+        (
+            "GetPlayerMapPosition()",
+            r#"Usage: GetPlayerMapPosition("player")"#,
+        ),
+        (
+            "GetPlayerMapPosition(nil)",
+            r#"Usage: GetPlayerMapPosition("player")"#,
+        ),
+    ] {
+        let err = s.run(call).unwrap_err().to_string();
+        assert!(err.contains(want), "{call}: {err}");
     }
 
     // No feed → the world sheet (never an error).
@@ -850,4 +901,160 @@ fn world_loc_map_position_projects_through_the_host() {
             "{call}: {err}"
         );
     }
+}
+
+/// A world-state packet's rebuild leaves its `WORLD_MAP_UPDATE` to the packet's own signal
+/// (`0x48fa0d` into `0x4a6cdf`): the list is rebuilt and nothing is queued.
+#[test]
+fn a_packet_rebuild_replaces_the_landmarks_and_queues_nothing() {
+    let mut s = script();
+    s.run(
+        r#"
+        seen = 0
+        local f = CreateFrame("Frame")
+        f:RegisterEvent("WORLD_MAP_UPDATE")
+        f:SetScript("OnEvent", function() seen = seen + 1 end)
+        "#,
+    )
+    .unwrap();
+    let source = |name: &str| WorldMapLandmarkSource {
+        name: name.into(),
+        description: String::new(),
+        map: 0,
+        pos: (0.2, 0.2),
+        icons: [Some(6); 3],
+    };
+    s.rebuild_world_map_landmarks(vec![source("The Inn")]);
+    s.tick(0.0);
+    assert_eq!(s.eval::<i64>("return seen").unwrap(), 0);
+}
+
+/// The explored bytes' watcher (`0x4a6460` → `0x4a67a0`) takes the bits, rebuilds the landmark list
+/// they gate and signals `WORLD_MAP_UPDATE` in place (`0x4a6ce4`), once: a handler reads the new
+/// overlays and landmarks, and nothing is left queued for the tick. The read at the world enter
+/// stores the bits and signals nothing.
+#[test]
+fn the_explored_watcher_rebuilds_then_signals_once() {
+    let mut s = script();
+    push_catalog(&mut s);
+    s.set_world_loc_projector(Box::new(|(c, _, _), map, x, y| {
+        (c == 2 && map == 0).then_some((x, y))
+    }));
+    s.tick(0.01);
+    s.run("SetMapZoom(2, 1)").unwrap();
+    s.run(
+        r#"
+        seen = {}
+        f = CreateFrame("Frame")
+        f:RegisterEvent("WORLD_MAP_UPDATE")
+        f:SetScript("OnEvent", function()
+            table.insert(seen, GetNumMapOverlays() .. "/" .. GetNumMapLandmarks())
+        end)
+    "#,
+    )
+    .unwrap();
+    let source = |name: &str| WorldMapLandmarkSource {
+        name: name.into(),
+        description: String::new(),
+        map: 0,
+        pos: (0.3, 0.3),
+        icons: [Some(6); 3],
+    };
+    let bits = |word: usize, bit: u32| {
+        let mut explored = vec![0u32; 64];
+        explored[word] = 1 << bit;
+        explored
+    };
+    let seen = |s: &UiScript| s.eval::<String>("return table.concat(seen, ',')").unwrap();
+
+    // The world-enter read: Northshire (bit 125) shows at once, with no signal.
+    s.seed_world_map_explored(bits(3, 29));
+    s.tick(0.01);
+    assert_eq!(seen(&s), "");
+    assert_eq!(s.eval::<i64>("return GetNumMapOverlays()").unwrap(), 1);
+
+    // A packet reveals Goldshire (bit 124) beside it, and the sources the bits gate change: one
+    // signal, over both.
+    let mut both = bits(3, 29);
+    both[3] |= 1 << 28;
+    s.world_map_explored_changed(both, Some(vec![source("Goldshire Inn"), source("Abbey")]));
+    assert_eq!(seen(&s), "2/2");
+    // Sources the host does not have leave the list as it stands.
+    s.world_map_explored_changed(bits(3, 29), None);
+    assert_eq!(seen(&s), "2/2,1/2");
+    s.tick(0.01);
+    assert_eq!(
+        seen(&s),
+        "2/2,1/2",
+        "the signal is not queued to fire again on the tick"
+    );
+}
+
+/// The catalog and the instance maps go in at the interface load with no signal, as
+/// `CGGameUI::InitializeGame` builds the lists (`0x48f5d1` → `0x4a5d00`) and signals nothing: a
+/// listener registered first hears nothing on the tick.
+#[test]
+fn the_catalog_push_signals_nothing() {
+    let mut s = script();
+    s.run(
+        r#"
+        seen = 0
+        local f = CreateFrame("Frame")
+        f:RegisterEvent("WORLD_MAP_UPDATE")
+        f:SetScript("OnEvent", function() seen = seen + 1 end)
+        "#,
+    )
+    .unwrap();
+    push_catalog(&mut s);
+    s.set_world_map_direct_areas(Vec::new());
+    s.tick(0.01);
+    assert_eq!(s.eval::<i64>("return seen").unwrap(), 0);
+    assert_eq!(
+        s.eval::<i64>("return table.getn({ GetMapContinents() })")
+            .unwrap(),
+        2,
+        "control: the catalog is in"
+    );
+}
+
+/// The gossip marker's set and clears re-select the shown map (`0x6dac93`, `0x6d9411`,
+/// `0x6d9a4c` → `0x4a67a0`): the list is rebuilt, then `WORLD_MAP_UPDATE` signals before the call
+/// returns, once, whether or not the list moved. A silent seed stores the sources alone, for the
+/// setter's next run.
+#[test]
+fn a_marker_change_rebuilds_then_signals_in_place() {
+    let mut s = script();
+    s.set_world_loc_projector(Box::new(|_, _, x, y| Some((x, y))));
+    s.tick(0.01);
+    s.run(
+        r#"
+        seen = {}
+        local f = CreateFrame("Frame")
+        f:RegisterEvent("WORLD_MAP_UPDATE")
+        f:SetScript("OnEvent", function() table.insert(seen, GetNumMapLandmarks()) end)
+        "#,
+    )
+    .unwrap();
+    let marker = WorldMapLandmarkSource {
+        name: "Stormwind Warrior Trainer".into(),
+        description: String::new(),
+        map: 0,
+        pos: (0.3, 0.3),
+        icons: [Some(6); 3],
+    };
+    let seen = |s: &UiScript| s.eval::<String>("return table.concat(seen, ',')").unwrap();
+    s.world_map_landmarks_changed(Some(vec![marker.clone()]));
+    assert_eq!(seen(&s), "1", "the handler read the marker");
+    s.world_map_landmarks_changed(None);
+    assert_eq!(seen(&s), "1,1", "an unmoved list signals too");
+    s.seed_world_map_landmark_sources(Vec::new());
+    s.tick(0.01);
+    assert_eq!(seen(&s), "1,1", "nothing queued for the tick");
+    assert_eq!(
+        s.eval::<i64>("return GetNumMapLandmarks()").unwrap(),
+        1,
+        "the seed leaves the list to the setter's next run"
+    );
+    s.world_map_landmarks_changed(None);
+    assert_eq!(seen(&s), "1,1,0", "which reads the seeded sources");
 }

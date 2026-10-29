@@ -4,10 +4,7 @@
 
 use benilla_protocol::messages::{BattlefieldList, BattlefieldStatus, LootStartRoll};
 use benilla_protocol::ObjectFields;
-use benilla_ui::script::{
-    BattlefieldListView, BattlefieldPositionView, BattlefieldQueueSlot, BattlefieldScores,
-    LootRollEntry, LootRollsState, UiScript, UnitGuids,
-};
+use benilla_ui::script::{UiScript, UnitGuids};
 use bevy::prelude::*;
 use crossbeam_channel::Receiver;
 
@@ -143,21 +140,17 @@ fn the_battleground_verbs_send_inside_their_calls() {
     let mut queue = world.resource_mut::<crate::ui_dialog_verbs::BattlefieldQueue>();
     queue.apply(status(0, WSG, 3));
     queue.apply(status(1, AV, 1));
-    let mut script = vm(&mut app);
-    script.set_battlefield_list(BattlefieldListView {
-        instances: vec![7],
-        ..Default::default()
-    });
-    let slot = |map_id, status| BattlefieldQueueSlot {
-        map_id,
-        status,
-        ..Default::default()
-    };
-    script.set_battlefield_queue([slot(WSG, 3), slot(AV, 1), slot(0, 0)], 0);
-    script.set_battlefield_scores(BattlefieldScores {
-        ended: true,
-        ..Default::default()
-    });
+    // An ended board, which the leave's gate reads (`0x4abe66`).
+    crate::net::handlers::dispatch(
+        app.world_mut(),
+        vec![benilla_protocol::SessionEvent::PvpLogData(
+            benilla_protocol::messages::PvpLogData {
+                ended: true,
+                winner: Some(0),
+                rows: Vec::new(),
+            },
+        )],
+    );
     eval::<()>(
         &mut app,
         "JoinBattlefield(1) RandomRoll(1, 2) ShowBattlefieldList(2) AcceptBattlefieldPort(2, 1) \
@@ -237,18 +230,6 @@ fn request_battlefield_positions_without_a_battleground_clears_inside_its_call()
             players: vec![at(0x9)],
             carrier: Some(at(0xA)),
         });
-    vm(&mut app).set_battlefield_positions(
-        vec![BattlefieldPositionView {
-            uv: (0.5, 0.5),
-            name: Some("Bob".into()),
-            ..Default::default()
-        }],
-        Some(benilla_ui::script::BattlefieldFlagView {
-            uv: (0.25, 0.25),
-            token: None,
-        }),
-        1.0,
-    );
     let n: (i64, i64) = eval(
         &mut app,
         "RequestBattlefieldPositions() \
@@ -288,6 +269,7 @@ fn the_death_verbs_send_inside_their_calls() {
                 name: "Priest".into(),
                 sickness: false,
                 has_timer: false,
+                waits_name: false,
             });
         }
         eval::<()>(
@@ -322,7 +304,7 @@ fn accept_xp_loss_sends_inside_its_call_within_range() {
         unit_at(&mut app, HEALER, yards);
         app.world_mut()
             .resource_mut::<crate::death::DeathNet>()
-            .ask_spirit_healer(HEALER);
+            .spirit_healer = Some(HEALER);
         eval::<()>(&mut app, "AcceptXPLoss() RandomRoll(1, 2) AcceptXPLoss()");
         let expected: &[&str] = if sends {
             &[
@@ -563,30 +545,31 @@ fn start_duel_casts_inside_its_call() {
 }
 
 /// The vote `0x61bdf0` inside `RollOnLoot`'s and `ConfirmLootRoll`'s calls: `CMSG_LOOT_ROLL`
-/// first (`0x61bf18`), then `CANCEL_LOOT_ROLL` (`0x61bf2a`), whose listeners run before the
-/// chunk's next line; the roll is gone from the engine's list before the call returns
-/// (`0x61bf32`).
+/// first (`0x61bf10`), then `CANCEL_LOOT_ROLL` (`0x61bf2a`), whose listeners run before the
+/// chunk's next line; the roll is closed before the call returns (`0x61bf32`). The gate reads the
+/// engine's roll and its item's record through the host (`0x61be67`, `0x61be70`).
 #[test]
 fn a_loot_vote_sends_ahead_of_its_cancel_inside_its_call() {
-    for (verb, bind_on_pickup) in [("RollOnLoot", false), ("ConfirmLootRoll", true)] {
+    for (verb, bonding) in [("RollOnLoot", 0), ("ConfirmLootRoll", 1)] {
         let (mut app, rx) = client();
+        let mut record = crate::items::test_template("Sulfuras");
+        record.bonding = bonding;
         app.world_mut()
-            .resource_mut::<crate::ui_loot_roll::LootRolls>()
-            .start(LootStartRoll {
-                looted_target: 0x77,
-                item_slot: 2,
-                item_id: 1,
-                random_property_id: 0,
-                suffix_factor: 0,
-                countdown_ms: 60_000,
-            });
-        vm(&mut app).set_loot_rolls(LootRollsState {
-            rolls: vec![LootRollEntry {
-                roll_id: 1,
-                bind_on_pickup,
-                ..Default::default()
-            }],
-        });
+            .resource_mut::<crate::items::Items>()
+            .insert_template(1, Some(record));
+        crate::net::handlers::dispatch(
+            app.world_mut(),
+            vec![benilla_protocol::SessionEvent::LootStartRoll(
+                LootStartRoll {
+                    looted_target: 0x77,
+                    item_slot: 2,
+                    item_id: 1,
+                    random_property_id: 0,
+                    suffix_factor: 0,
+                    countdown_ms: 60_000,
+                },
+            )],
+        );
         listen(&mut app, &["CANCEL_LOOT_ROLL"], "RandomRoll(9, 9)");
         eval::<()>(&mut app, &format!("{verb}(1, 2) RandomRoll(1, 2)"));
         assert_eq!(sent(&rx), ["loot roll 2", "roll 9", "roll 1"], "{verb}");
@@ -596,6 +579,24 @@ fn a_loot_vote_sends_ahead_of_its_cancel_inside_its_call() {
                 .holds(1),
             "{verb}: the roll closed inside the call"
         );
+        // A bind-on-pickup Need, unconfirmed, only asks (`0x61be8b`).
+        if bonding == 1 {
+            crate::net::handlers::dispatch(
+                app.world_mut(),
+                vec![benilla_protocol::SessionEvent::LootStartRoll(
+                    LootStartRoll {
+                        looted_target: 0x77,
+                        item_slot: 3,
+                        item_id: 1,
+                        random_property_id: 0,
+                        suffix_factor: 0,
+                        countdown_ms: 60_000,
+                    },
+                )],
+            );
+            eval::<()>(&mut app, "RollOnLoot(2, 1)");
+            assert!(sent(&rx).is_empty(), "the confirm sends nothing");
+        }
     }
 }
 

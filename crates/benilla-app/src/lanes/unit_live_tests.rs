@@ -212,8 +212,10 @@ fn client() -> Client {
 }
 
 /// Wherever the frame's snapshots are current, every getter answers the same off the live object
-/// as off the snapshot, for every token: the object's fields the snapshot holds are the ones it
-/// reads ([`crate::ui_unit::unit_object`]), with nothing a token's own build changes after.
+/// as off the snapshot: the object's fields the snapshot holds are the ones it reads
+/// ([`crate::ui_unit::unit_object`]), with nothing a token's own build changes after. The group's
+/// and the pet's tokens have no snapshot, nor has the roster, whose leader cell
+/// `UnitIsPartyLeader` reads at the call (`0x516210`), and every token names its unit live.
 #[test]
 fn every_getter_answers_the_same_live_as_off_the_snapshot() {
     let mut c = client();
@@ -224,24 +226,39 @@ fn every_getter_answers_the_same_live_as_off_the_snapshot() {
         vec![values(PET, &[(FIELD_UNIT_HEALTH, 35)])],
         vec![values(ME, &[(FIELD_UNIT_HEALTH, 20)])],
     ]);
+    // The four tokens' copies, which no feed pushes in game, seated for the host-less answer.
+    crate::ui_unit::seat_tokens_once(c.app.world_mut());
     let snapshot = c.answers(false);
     let live = c.answers(true);
     assert_eq!(snapshot.len(), TOKENS.len() * GETTERS.len());
     for token in TOKENS {
         assert!(
-            snapshot
-                .iter()
+            live.iter()
                 .any(|l| l.starts_with(&format!("{token} UnitExists true,1"))),
-            "{token} names a unit: {snapshot:?}"
+            "{token} names a unit: {live:?}"
         );
     }
-    let differ: Vec<(&String, &String)> =
-        snapshot.iter().zip(&live).filter(|(s, l)| s != l).collect();
+    let seated = |line: &str| {
+        ["player ", "target ", "targettarget "]
+            .iter()
+            .any(|t| line.starts_with(t))
+    };
+    assert!(
+        live.iter().any(|l| l == "player UnitIsPartyLeader true,1"),
+        "we lead, read off the roster: {live:?}"
+    );
+    let roster = |line: &str| line.contains(" UnitIsPartyLeader ");
+    let differ: Vec<(&String, &String)> = snapshot
+        .iter()
+        .zip(&live)
+        .filter(|(s, l)| seated(s) && !roster(s) && s != l)
+        .collect();
     assert!(differ.is_empty(), "snapshot vs live: {differ:?}");
 }
 
 /// A store a packet moved after the frame's pushes reads as the object holds it, through the host,
-/// for the token's own unit and through a `target` hop; the snapshot still holds the push.
+/// for the token's own unit and through a `target` hop; with no host lent, the VM holds no copy of
+/// the four tokens, which no feed pushes.
 #[test]
 fn a_getter_reads_the_object_as_it_runs() {
     let mut c = client();
@@ -253,7 +270,7 @@ fn a_getter_reads_the_object_as_it_runs() {
     });
     assert_eq!(live, (15, 5, 5));
     let snapshot: (i64, i64, i64) = crate::script_calls::eval_in_vm(c.app.world(), chunk);
-    assert_eq!(snapshot, (80, 90, 90));
+    assert_eq!(snapshot, (0, 0, 0));
 }
 
 /// `UnitOnTaxi` tests bit 20 of the resolved object's flags as it runs (`0x517a80`-`0x517a8c`): a

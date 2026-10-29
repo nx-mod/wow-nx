@@ -18,10 +18,10 @@
 //! dispatch `0x403620` is registered, then the frame time, category 5 (`0x420d63`), and last the
 //! frame pass, category 0x11 (`0x420d6a`, `0x442350`), whose interface layer runs the `OnUpdate`
 //! walk (`0x764330` → `0x765650` → `0x76b2c0`) before the draw. benilla runs the frame's input
-//! records first, ahead of the net drain: the UI's input pass and its bindings
-//! ([`crate::ui_script::UiInput`]), the world's mouse with the look session's click tests
-//! ([`crate::player::WorldMouse`]) and the world's clicks ([`crate::target::WorldClicks`]), so a
-//! handler and the calls it makes read the world as the last frame left it. Then the drain applies
+//! records first, ahead of the net drain: the UI's input pass, its bindings and the world clicks
+//! they make, each record's before the next ([`crate::ui_script::UiInput`]), then the world's mouse
+//! with the look session ([`crate::player::WorldMouse`]), so a handler and the calls it makes read
+//! the world as the last frame left it. Then the drain applies
 //! the packets, the world systems that move what a call reads with them run before
 //! [`VmPass::Resume`], and every other link follows: the feeds, the tick, the controller's
 //! frame-time step, the target chain's picks, the drains and the paint.
@@ -173,7 +173,7 @@ fn flush_unit_edits_elsewhere(world: &mut World) {
 }
 
 /// The host's append-only sinks, which it and their other users share by `&self`: the chat log,
-/// the refusal keys, the message sounds and the unit edits. Each user's declared access reads
+/// the refusal keys, the message sounds, the unit edits and the gestures. Each user's declared access reads
 /// them only, so [`order_the_pass`] takes every user in as though it wrote them: one runs at a
 /// time, a call's refusals ([`crate::ui_cast::CallReports`]) are the call's alone, and the edits
 /// apply in the order they were made.
@@ -183,6 +183,7 @@ pub(crate) fn shared_sinks(world: &World) -> Vec<ComponentId> {
         std::any::TypeId::of::<crate::ui_action::UiErrorKeys>(),
         std::any::TypeId::of::<crate::sound::MessageSounds>(),
         std::any::TypeId::of::<crate::creature_anim::UnitEdits>(),
+        std::any::TypeId::of::<crate::creature_anim::GestureQueue>(),
         std::any::TypeId::of::<crate::player::FarSight>(),
     ]
     .into_iter()
@@ -263,6 +264,9 @@ pub(crate) fn order_the_pass(world: &mut World, label: impl ScheduleLabel) -> Ve
             &VmPass::Member,
         ]);
         let drain = members(&[&crate::ui_script::UiDrain]);
+        // An exclusive system's access is the whole world's, which no comparison reads: it joins
+        // only placed there, as the input records' dispatch is.
+        let placed = members(&[&VmPass::Member]);
         // Why each system joins: a host, a phase member that meets the host, a sink's user. A
         // link's own set is its function's, when the system alone carries it.
         #[derive(Clone, Copy, PartialEq)]
@@ -282,7 +286,11 @@ pub(crate) fn order_the_pass(world: &mut World, label: impl ScheduleLabel) -> Ve
                     return Joins::No;
                 };
                 if system.is_exclusive() {
-                    return Joins::No;
+                    return if placed[index[&key]] {
+                        Joins::Always
+                    } else {
+                        Joins::No
+                    };
                 }
                 let combined = declared.combined_access();
                 with_host.clone_from(combined);
@@ -721,7 +729,7 @@ mod tests {
     }
 
     /// The pass runs its phases in the reference's tick order: the input records (the UI's input
-    /// pass, the world's mouse, its clicks), then the net feeds (the unit feed), then the tick,
+    /// pass and its world clicks, the world's mouse), then the net feeds (the unit feeds), then the tick,
     /// then the drains of what their Lua asked, then the paint.
     #[test]
     fn the_pass_runs_the_input_then_the_feeds_then_the_tick_then_the_drains() {
@@ -730,21 +738,15 @@ mod tests {
             return;
         };
         let at = |name: &str| at(&order, name);
-        let (input, mouse, click, feed, tick) = (
-            at("::feed_ui_input"),
+        let (input, mouse, feed, tick) = (
+            at("::dispatch_input_records"),
             at("::latch_world_mouse"),
-            at("::select_on_click"),
-            at("::ui_unit::feed_units"),
+            at("::ui_unit::feed_far_sight_bit"),
             at("::tick_script"),
         );
         let (drain, paint) = (at("::drain_chat_input"), at("::paint_script"));
         assert!(
-            input < mouse
-                && mouse < click
-                && click < feed
-                && feed < tick
-                && tick < drain
-                && drain < paint,
+            input < mouse && mouse < feed && feed < tick && tick < drain && drain < paint,
             "{order:?}"
         );
     }
@@ -780,7 +782,7 @@ mod tests {
             .map(|k| update.name(*k))
             .collect();
         unordered.sort();
-        assert!(ahead >= 10, "the input records' hosts run ahead: {ahead}");
+        assert!(ahead >= 5, "the input records' hosts run ahead: {ahead}");
         assert!(
             unordered.is_empty(),
             "hosts in no declared order against the net drain:\n  {}",
@@ -801,8 +803,9 @@ mod tests {
             .map(|(a, b, _)| format!("{} <-> {}", update.name(*a), update.name(*b)))
             .collect();
         unordered.sort();
+        // A floor that shows the census found the hosts at all; it falls as feeds go live.
         assert!(
-            update.hosted.len() > 150,
+            update.hosted.len() > 80,
             "the census finds the hosts: {}",
             update.hosted.len()
         );
@@ -975,7 +978,7 @@ mod tests {
     fn every_user_of_a_shared_sink_runs_in_one_order() {
         let mut app = headless_client_with(crate::dev::add_every_instrument);
         let sinks = super::shared_sinks(app.world());
-        assert_eq!(sinks.len(), 5, "the sinks are registered");
+        assert_eq!(sinks.len(), 6, "the sinks are registered");
         let users: Vec<SystemKey> = app.world_mut().schedule_scope(Update, |world, schedule| {
             schedule.graph_mut().systems.initialize(world);
             let graph = schedule.graph();
@@ -1067,7 +1070,7 @@ mod tests {
             early.join("\n  ")
         );
         let asks = [at(&order, "::drain_ui_sounds"), at(&order, "::lua_music")];
-        for host in ["::act_on_interact", "::cinematic::feed_ui"] {
+        for host in ["::dispatch_input_records", "::cinematic::feed_ui"] {
             let host = at(&order, host);
             assert!(asks.iter().all(|a| host < *a), "{order:?}");
         }
@@ -1087,10 +1090,10 @@ mod tests {
         }
     }
 
-    /// A `SetCVar` the input pass makes moves the camera the frame it is made: the registry's
-    /// sync triggers the observers (the camera's look, zoom and follow knobs) and a sync point
-    /// runs them ahead of the controller, as the reference's `CVar::Set` (`0x63df50`) calls the
-    /// change callback inside the call (`0x63df7d`).
+    /// A CVar write no call took moves the camera the frame it is made: the registry's sync runs
+    /// its callbacks (the camera's look, zoom and follow knobs) ahead of the controller. A Lua
+    /// verb's write ran them inside its call, as the reference's `CVar::Set` (`0x63df50`) calls
+    /// the change callback inside the write (`0x63df7d`).
     #[test]
     fn a_set_cvar_reaches_the_camera_the_frame_it_is_made() {
         let mut app = headless_client();
@@ -1101,16 +1104,16 @@ mod tests {
         let sync = one(&built, "cvars::sync_cvars");
         let control = one(&built, "controller::control");
         assert!(
-            built.applies_before(sync, control),
-            "the CVar observers run after the controller reads their knobs"
+            built.runs_before(sync, control),
+            "the CVar callbacks run after the controller reads their knobs"
         );
     }
 
-    /// A `SetCVar` an input record makes reaches the look session the frame it is made: the
-    /// registry's sync after the UI's input pass triggers the observers (the look's rates, the
-    /// camera's dynamics) and a sync point runs them ahead of the world's mouse, as the
-    /// reference's `CVar::Set` (`0x63df50`) calls the change callback inside the call
-    /// (`0x63df7d`), before the next mouse message.
+    /// A CVar write an input record makes outside any call reaches the look session the frame
+    /// it is made: the registry's sync after the UI's input pass runs its callbacks (the look's
+    /// rates, the camera's dynamics) ahead of the world's mouse. A Lua verb's write ran them
+    /// inside its call, as the reference's `CVar::Set` (`0x63df50`) calls the change callback
+    /// inside the write (`0x63df7d`), before the next mouse message.
     #[test]
     fn a_set_cvar_an_input_record_makes_reaches_the_look_session_that_frame() {
         let mut app = headless_client();
@@ -1121,8 +1124,8 @@ mod tests {
         let sync = one(&built, "cvars::sync_input_cvars");
         let sample = one(&built, "controller::sample_look");
         assert!(
-            built.applies_before(sync, sample),
-            "the CVar observers run after the look session reads their knobs"
+            built.runs_before(sync, sample),
+            "the CVar callbacks run after the look session reads their knobs"
         );
     }
 

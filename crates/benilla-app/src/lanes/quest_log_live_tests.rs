@@ -10,8 +10,11 @@
 use benilla_formats::FactionCatalog;
 use benilla_protocol::field::{FIELD_UNIT_HEALTH, FIELD_UNIT_MAXHEALTH};
 use benilla_protocol::messages::field::FIELD_PLAYER_QUEST_LOG_1_1;
+use benilla_protocol::messages::{
+    QuestDetails, QuestGiverList, QuestListEntry, QuestRequestItems, QuestRewardItem,
+};
 use benilla_protocol::{EntityKind, ObjectFields, SessionEvent};
-use benilla_ui::script::UiScript;
+use benilla_ui::script::{QuestPanel, UiScript};
 use bevy::prelude::*;
 use crossbeam_channel::{Receiver, Sender};
 
@@ -149,6 +152,7 @@ fn client() -> Client {
     benilla_world::world_point::init_world_point_resources(app.world_mut());
     let world = app.world_mut();
     world.resource_mut::<crate::net::SelfGuid>().0 = Some(ME);
+    crate::ui_quest::hold_for_test(world, GIVER);
     world
         .resource_mut::<crate::names::NameCache>()
         .insert_creature(
@@ -296,8 +300,8 @@ fn a_lines_count_is_the_slots_at_the_call() {
     );
     assert_eq!(
         c.eval::<String>(false, line),
-        "Timber Wolf slain: 3/3|monster|1",
-        "with no host the copy answers"
+        "... slain: 3/3|monster|1",
+        "with no host the copies answer, and the VM holds no creature name"
     );
 }
 
@@ -377,6 +381,111 @@ fn the_logs_events_fire_at_their_packets_places() {
         ],
         "{seen:?}"
     );
+}
+
+/// The client with quest 52 in slot 1, selected, whose text reads world state 2000 and the
+/// player's name, and a listener that notes `GetQuestLogQuestText` at each `QUEST_LOG_UPDATE`.
+fn holding_a_macro_quest() -> Client {
+    let mut c = client();
+    let mut t = crate::ui_quest::test_template(52, "Hold the Line", 0);
+    t.details = "Hold for $2000w waves, $N.".into();
+    t.objectives_text = "$2000W left.".into();
+    let world = c.app.world_mut();
+    world
+        .resource_mut::<crate::ui_quest_log::QuestLog>()
+        .insert_template(t);
+    world
+        .resource_mut::<crate::names::NameCache>()
+        .insert_player(ME, "Tri".into(), None);
+    c.frame(vec![vec![SessionEvent::ObjectValues {
+        guid: ME,
+        fields: ObjectFields::from_pairs(&[(FIELD_PLAYER_QUEST_LOG_1_1 + 3, 52)]),
+    }]]);
+    c.frame(vec![]);
+    c.eval::<()>(
+        false,
+        r#"for i = 1, GetNumQuestLogEntries() do
+            if GetQuestLogTitle(i) == "Hold the Line" then SelectQuestLogEntry(i) end
+        end
+        Texts = {}
+        local g = CreateFrame("Frame")
+        g:RegisterEvent("QUEST_LOG_UPDATE")
+        g:SetScript("OnEvent", function()
+            local d, o = GetQuestLogQuestText()
+            table.insert(Texts, tostring(d) .. "|" .. tostring(o))
+        end)"#,
+    );
+    c.seen();
+    c
+}
+
+fn texts_seen(c: &mut Client) -> Vec<String> {
+    c.eval(false, "local t = Texts Texts = {} return t")
+}
+
+fn world_state(value: u32) -> SessionEvent {
+    SessionEvent::WorldStates {
+        scope: None,
+        states: vec![(2000, value)],
+    }
+}
+
+/// `GetQuestLogQuestText` expands its text's `$` macros at the call (`0x4dff89`, `0x4dffae` →
+/// `0x506f70`): a listener fired at a packet, with the packets after it not yet in, reads the
+/// world state and the name as its packet left them, not as a push before it did.
+#[test]
+fn a_quest_log_listener_reads_its_packets_quest_text() {
+    let mut c = holding_a_macro_quest();
+    for value in [3, 7] {
+        let world = c.app.world_mut();
+        crate::net::handlers::dispatch(world, vec![world_state(value)]);
+        crate::net::handlers::dispatch(world, sync());
+        crate::lanes::fire_in_order(world);
+        assert_eq!(
+            texts_seen(&mut c),
+            [format!("Hold for {value} waves, Tri.|{value} left.")]
+        );
+    }
+    let world = c.app.world_mut();
+    world
+        .resource_mut::<crate::names::NameCache>()
+        .insert_player(ME, "Tria".into(), None);
+    crate::net::handlers::dispatch(world, sync());
+    crate::lanes::fire_in_order(world);
+    assert_eq!(texts_seen(&mut c), ["Hold for 7 waves, Tria.|7 left."]);
+}
+
+/// The quest-slot watcher's accept line shows inside the update packet that filled the slot
+/// (`0x5ddd80`, `0x5dde66`), at its place: a later packet of the same frame that empties the slot
+/// again takes nothing back. The line's listener reads the log as it stood when the slot's watcher
+/// ran, ahead of the log's own watcher on the same block (`0x4de430`), so without the quest.
+#[test]
+fn the_accept_line_shows_at_the_packet_that_fills_the_slot() {
+    let mut c = client();
+    c.app
+        .world_mut()
+        .resource_mut::<crate::ui_quest_log::QuestLog>()
+        .insert_template(crate::ui_quest::test_template(51, "Kobolds", 0));
+    c.eval::<()>(
+        false,
+        r#"ERR_QUEST_ACCEPTED_S = "Quest accepted: %s"
+        Lines = {}
+        local g = CreateFrame("Frame")
+        g:RegisterEvent("CHAT_MSG_SYSTEM")
+        g:SetScript("OnEvent", function()
+            local _, n = GetNumQuestLogEntries()
+            table.insert(Lines, arg1 .. "|" .. n)
+        end)"#,
+    );
+    let slot = |quest: u32| {
+        vec![SessionEvent::ObjectValues {
+            guid: ME,
+            fields: ObjectFields::from_pairs(&[(FIELD_PLAYER_QUEST_LOG_1_1 + 3, quest)]),
+        }]
+    };
+    c.frame(vec![slot(51), slot(0)]);
+    let lines: Vec<String> = c.eval(false, "local l = Lines Lines = {} return l");
+    assert_eq!(lines, ["Quest accepted: Kobolds|1"]);
 }
 
 /// The client with a second quest in slot 1 whose record is not cached, so the rebuild awaits it,
@@ -501,4 +610,203 @@ fn the_lfg_quest_list_follows_the_slots_after_a_refused_template() {
     for live in [true, false] {
         assert_eq!(c.eval::<i64>(live, listed), 3, "live {live}");
     }
+}
+
+// ── The questgiver panel ─────────────────────────────────────────────────────────────────────
+
+const GIVER: u64 = 0xF130_0000_0000_0042;
+
+fn quest_row(quest_id: u32, icon: u32, level: u32, title: &str) -> QuestListEntry {
+    QuestListEntry {
+        quest_id,
+        icon,
+        level,
+        title: title.into(),
+    }
+}
+
+fn greeting() -> SessionEvent {
+    SessionEvent::QuestGreeting(QuestGiverList {
+        npc: GIVER,
+        greeting: "Well met.".into(),
+        emote_delay: 0,
+        emote: 0,
+        quests: vec![
+            quest_row(QUEST, 3, 12, "Wolves and Pelts"),
+            quest_row(51, 2, 9, "Kobolds"),
+        ],
+    })
+}
+
+fn detail() -> SessionEvent {
+    SessionEvent::QuestDetail(QuestDetails {
+        npc: GIVER,
+        quest_id: 51,
+        title: "Kobolds".into(),
+        details: "Clear the mine, $N.".into(),
+        objectives: String::new(),
+        auto_finish: 0,
+        choices: Vec::new(),
+        rewards: Vec::new(),
+        money: 0,
+        reward_spell: 0,
+    })
+}
+
+fn progress(pelts: u32) -> SessionEvent {
+    SessionEvent::QuestProgress(QuestRequestItems {
+        npc: GIVER,
+        quest_id: QUEST,
+        title: "Wolves and Pelts".into(),
+        request_text: "The pelts?".into(),
+        emote: 0,
+        close_on_cancel: 0,
+        required_money: 0,
+        required_items: vec![QuestRewardItem {
+            item_id: PELT,
+            count: pelts,
+            display_id: 1,
+        }],
+        is_complete: true,
+    })
+}
+
+/// The questgiver getters with the host lent read the panel's cells as the packets' handlers left
+/// them, with no push between: each text its own buffer (`0xbde288`, `0xbdf0f8`), expanded at its
+/// packet (`0x500cc9`); the greeting's pools past the panel, nil past their count (`0x501b05`);
+/// and `IsQuestCompletable` the packet's flag with the pelts held at the call (`0x501230`).
+#[test]
+fn the_giver_getters_read_the_panel_cells_at_the_call() {
+    let mut c = client();
+    c.app
+        .world_mut()
+        .resource_mut::<crate::names::NameCache>()
+        .insert_player(ME, "Tri".into(), None);
+    for ev in [greeting(), detail(), progress(5)] {
+        crate::net::handlers::dispatch(c.app.world_mut(), vec![ev]);
+    }
+    let texts = "return GetQuestText(), GetProgressText(), GetRewardText()";
+    assert_eq!(
+        c.eval::<(String, String, String)>(true, texts),
+        (
+            "Clear the mine, Tri.".into(),
+            "The pelts?".into(),
+            String::new()
+        )
+    );
+    let copy: (String, String, String) = c.eval(false, texts);
+    assert_eq!(copy.1, "", "the VM's copy has heard of no panel");
+    let titles = "return GetActiveTitle(1), GetAvailableTitle(1), GetActiveTitle(2), \
+                  GetAvailableLevel(1)";
+    assert_eq!(
+        c.eval::<(Option<String>, Option<String>, Option<String>, i64)>(true, titles),
+        (
+            Some("Wolves and Pelts".into()),
+            Some("Kobolds".into()),
+            None,
+            9
+        )
+    );
+    let completable = "return IsQuestCompletable()";
+    assert_eq!(
+        c.eval::<Option<i64>>(true, completable),
+        Some(1),
+        "five held"
+    );
+    crate::net::handlers::dispatch(c.app.world_mut(), vec![progress(6)]);
+    assert_eq!(
+        c.eval::<Option<i64>>(true, completable),
+        None,
+        "five of six held, whatever the packet's flag"
+    );
+}
+
+/// A panel's event sits on the questgiver lane at its handler's place and fires there, and a
+/// refusal's close in the same frame runs behind it: `QUEST_DETAIL`, the line, then
+/// `QUEST_FINISHED` (`0x5dbd50`, `0x5dbca0`, `0x501217`).
+#[test]
+fn a_panel_and_its_refusal_fire_on_the_lane_at_their_packets() {
+    let mut c = client();
+    c.eval::<()>(
+        false,
+        r#"
+        ERR_QUEST_ALREADY_ON = "already on"
+        local f = CreateFrame("Frame")
+        for _, e in ipairs({"QUEST_DETAIL", "QUEST_FINISHED", "CHAT_MSG_SYSTEM"}) do
+            f:RegisterEvent(e)
+        end
+        f:SetScript("OnEvent", function() table.insert(Seen, event) end)
+        "#,
+    );
+    let before = crate::lanes::stamp();
+    crate::net::handlers::dispatch(c.app.world_mut(), vec![detail()]);
+    let after = crate::lanes::stamp();
+    let stamped = c
+        .app
+        .world()
+        .resource::<crate::ui_quest::QuestGiverLane>()
+        .stamped();
+    assert!(
+        matches!(
+            stamped.as_slice(),
+            [(at, crate::ui_quest::QuestGiverEvent::Panel(QuestPanel::Detail, GIVER))]
+                if before < *at && *at < after
+        ),
+        "stamped inside the handler: {stamped:?}"
+    );
+    crate::net::handlers::dispatch(
+        c.app.world_mut(),
+        vec![SessionEvent::QuestGiverInvalid { reason: 13 }],
+    );
+    assert!(c.seen().is_empty(), "nothing fires ahead of the drain");
+    crate::lanes::fire_in_order(c.app.world_mut());
+    assert_eq!(
+        c.seen(),
+        ["QUEST_DETAIL", "CHAT_MSG_SYSTEM", "QUEST_FINISHED"]
+    );
+}
+
+/// A panel's event fires once per panel, and the giver's name, which the frame looks up with a
+/// callback at that event (`0x5171b8`), signals nothing when it lands: no questgiver event fires
+/// off its answer (`QUEST_ITEM_UPDATE` only off an item callback, `0x501903`).
+#[test]
+fn the_givers_name_landing_fires_no_quest_event() {
+    const SHARER: u64 = 0x99;
+    let mut c = client();
+    c.eval::<()>(
+        false,
+        r#"
+        local f = CreateFrame("Frame")
+        for _, e in ipairs({"QUEST_GREETING", "QUEST_DETAIL", "QUEST_ITEM_UPDATE"}) do
+            f:RegisterEvent(e)
+        end
+        f:SetScript("OnEvent", function() table.insert(Seen, event) end)
+        "#,
+    );
+    let mut offer = detail();
+    if let SessionEvent::QuestDetail(d) = &mut offer {
+        d.npc = SHARER;
+    }
+    crate::ui_quest::hold_for_test(c.app.world_mut(), SHARER);
+    crate::net::handlers::dispatch(c.app.world_mut(), vec![offer]);
+    crate::lanes::fire_in_order(c.app.world_mut());
+    assert_eq!(c.seen(), ["QUEST_DETAIL"]);
+    crate::net::handlers::dispatch(
+        c.app.world_mut(),
+        vec![SessionEvent::PlayerName {
+            guid: SHARER,
+            name: "Sharer".into(),
+            race: 1,
+            gender: 0,
+            class: 1,
+        }],
+    );
+    let lane = c
+        .app
+        .world()
+        .resource::<crate::ui_quest::QuestGiverLane>()
+        .stamped();
+    assert!(lane.is_empty(), "the name queues nothing: {lane:?}");
+    crate::lanes::fire_in_order(c.app.world_mut());
+    assert!(c.seen().is_empty(), "a landed name fires nothing");
 }

@@ -178,29 +178,42 @@ pub(crate) fn open(app: &mut App, window: W, npc: u64) {
     match window {
         W::Trade => {
             world.resource_mut::<TradeSession>().begin(npc);
-            crate::ui_trade::open_window(world);
+            crate::ui_trade::open_window(world, None);
         }
         W::ItemText => {
-            // The reader finds the template through the object's own descriptor.
-            if !world
+            // The reader finds the template through the object's own descriptor: a book, unless
+            // the guid already holds a game object (a quest panel's unit gives way to it).
+            let book = crate::go_templates::test_typed_fields(BOOK_ENTRY, 9);
+            let held = world
                 .resource::<crate::net::GuidIndex>()
                 .0
-                .contains_key(&npc)
-            {
-                crate::items::test_spawn_object(
-                    world,
-                    npc,
-                    crate::go_templates::test_typed_fields(BOOK_ENTRY, 9),
-                );
+                .get(&npc)
+                .copied();
+            match held {
+                None => {
+                    crate::items::test_spawn_object(world, npc, book);
+                }
+                Some(e) => {
+                    let is_go = world
+                        .get::<crate::net::ObjectStore>(e)
+                        .and_then(|s| s.0.object_type_mask())
+                        .is_some_and(|m| m & 0x20 != 0);
+                    if !is_go {
+                        world.entity_mut(e).insert(crate::net::ObjectStore(book));
+                    }
+                }
             }
             crate::ui_item_text::read_now(world, npc)
         }
         W::Merchant => crate::ui_merchant::open_merchant(world, npc, Vec::new()),
         W::Bank => crate::ui_bank::open_bank(world, npc),
         W::Gossip => crate::ui_gossip::open_menu(world, npc, 0, Vec::new(), Vec::new()),
-        W::Quest => crate::ui_quest::open_panel(world, npc, greeting(npc)),
+        W::Quest => {
+            crate::ui_quest::hold_for_test(world, npc);
+            crate::ui_quest::open_panel(world, npc, greeting(npc))
+        }
         W::Trainer => crate::ui_trainer::open_trainer(world, npc, 0, Vec::new(), String::new()),
-        W::Taxi => crate::ui_taxi::open_map(world, npc, 1, Default::default()),
+        W::Taxi => crate::ui_taxi::open_unbuilt(world, npc),
         W::Stable => crate::ui_stable::open_stable(world, npc, 0, Vec::new()),
         W::Registrar => {
             use crate::target::cursor_mode::npc_flags::{PETITIONER, TABARDDESIGNER};
@@ -378,7 +391,7 @@ fn a_trade_and_an_npc_window_close_each_other() {
     app.world_mut()
         .resource_mut::<TradeSession>()
         .begin(PARTNER);
-    crate::ui_trade::open_window(app.world_mut());
+    crate::ui_trade::open_window(app.world_mut(), None);
     assert_eq!(latch(&app), Some(PARTNER));
     assert!(rx.try_iter().next().is_none(), "the open sends nothing");
 
@@ -395,7 +408,7 @@ fn a_trade_and_an_npc_window_close_each_other() {
     app.world_mut()
         .resource_mut::<TradeSession>()
         .begin(PARTNER);
-    crate::ui_trade::open_window(app.world_mut());
+    crate::ui_trade::open_window(app.world_mut(), None);
     assert_eq!(seen_in(&app), ["TRADE_CLOSED", "MERCHANT_CLOSED"]);
     assert!(
         rx.try_iter().next().is_none(),
@@ -436,7 +449,7 @@ fn a_book_over_a_trade_cancels_it_before_the_begin() {
     app.world_mut()
         .resource_mut::<TradeSession>()
         .begin(PARTNER);
-    crate::ui_trade::open_window(app.world_mut());
+    crate::ui_trade::open_window(app.world_mut(), None);
     read_book(app.world_mut(), NPC);
     assert_eq!(seen_in(&app), ["TRADE_CLOSED", "ITEM_TEXT_BEGIN"]);
     let sent: Vec<ClientCommand> = rx.try_iter().collect();

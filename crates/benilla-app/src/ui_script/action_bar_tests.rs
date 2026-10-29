@@ -1024,7 +1024,7 @@ fn drag_drop_onto_another_button_hops_the_displaced_action() {
 
 /// The count shows only for `IsConsumableAction` (ActionButton.lua:285-292), false for a mount's
 /// item: zero charges, `InventoryType` 0 (`0x4e5250`). The flag rides the slot, not the state
-/// map: `ACTIONBAR_SLOT_CHANGED` repaints before the state feed writes.
+/// map: `ACTIONBAR_SLOT_CHANGED` repaints before any state is pushed.
 #[test]
 fn count_fontstring_follows_is_consumable_action_not_the_bag_count() {
     benilla_formats::wow_data_or_skip!();
@@ -1624,7 +1624,7 @@ fn both_reference_action_button_templates_are_inheritable() {
         !report
             .warnings
             .iter()
-            .any(|w| w.contains("unknown template")),
+            .any(|w| w.contains("Couldn't find inherited node")),
         "both names must resolve: {:?}",
         report.warnings
     );

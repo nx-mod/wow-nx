@@ -5,7 +5,7 @@
 
 use bevy::prelude::*;
 
-use crate::ui_script::{UiFeed, UiInput};
+use crate::ui_script::UiInput;
 
 #[cfg(test)]
 mod ace_gate_tests;
@@ -33,6 +33,7 @@ pub(crate) mod idle;
 mod input;
 /// The language gate: the exemptions and fluency lookup behind the chat garble.
 mod language;
+pub(crate) use language::ChatLanguages;
 /// `LoggingChat`/`LoggingCombat`: the two log files `/chatlog` and `/combatlog` toggle.
 pub(crate) mod logging;
 #[cfg(test)]
@@ -63,7 +64,9 @@ pub(crate) use edit::ChannelState;
 #[cfg(test)]
 pub(crate) use event::event_name;
 pub(crate) use event::{default_color, ChatEvent, ChatEventKind};
-pub(crate) use feed::{Answer, ChatLog};
+#[cfg(test)]
+pub(crate) use feed::EmoteTexts;
+pub(crate) use feed::{release_display, Answer, ChatLog};
 /// The chat applier off a bare world, for the tests that send through it.
 #[cfg(test)]
 pub(crate) use input::{chat_world, run_chat};
@@ -124,9 +127,13 @@ pub(crate) struct ChatDrain;
 
 impl Plugin for UiChatPlugin {
     fn build(&self, app: &mut App) {
+        use crate::ui_script::SweepApp;
         net::register(app);
         add_chat_lane(app);
-        app.add_observer(combat::on_cvar);
+        app.add_sweep_leg(
+            crate::ui_script::SweepLeg::ChatLatch,
+            feed::latch_on_leave_world,
+        );
         app.init_resource::<ChatLog>()
             .init_resource::<away::AfkMirror>()
             .init_resource::<away::AfkMirrorMemo>()
@@ -137,8 +144,8 @@ impl Plugin for UiChatPlugin {
             .init_resource::<recruitment::GuildRecruitmentCascade>()
             .init_resource::<language::ChatLanguages>()
             .init_resource::<combat::CombatLogRanges>()
-            // `combat::on_cvar` writes this and the range set: a missing one panics on the first
-            // write, which only `scripts/smoke.sh` sees (the unit suites build their own worlds).
+            // `combat::on_cvar` writes this and the range set; the callbacks skip a row whose
+            // knob is missing ([`crate::cvars::CvarCallbacks`]), so its write would go nowhere.
             .init_resource::<combat::LogPeriodicSpells>()
             // These DBC loads must follow `AssetSet::Open`: before it there is no chain, and each
             // silently loads nothing.
@@ -153,7 +160,8 @@ impl Plugin for UiChatPlugin {
             )
             // The slash-command table needs the VM's globals and the emote catalog, both `Startup`.
             .add_systems(PostStartup, commands::build_slash_commands)
-            // The language gate's feeds, ahead of the chat lane that reads them.
+            // The language gate's feeds, ahead of the chat lane that reads them; with the frame's
+            // packets, ahead of the resumed pass, as a page turn's show reads them inside its call.
             .add_systems(
                 Update,
                 (
@@ -161,16 +169,8 @@ impl Plugin for UiChatPlugin {
                     language::feed_language_skills,
                     language::feed_default_language,
                 )
-                    .before(crate::lanes::UiLanes),
-            )
-            // Descriptor-diff combat-log lines, ahead of the drain so none lands a frame late.
-            .add_systems(
-                Update,
-                (
-                    combat::watch::death_lines,
-                    combat::watch::aura_lines,
-                    combat::watch::pet_loyalty_lines,
-                )
+                    .after(benilla_world::schedule::WorldStage::Net)
+                    .before(crate::vm_pass::VmPass::Resume)
                     .before(crate::lanes::UiLanes),
             )
             // After the drain, so the log files take the frame's lines in one order.
@@ -180,21 +180,9 @@ impl Plugin for UiChatPlugin {
                     .in_set(crate::lanes::UiLanes)
                     .after(crate::lanes::fire_in_order),
             )
-            // Before the drain, so a broadcast lands on the frame it decodes.
-            .add_systems(
-                Update,
-                broadcast::feed_broadcasts.in_set(crate::ui_script::UiFeed),
-            )
             // The last-input stamp `[0xcf0bc8]`, ungated and ahead of the UI pass: the reference
             // stamps raw input before dispatch, so a key the chat box swallows still counts.
             .add_systems(Update, idle::stamp_input.before(UiInput))
-            // A fresh VM's joined-channel mirror, before the drain so its first line is numbered.
-            .add_systems(
-                Update,
-                channels::seed_channels.in_set(crate::ui_script::UiFeed),
-            )
-            // `SMSG_PLAYED_TIME` -> `TIME_PLAYED_MSG`.
-            .add_systems(Update, feed::played_time_bridge.in_set(UiFeed))
             .add_systems(
                 Update,
                 (
@@ -250,7 +238,6 @@ impl Plugin for UiChatPlugin {
 /// welcome. Ahead of each drain the held lines' age pass is queued ([`ChatLog::begin_frame`]).
 pub(crate) fn add_chat_lane(app: &mut App) {
     use crate::lanes::LaneApp;
-    app.init_resource::<combat::watch::DeathLineAt>();
     app.init_resource::<ChatLog>().add_lane(
         "chat",
         |world| world.get_resource::<ChatLog>()?.peek(),

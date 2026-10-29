@@ -4,13 +4,13 @@
 //! not unify them.
 
 use benilla_formats::{
-    substitute, SkillLineCatalog, SpellCatalog, TokenContext, SPELL_ATTR_IS_TRADESKILL,
-    SPELL_EFFECT_CREATE_ITEM, SPELL_EFFECT_LEARN_PET_SPELL, SPELL_EFFECT_LEARN_SPELL,
-    SPELL_EFFECT_SKILL_STEP,
+    substitute_parts, ExpandAt, SkillLineCatalog, SpellCatalog, TokenContext,
+    SPELL_ATTR_IS_TRADESKILL, SPELL_EFFECT_CREATE_ITEM, SPELL_EFFECT_LEARN_PET_SPELL,
+    SPELL_EFFECT_LEARN_SPELL, SPELL_EFFECT_SKILL_STEP,
 };
 use benilla_protocol::messages::{trainer_spell_state, TrainerSpell};
 use benilla_ui::script::{
-    ProductWait, TrainerServiceCategory, TrainerTooltip, TRAINER_GROUP_KNOWN,
+    ProductWait, TooltipText, TrainerServiceCategory, TrainerTooltip, TRAINER_GROUP_KNOWN,
 };
 
 use crate::entities::ItemDisplays;
@@ -124,9 +124,9 @@ pub(super) fn service_tooltip(wire_spell: u32, spells: &SpellCatalog) -> Trainer
 /// The `$`-token contexts a service description expands over, picked per row by the caster the
 /// expander's level terms read (`0x6e3130`'s selector): the active player's, or the pet's, which
 /// a `LEARN_PET_SPELL` wrapper selects.
-pub(super) struct ServiceText<'a> {
-    pub(super) player: &'a TokenContext<'a>,
-    pub(super) pet: &'a TokenContext<'a>,
+pub(super) struct ServiceText<'c, 'a> {
+    pub(super) player: &'c TokenContext<'a>,
+    pub(super) pet: &'c TokenContext<'a>,
 }
 
 /// `GetTrainerServiceDescription 0x4d9b40`: the text the stock window shows under the service's
@@ -152,6 +152,7 @@ pub(super) fn service_description(
     text: &ServiceText,
 ) -> Option<String> {
     service_description_waiting(wire, trainer_type, spells, items, ask, text, &mut None)
+        .map(|t| t.text(benilla_ui::strings::Strings::Host(text.player.global)))
 }
 
 /// [`service_description`], with `wait` set to the recipe's product whose record the lookup
@@ -165,7 +166,15 @@ pub(super) fn service_description_waiting(
     ask: Ask<'_>,
     text: &ServiceText,
     wait: &mut Option<ProductWait>,
-) -> Option<String> {
+) -> Option<TooltipText> {
+    // The expander's text, each template it names left to the getter's read of the VM's strings.
+    fn substitute(
+        text: &str,
+        d: &benilla_formats::SpellDisplay,
+        ctx: &TokenContext,
+    ) -> TooltipText {
+        crate::ui_tooltip::tooltip_text(substitute_parts(text, d, ctx, ExpandAt::default()))
+    }
     let d = spells.get(wire.spell)?;
     let learn = (0..3).find(|&i| {
         matches!(
@@ -199,7 +208,7 @@ pub(super) fn service_description_waiting(
                 let product = taught.effect_item_type[0];
                 match items.template(product, 0, ask) {
                     Some(item) if !item.description.is_empty() => {
-                        return Some(item.description.clone());
+                        return Some(TooltipText::from(item.description.clone()));
                     }
                     Some(_) => {}
                     None if product != 0 => {
@@ -289,9 +298,9 @@ pub(super) fn service_kind(wire_spell: u32, spells: &SpellCatalog) -> (bool, Opt
 /// re-evaluator's 3 (`0x4d7e3e`, `0x4d83a4`) among them; vmangos sends 0 to 2
 /// (`NPCHandler.cpp:113`).
 ///
-/// Deviation: benilla hides every state from 3 up. The reference shows bytes 32 and up, because
-/// x86 `shl` wraps its count (bits 32-34 alias 0-2) and its group counter `[hdr+4+state*4]`
-/// (`0x4d7854`) runs past the header.
+/// Deviation: benilla hides every state from 3 up. The reference shows states 32-34, 64-66 …
+/// 224-226 and hides the gaps, because x86 `shl` uses its count's low 5 bits and only filter bits
+/// 0-2 are set (`0x4da390`); its group counter `[hdr+4+state*4]` (`0x4d7854`) runs past the header.
 pub(super) fn category(state: u8) -> TrainerServiceCategory {
     match state {
         trainer_spell_state::GREEN => TrainerServiceCategory::Available,

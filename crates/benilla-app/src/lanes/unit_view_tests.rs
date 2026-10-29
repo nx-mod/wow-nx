@@ -172,6 +172,9 @@ pub(super) fn client() -> App {
     // Our create tagged as ours, as the net stage's pass does (`net::apply`).
     let me = world.resource::<crate::net::GuidIndex>().0[&ME];
     world.entity_mut(me).insert(crate::net::SelfPlayer);
+    // The world entry first, as a session has it: the target comes after.
+    frame(&mut app, vec![]);
+    let world = app.world_mut();
     let wolf = world.resource::<crate::net::GuidIndex>().0[&WOLF];
     *world.resource_mut::<crate::target::Selection>() = crate::target::Selection {
         target: Some(wolf),
@@ -195,8 +198,7 @@ pub(super) fn seat(app: &mut App, tot: u64) {
         });
 }
 
-/// One frame: the packets through the handler table, the unit feed's push of the frame's state,
-/// then the lanes' drain; what the spy saw.
+/// One frame: the packets through the handler table, then the lanes' drain; what the spy saw.
 pub(super) fn frame(app: &mut App, packets: Vec<SessionEvent>) -> Vec<String> {
     frame_after(app, |_| {}, packets)
 }
@@ -217,7 +219,6 @@ pub(super) fn frame_after(
     }
     before(world);
     crate::net::handlers::dispatch(world, wire(packets));
-    crate::ui_unit::run_feed_units_once(world);
     crate::lanes::fire_in_order(world);
     let s = world.non_send_resource_mut::<UiScript>();
     let out = s.eval::<Vec<String>>("return Seen").unwrap();
@@ -239,6 +240,37 @@ fn each_unit_health_listener_reads_its_own_packets_target_health() {
         ),
         ["UNIT_HEALTH:target:70", "UNIT_HEALTH:target:40"]
     );
+}
+
+/// The unit tooltip watches the health of the unit it shows on the object itself (`0x52a0a8`
+/// registers `0x529560`), so a values block re-seats the plate's bar inside its packet's notify
+/// pass, with no token pushed: the target's plate follows each packet's health.
+#[test]
+fn a_unit_tooltips_bar_follows_its_units_health_at_each_packet() {
+    let mut app = client();
+    let world = app.world_mut();
+    crate::ui_script::test_ui::load_tooltip_template(world.non_send_resource::<UiScript>());
+    crate::script_calls::with_hosted_vm(world, |s| {
+        s.expect("a VM").run(
+            r#"
+            Tip = CreateFrame("GameTooltip", "Tip", nil, "TestTooltipTemplate")
+            local bar = CreateFrame("StatusBar", "TipStatusBar", Tip)
+            bar:SetWidth(100) bar:SetHeight(8)
+            Bars = {}
+            bar:SetScript("OnValueChanged", function() table.insert(Bars, arg1) end)
+            Tip:SetOwner(CreateFrame("Frame"), "ANCHOR_NONE")
+            Tip:SetUnit("target")
+            "#,
+        )
+    })
+    .expect("the plate shows the target");
+    frame(
+        &mut app,
+        vec![values(WOLF, &health(70)), values(WOLF, &health(40))],
+    );
+    let bars: Vec<f64> = crate::script_calls::eval_in_vm(app.world(), "return Bars");
+    // Each seat sets the range, re-firing the held value, then the packet's (`0x529560`).
+    assert_eq!(bars, [100.0, 100.0, 70.0, 70.0, 40.0]);
 }
 
 /// A combat-log `UNIT_COMBAT` raised ahead of the update packet that writes the hit reads the
@@ -267,17 +299,12 @@ fn each_unit_mana_listener_reads_its_own_packets_mana() {
     );
 }
 
-/// The lane's own count of the builds it made, the views it pushed and the stores it checked at
-/// its end, read and reset.
-fn lane_counts(app: &mut App) -> (usize, usize, usize) {
+/// The lane's own count of the stores it checked at its end, read and reset.
+fn lane_checks(app: &mut App) -> usize {
     let mut views = app
         .world_mut()
         .resource_mut::<crate::ui_unit::views::UnitViews>();
-    let counts = (views.builds, views.pushes, views.checked);
-    views.builds = 0;
-    views.pushes = 0;
-    views.checked = 0;
-    counts
+    std::mem::take(&mut views.checked)
 }
 
 /// The replay ends on the live stores: a frame of moved dwords, a re-create that clears a field,
@@ -293,7 +320,7 @@ fn the_replay_ends_on_the_live_stores() {
         .non_send_resource_mut::<UiScript>()
         .run(r#"function Look(event, unit) return UnitHealth("targettarget") end"#)
         .unwrap();
-    lane_counts(&mut app);
+    lane_checks(&mut app);
     let seen = frame(
         &mut app,
         vec![
@@ -324,7 +351,7 @@ fn the_replay_ends_on_the_live_stores() {
         "the target's target as each packet left it: gone between its release and its create"
     );
     assert_eq!(
-        lane_counts(&mut app).2,
+        lane_checks(&mut app),
         2,
         "the boar and we were rewound and checked"
     );
@@ -335,17 +362,17 @@ fn the_replay_ends_on_the_live_stores() {
     );
 }
 
-/// Two packets with no event between them are one gap: the drain applies both and builds the
-/// views once. A fall ahead of the first reads the frame's start, one between the second and the
-/// third reads after the second, and the last packet's views are the feed's own, built by none.
+/// Two packets with no event between them are one gap: the drain applies both at once. A fall
+/// ahead of the first reads the frame's start, one between the second and the third reads after
+/// the second, and the last reads the live stores.
 #[test]
-fn two_packets_with_no_event_between_make_one_build() {
+fn two_packets_with_no_event_between_are_one_gap() {
     let mut app = client();
     app.world_mut()
         .non_send_resource_mut::<UiScript>()
         .run(r#"function Look(event, unit) return UnitHealth("targettarget") end"#)
         .unwrap();
-    lane_counts(&mut app);
+    lane_checks(&mut app);
     let seen = frame(
         &mut app,
         vec![
@@ -365,25 +392,6 @@ fn two_packets_with_no_event_between_make_one_build() {
             "UNIT_COMBAT:player:50"
         ]
     );
-    assert_eq!(
-        lane_counts(&mut app).0,
-        2,
-        "the frame's start and the one gap"
-    );
-}
-
-/// A frame whose events all follow its last write needs no older view than the feed's push:
-/// the lane builds and pushes nothing.
-#[test]
-fn a_frame_whose_events_follow_every_write_pushes_no_old_view() {
-    let mut app = client();
-    lane_counts(&mut app);
-    assert_eq!(
-        frame(&mut app, vec![values(WOLF, &health(70)), fall(1)]),
-        ["UNIT_HEALTH:target:70", "UNIT_COMBAT:player:100"]
-    );
-    let (builds, pushes, _) = lane_counts(&mut app);
-    assert_eq!((builds, pushes), (0, 0));
 }
 
 /// A store written past the log fails the rewind's check against the frame-start snapshot: here
@@ -412,7 +420,7 @@ fn a_write_the_log_missed_fails_the_rewind() {
 #[test]
 fn a_worldport_is_logged_as_the_stores_it_takes() {
     let mut app = client();
-    lane_counts(&mut app);
+    lane_checks(&mut app);
     app.world_mut()
         .resource_mut::<crate::ui_unit::views::UnitViews>()
         .starts_checked = 0;
@@ -441,8 +449,7 @@ struct Stuck(Option<crate::lanes::Stamp>);
 fn fire_stuck(In(_): In<crate::lanes::Until>) {}
 
 /// A drain that stops before the views lane has replayed its entries leaves no rewound store
-/// behind: the next frame's feed reads the live store, and the next drain puts the feed's views
-/// back, so the target reads the health its last packet wrote.
+/// behind, so the target reads, through the host, the health its last packet wrote.
 #[test]
 fn a_drain_that_stops_early_leaves_no_rewound_store() {
     use crate::lanes::LaneApp;
@@ -463,40 +470,11 @@ fn a_drain_that_stops_early_leaves_no_rewound_store() {
     assert!(!views.holds(WOLF), "the stop left nothing rewound");
     app.world_mut().resource_mut::<Stuck>().0 = None;
     assert_eq!(frame(&mut app, vec![]), ["UNIT_HEALTH:target:70"]);
-    let health = app
-        .world_mut()
-        .non_send_resource_mut::<UiScript>()
-        .eval::<f64>("return UnitHealth('target')")
-        .unwrap();
+    let health = crate::script_calls::with_hosted_vm(app.world_mut(), |s| {
+        s.expect("a VM").eval::<f64>("return UnitHealth('target')")
+    })
+    .unwrap();
     assert_eq!(health, 70.0);
-}
-
-/// Updates to units no view reads, between events, build nothing: the lane rewinds only a unit a
-/// token can name, and a gap whose entries name none is no build.
-#[test]
-fn updates_to_units_no_view_reads_build_nothing() {
-    const FAR: [u64; 3] = [
-        0xF130_0000_0050_0001,
-        0xF130_0000_0050_0002,
-        0xF130_0000_0050_0003,
-    ];
-    let mut app = client();
-    let mob = |hp: u32| [(FIELD_UNIT_HEALTH, hp), (FIELD_UNIT_MAXHEALTH, 100)];
-    frame(
-        &mut app,
-        FAR.iter()
-            .map(|&g| created(g, EntityKind::Unit, &mob(100)))
-            .collect(),
-    );
-    lane_counts(&mut app);
-    let mut packets = vec![fall(1)];
-    for (i, &g) in FAR.iter().enumerate() {
-        packets.push(values(g, &health(90 - i as u32)));
-        packets.push(fall(1));
-    }
-    frame(&mut app, packets);
-    let (builds, pushes, _) = lane_counts(&mut app);
-    assert_eq!((builds, pushes), (0, 0));
 }
 
 /// Our own death signals `PLAYER_DEAD` inside its packet (`0x6046f0` at `0x6047a3`, then
@@ -531,6 +509,7 @@ fn player_dead_reads_its_packets_health_after_an_earlier_packets_line() {
 /// line (`0x62c160`) and ends in `SignalDeathState` (`0x6251cc` → `0x495850`).
 #[test]
 fn our_deaths_list_signals_before_its_line_and_player_dead_after() {
+    #[cfg(debug_assertions)]
     use bevy::ecs::system::RunSystemOnce;
 
     let mut app = client();
@@ -557,12 +536,8 @@ fn our_deaths_list_signals_before_its_line_and_player_dead_after() {
     world
         .run_system_once(crate::ui_unit::views::mark_frame_start)
         .unwrap();
+    // The packet's end writes the line among the death's legs.
     crate::net::handlers::dispatch(world, wire([values(ME, &health(0))]));
-    // The death line's watcher, which the frame runs ahead of the drain.
-    world
-        .run_system_once(crate::ui_chat::combat::watch::death_lines)
-        .unwrap();
-    crate::ui_unit::run_feed_units_once(world);
     crate::lanes::fire_in_order(world);
     let seen = world
         .non_send_resource::<UiScript>()
@@ -574,6 +549,54 @@ fn our_deaths_list_signals_before_its_line_and_player_dead_after() {
         .filter(|s| !s.starts_with("UNIT_"))
         .collect();
     assert_eq!(ours, ["PLAYER_TARGET_CHANGED", "death line", "PLAYER_DEAD"]);
+}
+
+/// The death line's listener runs where the health watcher wrote it, inside its update packet
+/// (`0x465277` → `0x6046f0` → `0x605860` → `0x62c160`), before the next packet's handler runs
+/// (`0x537ae5`): its `SendChatMessage` goes out ahead of the name query the next packet's create
+/// asks in its handler (`0x5dec12` → `0x609210`). The lanes fire after the whole dispatch until
+/// they fire inside it, so the query goes first today.
+#[test]
+#[ignore = "the lanes fire inside the dispatch only from the flip on"]
+fn a_death_lines_listener_sends_ahead_of_the_next_packets_handler() {
+    const STRANGER: u64 = 0x31;
+    let mut app = client();
+    let (tx, sent) = crossbeam_channel::unbounded();
+    app.insert_resource(crate::net::NetCommands(tx));
+    app.world_mut()
+        .resource_mut::<crate::net::NetStatus>()
+        .connected = true;
+    app.world()
+        .non_send_resource::<UiScript>()
+        .run(
+            r#"UNITDIESOTHER = "%s dies."
+            local d = CreateFrame("Frame")
+            d:RegisterEvent("CHAT_MSG_COMBAT_HOSTILE_DEATH")
+            d:SetScript("OnEvent", function() SendChatMessage("down", "SAY") end)"#,
+        )
+        .unwrap();
+    let world = app.world_mut();
+    crate::net::handlers::dispatch(
+        world,
+        wire_packets(vec![
+            vec![values(BOAR, &health(0))],
+            vec![created(
+                STRANGER,
+                EntityKind::Player,
+                &[(FIELD_UNIT_HEALTH, 100)],
+            )],
+        ]),
+    );
+    crate::lanes::fire_in_order(world);
+    let order: Vec<&str> = sent
+        .try_iter()
+        .filter_map(|c| match c {
+            crate::net::ClientCommand::Chat { .. } => Some("chat"),
+            crate::net::ClientCommand::NameQuery { guid: STRANGER } => Some("name query"),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(order, ["chat", "name query"]);
 }
 
 /// A spy on the level-up's events, each with its arguments, into the client's `Seen`.

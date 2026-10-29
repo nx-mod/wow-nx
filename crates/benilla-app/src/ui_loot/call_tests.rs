@@ -123,6 +123,7 @@ pub(super) fn client() -> Loot {
             ERR_LOOT_NO_UI = "ERR_LOOT_NO_UI"
             ERR_LOOT_DIDNT_KILL = "ERR_LOOT_DIDNT_KILL"
             YOU_LOOT_MONEY = "You loot %s"
+            LOOT_MONEY_SPLIT = "Your share of the loot is %s."
             GOLD = "Gold" SILVER = "Silver" COPPER = "Copper"
             SEEN = {}
             local f = CreateFrame("Frame")
@@ -318,6 +319,63 @@ fn a_roll_or_master_rows_click_answers_inside_it() {
     assert!(sent(&l).is_empty());
 }
 
+/// `SMSG_LOOT_ALL_PASSED` and `SMSG_LOOT_ROLL_WON` both run `ClearLootRollState` (`0x61b5dd`,
+/// `0x61b97c` → `0x5ebcf0`), which zeroes the type of the open source's row: the next click on it
+/// takes, where the pending row refused. Another source's packet, or another slot's, frees nothing.
+#[test]
+fn a_resolved_roll_frees_the_open_row() {
+    let packet = |won: bool, guid: u64, slot: u32| {
+        if won {
+            SessionEvent::LootRollWon(benilla_protocol::messages::LootRollWon {
+                looted_target: guid,
+                item_slot: slot,
+                item_id: LINEN,
+                random_property_id: 0,
+                suffix_factor: 0,
+                winner: THRALL,
+                roll_number: 50,
+                roll_type: 2,
+            })
+        } else {
+            SessionEvent::LootAllPassed(benilla_protocol::messages::LootAllPassed {
+                looted_target: guid,
+                item_slot: slot,
+                item_id: LINEN,
+                random_property_id: 0,
+                suffix_factor: 0,
+            })
+        }
+    };
+    for won in [false, true] {
+        let mut l = client();
+        let (mut first, mut second) = (row(0, LINEN), row(1, WOOL));
+        first.slot_type = slot_type::ROLL_ONGOING;
+        second.slot_type = slot_type::ROLL_ONGOING;
+        open(&mut l, CORPSE, 1, 0, vec![first, second]);
+        let _ = (seen(&mut l), sent(&l));
+        packets(&mut l, vec![packet(won, GONE, 0), packet(won, CORPSE, 7)]);
+        click(&mut l, 1);
+        assert_eq!(
+            seen(&mut l),
+            "UI_ERROR_MESSAGE:ERR_LOOT_ROLL_PENDING",
+            "won: {won}"
+        );
+        packets(&mut l, vec![packet(won, CORPSE, 0)]);
+        let _ = seen(&mut l);
+        click(&mut l, 1);
+        assert!(
+            matches!(sent(&l)[..], [ClientCommand::AutostoreLootItem { slot: 0 }]),
+            "won: {won}"
+        );
+        click(&mut l, 2);
+        assert_eq!(
+            seen(&mut l),
+            "UI_ERROR_MESSAGE:ERR_LOOT_ROLL_PENDING",
+            "the other row"
+        );
+    }
+}
+
 /// `CloseLoot` closes inside its call (`0x4c2ec0` → `0x48f200` → `0x4c1cb0`): the release is out,
 /// `LOOT_CLOSED` has run and the window reads closed on the next line.
 #[test]
@@ -406,6 +464,36 @@ fn the_last_rows_removal_closes_before_its_push() {
     );
     feed(&mut l);
     assert_eq!(seen(&mut l), "LOOT_SLOT_CLEARED:1,LOOT_CLOSED,ITEM_PUSH");
+}
+
+/// A `LOOT_SLOT_CLEARED` listener that closes the window on the last row's removal closes it once:
+/// the reference runs the listener's close first (`0x4c1f77`), and the removal's own then finds
+/// no window (`0x4c1f7f` → `0x4c1f8d` → `0x48f23f`). The removal's release went at its packet, so
+/// the listener's close takes that close's signals in place: one release, the lockbox's two
+/// unlocks and one `LOOT_CLOSED`, all inside the listener's call.
+#[test]
+fn a_listeners_close_on_the_last_rows_removal_closes_once() {
+    let mut l = client();
+    open(&mut l, LOCKBOX, 1, 0, vec![row(0, LINEN)]);
+    run(
+        &mut l,
+        r#"local f = CreateFrame("Frame")
+        f:RegisterEvent("LOOT_SLOT_CLEARED")
+        f:SetScript("OnEvent", function() CloseLoot() end)"#,
+    );
+    let _ = (seen(&mut l), sent(&l));
+    packets(&mut l, vec![SessionEvent::LootRemoved { slot: 0 }]);
+    feed(&mut l);
+    assert_eq!(
+        seen(&mut l),
+        "LOOT_SLOT_CLEARED:1,ITEM_LOCK_CHANGED,ITEM_LOCK_CHANGED,LOOT_CLOSED"
+    );
+    assert!(matches!(
+        sent(&l)[..],
+        [ClientCommand::LootRelease { guid: LOCKBOX }]
+    ));
+    assert_eq!(l.app.world().resource::<LootState>().source(), None);
+    assert_eq!(l.app.world().resource::<LootLatch>().0, None);
 }
 
 /// With the byte the interaction stored set (`0x5df468`), the copier sweeps first (`0x4c1ec7`,
@@ -619,8 +707,12 @@ fn a_lockboxs_last_row_signals_its_unlocks_between_the_clear_and_the_close() {
         "LOOT_SLOT_CLEARED:1,ITEM_LOCK_CHANGED,ITEM_LOCK_CHANGED,LOOT_CLOSED"
     );
     assert!(
-        !l.app.world().resource::<LootState>().owes_unlocks(),
-        "signalled in their place, none left for the inventory pass"
+        l.app
+            .world()
+            .resource::<LootState>()
+            .queued_unlocks()
+            .is_empty(),
+        "signalled in their place, none left on the lane"
     );
 }
 
@@ -885,6 +977,29 @@ fn a_replaced_sessions_close_keeps_the_next_copiers_end() {
     assert_eq!(seen(&mut l), "LOOT_OPENED");
 }
 
+/// A row another member takes before its item record answers stops the window waiting: the
+/// window opens on the rows left, where 1.12.1's count stays above 0 and the corpse never opens
+/// (`ClearLootRow 0x4c1f00` lowers nothing), a deviation `records_pending` records.
+#[test]
+fn a_row_cleared_while_its_record_is_pending_does_not_hold_the_window_shut() {
+    const UNCACHED: u32 = 40_000;
+    let mut l = client();
+    open(&mut l, CORPSE, 1, 0, vec![row(0, LINEN), row(1, UNCACHED)]);
+    assert_eq!(seen(&mut l), "", "the copier waits on the record");
+    packets(&mut l, vec![SessionEvent::LootRemoved { slot: 1 }]);
+    feed(&mut l);
+    assert_eq!(seen(&mut l), "LOOT_SLOT_CLEARED:2");
+    let world = l.app.world_mut();
+    world
+        .resource_mut::<Items>()
+        .insert_template(UNCACHED, Some(crate::items::test_template("Silk Cloth")));
+    world.resource_scope(|world, mut loot: Mut<LootState>| {
+        loot.row_answered(world.resource::<Items>())
+    });
+    feed(&mut l);
+    assert_eq!(seen(&mut l), "LOOT_OPENED");
+}
+
 /// An inventory failure ends by signalling `LOOT_OPENED` again while a window is open
 /// (`0xb71b48`) and the auto-loot byte is set (`0x5e3aff`-`0x5e3b20`): a window whose copier
 /// waits on a row's record keeps the byte its interaction stored (`0x4c1ea6`, before the sweep's
@@ -944,4 +1059,270 @@ fn an_inventory_failure_reads_the_window_at_its_own_packet() {
     crate::lanes::fire_in_order(l.app.world_mut());
     assert_eq!(seen(&mut l), "UI_ERROR_MESSAGE:ERR_INV_FULL");
     assert!(l.app.world().resource::<AutoLootByte>().0, "no sweep ran");
+}
+
+/// Our own push of `entry` into the backpack, shown in chat.
+fn pushed(entry: u32) -> ItemPushResult {
+    ItemPushResult {
+        player_guid: ME,
+        from_npc: false,
+        created: false,
+        show_in_chat: true,
+        bag_slot: benilla_protocol::messages::BAG_PLAYER_INVENTORY,
+        item_slot: 23,
+        item_entry: entry,
+        suffix_factor: 0,
+        random_property_id: 0,
+        count: 1,
+    }
+}
+
+/// `SetLootPortrait` answers 1 only while the loot source is a unit object we hold
+/// (`0x4c2bd1`-`0x4c2be9`): a creature's corpse, never an item or a closed window.
+#[test]
+fn the_loot_portrait_follows_a_unit_source_only() {
+    let mut l = client();
+    // `OBJECT_FIELD_TYPE` (2): `TYPEMASK_OBJECT | TYPEMASK_UNIT`, which the portrait asks for.
+    let world = l.app.world_mut();
+    let corpse = world.resource::<GuidIndex>().0[&CORPSE];
+    world
+        .entity_mut(corpse)
+        .insert(ObjectStore(ObjectFields::from_pairs(&[
+            (2, 0x9),
+            (22, 0),
+            (28, 100),
+        ])));
+    run(
+        &mut l,
+        r#"CreateFrame("Frame", "LootHost"):CreateTexture("LootTex")"#,
+    );
+    let portrait = |l: &mut Loot| eval::<bool>(l, "return SetLootPortrait(LootTex) == 1");
+    assert!(!portrait(&mut l), "no window");
+    open(&mut l, CORPSE, 1, 5, Vec::new());
+    assert!(portrait(&mut l), "a corpse");
+    run(&mut l, "CloseLoot()");
+    open(&mut l, LOCKBOX, 1, 5, Vec::new());
+    assert!(!portrait(&mut l), "an item");
+}
+
+/// The response's tail closes a window that opened on the run after the copier's open and
+/// sweep (`0x5ebc3a`-`0x5ebc51`), so `LOOT_OPENED`'s handlers read the open window, its coin
+/// row included, and `LOOT_CLOSED`'s the closed one.
+#[test]
+fn a_window_opened_on_the_run_is_open_to_its_loot_opened_handlers() {
+    let mut l = client();
+    run(
+        &mut l,
+        r#"COUNTS = {}
+        local f = CreateFrame("Frame")
+        f:RegisterEvent("LOOT_OPENED")
+        f:RegisterEvent("LOOT_CLOSED")
+        f:SetScript("OnEvent", function()
+            table.insert(COUNTS, event .. ":" .. GetNumLootItems())
+        end)"#,
+    );
+    l.app.world_mut().resource_mut::<LootLatch>().0 = Some(CORPSE);
+    packets(
+        &mut l,
+        vec![SessionEvent::LootResponse {
+            guid: CORPSE,
+            loot_type: 1,
+            gold: 5,
+            items: Vec::new(),
+        }],
+    );
+    l.app.world_mut().resource_mut::<super::LootMoveStart>().0 = true;
+    feed(&mut l);
+    assert_eq!(
+        eval::<String>(&mut l, "return table.concat(COUNTS, ',')"),
+        "LOOT_OPENED:1,LOOT_CLOSED:0"
+    );
+}
+
+/// The sweep's loot leg on a lockbox: `CloseInteraction`'s unlock (`0x48f2bd`) and the
+/// teardown's (`0x4c1d36`) come before the teardown zeroes the source (`0x4c1cb0`) and signals
+/// `LOOT_CLOSED` (`0x4c1dac`), so each unlock's `ITEM_LOCK_CHANGED` handlers read the window
+/// still open, and `LOOT_CLOSED`'s the closed one.
+#[test]
+fn a_closing_lockboxs_unlock_handlers_read_the_window_open() {
+    let mut l = client();
+    run(
+        &mut l,
+        r#"COUNTS = {}
+        local f = CreateFrame("Frame")
+        f:RegisterEvent("LOOT_OPENED")
+        f:RegisterEvent("ITEM_LOCK_CHANGED")
+        f:RegisterEvent("LOOT_CLOSED")
+        f:SetScript("OnEvent", function()
+            table.insert(COUNTS, event .. ":" .. GetNumLootItems())
+        end)"#,
+    );
+    open(&mut l, LOCKBOX, 1, 0, vec![row(0, LINEN)]);
+    crate::ui_script::sweep_test::sweep_in_place(&mut l.app);
+    assert_eq!(
+        eval::<String>(&mut l, "return table.concat(COUNTS, ',')"),
+        "LOOT_OPENED:1,ITEM_LOCK_CHANGED:1,ITEM_LOCK_CHANGED:1,LOOT_CLOSED:0"
+    );
+}
+
+/// A `CloseLoot` signals its two unlocks with the window still open and its `LOOT_CLOSED` with it
+/// closed (`0x48f2bd`, `0x4c1d36`, `0x4c1da0`, `0x4c1dac`), inside the call.
+#[test]
+fn close_loots_unlock_handlers_read_the_window_open() {
+    let mut l = client();
+    run(
+        &mut l,
+        r#"COUNTS = {}
+        local f = CreateFrame("Frame")
+        f:RegisterEvent("ITEM_LOCK_CHANGED")
+        f:RegisterEvent("LOOT_CLOSED")
+        f:SetScript("OnEvent", function()
+            table.insert(COUNTS, event .. ":" .. GetNumLootItems())
+        end)"#,
+    );
+    open(&mut l, LOCKBOX, 1, 0, vec![row(0, LINEN)]);
+    run(
+        &mut l,
+        "CloseLoot() table.insert(COUNTS, 'after:' .. GetNumLootItems())",
+    );
+    assert_eq!(
+        eval::<String>(&mut l, "return table.concat(COUNTS, ',')"),
+        "ITEM_LOCK_CHANGED:1,ITEM_LOCK_CHANGED:1,LOOT_CLOSED:0,after:0"
+    );
+}
+
+/// `OnItemPush` signals `ITEM_PUSH` in the push's handler (`0x491be8`), which touches no loot
+/// window, so its handlers read the window as the packets before it left it: none, here, for a
+/// push ahead of the response.
+#[test]
+fn an_item_pushs_handlers_read_the_loot_before_the_response() {
+    let mut l = client();
+    run(
+        &mut l,
+        r#"COUNTS = ""
+        local f = CreateFrame("Frame")
+        f:RegisterEvent("ITEM_PUSH")
+        f:SetScript("OnEvent", function() COUNTS = COUNTS .. GetNumLootItems() end)"#,
+    );
+    l.app.world_mut().resource_mut::<LootLatch>().0 = Some(CORPSE);
+    packets(
+        &mut l,
+        vec![
+            SessionEvent::ItemPushResult(pushed(LINEN)),
+            SessionEvent::LootResponse {
+                guid: CORPSE,
+                loot_type: 1,
+                gold: 0,
+                items: vec![row(0, LINEN)],
+            },
+        ],
+    );
+    feed(&mut l);
+    assert_eq!(eval::<String>(&mut l, "return COUNTS"), "0");
+    assert_eq!(eval::<i64>(&mut l, "return GetNumLootItems()"), 1);
+}
+
+/// A VM noting `LOOT_OPENED`, each `LOOT_SLOT_CLEARED` row and, at each `ITEM_PUSH`, which of rows
+/// 1 and 2 still hold an item.
+fn push_order(l: &mut Loot) {
+    run(
+        l,
+        r#"ORDER = {}
+        local f = CreateFrame("Frame")
+        f:RegisterEvent("LOOT_OPENED")
+        f:RegisterEvent("LOOT_SLOT_CLEARED")
+        f:RegisterEvent("ITEM_PUSH")
+        f:SetScript("OnEvent", function()
+            if event == "LOOT_OPENED" then
+                tinsert(ORDER, "OPENED")
+            elseif event == "LOOT_SLOT_CLEARED" then
+                tinsert(ORDER, "CLEARED" .. arg1)
+            else
+                local rows = ""
+                for i = 1, 2 do rows = rows .. ((GetLootSlotInfo(i)) and 1 or 0) end
+                tinsert(ORDER, "PUSH" .. rows)
+            end
+        end)"#,
+    );
+}
+
+fn order(l: &mut Loot) -> String {
+    eval(l, "local s = table.concat(ORDER, ',') ORDER = {} return s")
+}
+
+/// Each packet's events fire inside its dispatch: `SMSG_LOOT_REMOVED` clears its row
+/// (`0x5ebeb0` → `0x4c1f00`) ahead of the `SMSG_ITEM_PUSH_RESULT` vmangos sends after it
+/// (`LootHandler.cpp:217`, `:230`), so each `ITEM_PUSH` reads the rows removed before it gone
+/// and the rows removed after it still there.
+#[test]
+fn each_item_push_reads_the_rows_removed_before_it() {
+    let mut l = client();
+    push_order(&mut l);
+    open(&mut l, CORPSE, 1, 0, vec![row(0, LINEN), row(1, WOOL)]);
+    assert_eq!(order(&mut l), "OPENED");
+    packets(
+        &mut l,
+        vec![
+            SessionEvent::LootRemoved { slot: 0 },
+            SessionEvent::ItemPushResult(pushed(LINEN)),
+            SessionEvent::LootRemoved { slot: 1 },
+            SessionEvent::ItemPushResult(pushed(WOOL)),
+        ],
+    );
+    feed(&mut l);
+    assert_eq!(order(&mut l), "CLEARED1,PUSH01,CLEARED2,PUSH00");
+}
+
+/// A push after the response in the same frame fires after the response's `LOOT_OPENED`
+/// (`0x4c2ac0`), so its handlers read the window open.
+#[test]
+fn an_item_push_after_the_response_reads_the_window_open() {
+    let mut l = client();
+    push_order(&mut l);
+    l.app.world_mut().resource_mut::<LootLatch>().0 = Some(CORPSE);
+    packets(
+        &mut l,
+        vec![
+            SessionEvent::LootResponse {
+                guid: CORPSE,
+                loot_type: 1,
+                gold: 0,
+                items: vec![row(0, LINEN)],
+            },
+            SessionEvent::ItemPushResult(pushed(WOOL)),
+        ],
+    );
+    feed(&mut l);
+    assert_eq!(order(&mut l), "OPENED,PUSH10");
+}
+
+/// A push whose record the cache lacks waits on its answer (`0x491a93` → `0x491ee0`), and a
+/// refused answer frees it unrun (`0x491ee8`, `0x491efb` → `SMemFree 0x646430`): no line and no
+/// `ITEM_PUSH`, then or at a later answer for the entry.
+#[test]
+fn a_push_whose_record_is_refused_is_dropped() {
+    const UNCACHED: u32 = 40_000;
+    let mut l = client();
+    let _ = seen(&mut l);
+    packets(&mut l, vec![SessionEvent::ItemPushResult(pushed(UNCACHED))]);
+    feed(&mut l);
+    assert_eq!(l.app.world().resource::<LootState>().waiting.len(), 1);
+    packets(
+        &mut l,
+        vec![SessionEvent::ItemTemplate {
+            entry: UNCACHED,
+            info: None,
+        }],
+    );
+    feed(&mut l);
+    assert!(l.app.world().resource::<LootState>().waiting.is_empty());
+    packets(
+        &mut l,
+        vec![SessionEvent::ItemTemplate {
+            entry: UNCACHED,
+            info: Some(Box::new(crate::items::test_template("Silk Cloth"))),
+        }],
+    );
+    feed(&mut l);
+    assert_eq!(seen(&mut l), "");
 }

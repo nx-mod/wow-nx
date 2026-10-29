@@ -5,7 +5,7 @@
 //! health on the `<name>StatusBar` child. The world mouseover drives it through
 //! [`super::UiScript::world_tooltip_unit`]; unit-frame hovers call `SetUnit` from Lua.
 
-use mlua::{Lua, Table};
+use mlua::{Lua, Table, Value};
 
 use super::object::frame_handle_of;
 use super::tooltip::{append_line, clear, set_owner_core, show_or_hide_empty};
@@ -90,18 +90,27 @@ struct Viewer {
 
 /// The active player toward `u`, through the host's relation functions as `UnitCanAttack` and
 /// `UnitCanAssist` ask them.
-fn viewer(model: &Model, u: &UnitState) -> Option<Viewer> {
+fn viewer(lua: &Lua, model: &Model, u: &UnitState) -> Option<Viewer> {
     let me = model.unit_guids.player;
     if me == 0 {
         return None;
     }
-    let player = model.snapshot_unit("player");
-    let rel = model.unit_relations.as_deref();
+    // The active player's drunkenness off its object as the call runs.
+    let drunk = super::unit::view_held(lua, model, "player").map_or(0, |p| {
+        let mut drunk = None;
+        super::host::read_host(lua, |h| {
+            h.read_unit_object(p.guid, &mut |o| drunk = Some(o.drunk()))
+        });
+        drunk.unwrap_or(p.drunk)
+    });
     let ask = |f: &dyn Fn(&dyn super::UnitRelations) -> Option<bool>| {
-        u.has_object && rel.and_then(f).unwrap_or(false)
+        u.has_object
+            && super::unit::with_relations(lua, model, f)
+                .flatten()
+                .unwrap_or(false)
     };
     Some(Viewer {
-        drunk: player.map_or(0, |p| p.drunk),
+        drunk,
         can_attack: ask(&|r| r.can_attack(me, u.guid)),
         can_assist: ask(&|r| r.can_assist(me, u.guid)),
     })
@@ -225,30 +234,18 @@ fn level_line(
 fn render_unit(lua: &Lua, this: &Table, token: &str) -> mlua::Result<bool> {
     let h = frame_handle_of(lua, this)?;
     // A unit is its object, found by guid (`0x52a021`); guid 0 finds none.
-    let (unit, viewer, player_level, skinning, me) = {
+    let (unit, viewer, req, me) = {
         let model = lua.app_data_mut::<Model>().expect("model app_data");
+        // The unit's state carries the group record by guid, which the build reads for every unit
+        // shown (`0x52a02b`).
         let unit = crate::script::unit::view(lua, &model, token)
             .map(std::borrow::Cow::into_owned)
             .filter(|u| u.exists && u.guid != 0);
-        // The group record by guid, for every unit shown (`0x52a02b`): its member row's.
-        let unit = unit.map(|mut u| {
-            u.tooltip.party = model
-                .unit_guids
-                .roster_token(u.guid)
-                .and_then(|t| model.pushed_unit(&t))
-                .and_then(|row| row.tooltip.party.clone());
-            u
-        });
-        let viewer = unit.as_ref().and_then(|u| viewer(&model, u));
-        let req = &model.player_req;
-        (
-            unit,
-            viewer,
-            req.level,
-            req.skinning,
-            model.unit_guids.player,
-        )
+        let viewer = unit.as_ref().and_then(|u| viewer(lua, &model, u));
+        let req = crate::script::requirements::player_req(lua, &model);
+        (unit, viewer, req, model.unit_guids.player)
     };
+    let player_level = crate::script::ReqRead::head(&req).level;
     clear(lua, h);
     let Some(u) = unit else {
         super::visibility::set_shown(lua, h, false);
@@ -327,7 +324,8 @@ fn render_unit(lua: &Lua, this: &Table, token: &str) -> mlua::Result<bool> {
         // `UNIT_SKINNABLE` (`0x529ed0`): unit flags bit 26 off a creature (`0x52a914`,
         // `0x52a924`), red but for a player with the skinning spell (`0x529eed`-`0x529f86`).
         if u.skinnable && !u.is_player {
-            let color = skinning.map_or(RED, |value| {
+            // The latched spell's points, read only for a skinnable unit (`0x529f06`).
+            let color = crate::script::ReqRead::skinning(&req).map_or(RED, |value| {
                 super::tooltip_item::names::skill_color(skinning_required(u.level), value)
             });
             keyed_line(lua, this, "UNIT_SKINNABLE", color)?;
@@ -401,14 +399,18 @@ fn set_subject(lua: &Lua, h: FrameHandle, guid: Option<u64>) {
 /// [`super::statusbar::set_health`], firing each `OnValueChanged` it makes; FrameXML's
 /// `HealthBar_OnValueChanged` colours the fill. Neither shows it. Returns the bar.
 fn seed_bar(lua: &Lua, h: FrameHandle, u: &UnitState) -> Option<FrameHandle> {
+    seed_bar_at(lua, h, u.health, u.max_health)
+}
+
+/// [`seed_bar`] off the unit's health and maximum alone.
+fn seed_bar_at(lua: &Lua, h: FrameHandle, health: u32, max_health: u32) -> Option<FrameHandle> {
     let (bar, fires) = {
         let mut model = lua.app_data_mut::<Model>().expect("model app_data");
         let bar = super::tooltip::status_bar(&model, h)?;
         if let Some(KindState::Tooltip(t)) = model.arena.frame_mut(h).map(|f| &mut f.kind_state) {
-            t.unit_health = u.health;
+            t.unit_health = health;
         }
-        let fires =
-            super::statusbar::set_health(&mut model, bar, u.max_health as f32, u.health as f32);
+        let fires = super::statusbar::set_health(&mut model, bar, max_health as f32, health as f32);
         (bar, fires)
     };
     for value in fires.into_iter().flatten() {
@@ -417,19 +419,13 @@ fn seed_bar(lua: &Lua, h: FrameHandle, u: &UnitState) -> Option<FrameHandle> {
     Some(bar)
 }
 
-/// A `set_unit` push of the unit a tooltip shows updates its health bar without rebuilding the
-/// lines, as the reference's HEALTH field watcher does: it is keyed on the unit's guid (`0x52a0a8`
-/// registers `0x529560` on `+0x368`/`+0x36c`), so a token that stops naming the unit, as
-/// `"mouseover"` does when the hover ends, leaves a fading plate's bar standing. It runs only
-/// when the health differs from the bytes it last saw (`0x4655bb`), not for a maximum alone.
-pub(super) fn on_unit_push(lua: &Lua, token: &str) {
-    let (unit, hits): (UnitState, Vec<FrameHandle>) = {
-        let model = lua.app_data_mut::<Model>().expect("model app_data");
-        let Some(unit) = model.pushed_unit(token).filter(|u| u.exists && u.guid != 0) else {
-            return;
-        };
+/// The tooltips showing `guid`, whose health is now `health` of `max_health`: each whose bar last
+/// saw another health is seeded again (`0x529560`, its compare at `0x4655bb`).
+fn on_unit_health(lua: &Lua, guid: u64, health: u32, max_health: u32) {
+    let hits: Vec<FrameHandle> = {
+        let model = lua.app_data_ref::<Model>().expect("model app_data");
         // Registered frames only, as `update_bar` writes layout.
-        let hits: Vec<FrameHandle> = model
+        model
             .arena
             .tooltip_kinds()
             .iter()
@@ -439,21 +435,27 @@ pub(super) fn on_unit_push(lua: &Lua, token: &str) {
                     && matches!(
                         model.arena.frame(h).map(|f| &f.kind_state),
                         Some(KindState::Tooltip(t))
-                            if t.unit_guid == Some(unit.guid) && t.unit_health != unit.health
+                            if t.unit_guid == Some(guid) && t.unit_health != health
                     )
             })
-            .collect();
-        if hits.is_empty() {
-            return;
-        }
-        (unit.clone(), hits)
+            .collect()
     };
     for h in hits {
-        seed_bar(lua, h, &unit);
+        seed_bar_at(lua, h, health, max_health);
     }
 }
 
 impl super::UiScript {
+    /// The unit tooltip's own watcher on the health of the unit it shows, which the render
+    /// registers on the object (`0x52a0a8`, `0x529560` on `+0x368`/`+0x36c`): the object `guid`'s
+    /// health moved to `health` of `max_health`, inside the notify pass of the packet that wrote
+    /// it. Each tooltip showing the unit whose bar last saw another health is seeded again.
+    pub fn tooltip_unit_health(&mut self, guid: u64, health: u32, max_health: u32) {
+        if guid != 0 {
+            on_unit_health(&self.lua, guid, health, max_health);
+        }
+    }
+
     /// Show the world-mouseover unit tooltip: fire `OnTooltipSetDefaultAnchor`, render `token`,
     /// fire `UPDATE_MOUSEOVER_UNIT`. Call on a hover-target change; the render's show returns a
     /// fading plate to full alpha. `false` when there is no tooltip frame or no such unit.
@@ -550,7 +552,7 @@ impl super::UiScript {
             let Some(root) = model.arena.lookup("UIParent") else {
                 return false;
             };
-            (h, model.frame_id(h), root)
+            (h, model.frame_id(h), model.frame_id(root))
         };
         if cursor {
             set_owner_core(&self.lua, h, Some(root), TooltipAnchor::Cursor, 0.0, 0.0);
@@ -590,7 +592,7 @@ impl super::UiScript {
             let Some(root) = model.arena.lookup("Minimap") else {
                 return false;
             };
-            (h, model.frame_id(h), root)
+            (h, model.frame_id(h), model.frame_id(root))
         };
         let wrapper = match super::object::frame_wrapper(&self.lua, id) {
             Ok(w) => w,
@@ -615,9 +617,12 @@ pub(super) fn install_methods(lua: &Lua, m: &Table) -> mlua::Result<()> {
     // GameTooltip:SetUnit(token) → 1 or nil, which `UnitFrame_OnEnter` reads to arm its re-poll.
     m.set(
         "SetUnit",
-        lua.create_function(|lua, (this, token): (Table, String)| {
-            // The token gate every `Unit*` verb uses: an unknown token raises. Not in
-            // `render_unit`, which the app calls with canonical tokens.
+        lua.create_function(|lua, (this, token): (Table, Value)| {
+            frame_handle_of(lua, &this)?;
+            // `is-number-or-string` else `Usage: SetUnit("unit")` (`0x534a42`, `0x84f284`).
+            let token = super::binding_abi::string_arg(lua, token, r#"Usage: SetUnit("unit")"#)?;
+            // The token gate every `Unit*` verb uses (`0x515970`): an unknown token raises. Not
+            // in `render_unit`, which the app calls with canonical tokens.
             crate::script::unit::check_unit_token(&Some(token.clone()))?;
             let ok = render_unit(lua, &this, &token)?;
             Ok(if ok {

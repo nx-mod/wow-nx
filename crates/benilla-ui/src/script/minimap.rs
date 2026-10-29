@@ -393,7 +393,9 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                 let text = model.minimap.active_zoom().to_string();
                 super::cvars::set_from_engine(&mut model, cvar, text);
             }
-            Ok(())
+            drop(model);
+            // `set_zoom`'s `CVar::Set` (`0x6da974`) runs the row's callback inside the call.
+            super::cvars::written(lua)
         })?,
     )?;
     m.set(
@@ -475,7 +477,8 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             }
             let (world, ground) = {
                 let model = lua.app_data_ref::<Model>().expect("model app_data");
-                let ground = model.spell_targeting && model.location_pick_armed;
+                let ground = super::action::spell_targeting(lua)
+                    && super::cursor::targeting_wants(lua, &model).location;
                 let d = 2.0 * f64::from(model.minimap.radius_yd());
                 // Each fraction times the diameter is stored as a float (`0x4eee2e`, `0x4eee3d`).
                 let (second, first) = (

@@ -7,10 +7,10 @@
 //! | `AssistByName 0x489c40` | 0x10, players only | 0 | 0 |
 //! | `FollowByName 0x489ec0` | 0x10, players only | 2, `CanAssist` and alive | Lua arg 2 |
 //!
-//! The ranking is [`benilla_ui::script::by_name::resolve`], the one resolver `SetLootMethod`'s master
-//! name and `TargetByName`'s view of the pick share; this module feeds it the held units, positioned
-//! by [`GlobalTransform`] as [`crate::ui_unit`]'s candidate feed does, and breaks a full tie by
-//! guid, so the chunk shows the unit the commit picks. The reference's walk follows the object
+//! The ranking is [`benilla_ui::script::by_name::resolve`], the one resolver the VM's name verbs
+//! (`SetLootMethod`'s master name, `StartDuel`, `PromoteByName`) share; this module feeds it the
+//! held units, each positioned at the call, and breaks a full tie by guid, as the VM's walk
+//! over the units the call host offers does ([`crate::ui_unit::live`]). The reference's walk follows the object
 //! list's order (a tail append, `0x4646c3`-`0x4646d4`), the deviation documented there.
 //!
 //! Every caller runs the roster passes (party `0x493b22`, raid `0x493ba7`), which offer a member
@@ -68,8 +68,8 @@ impl NameSearch {
     }
 
     /// Whether `guid_val` is a candidate of this search: the typemask, then a name already in the
-    /// cache. The one test both [`scan_units`] and the VM's candidate feed
-    /// (`ui_unit::held::feed_name_candidates`) apply, so the chunk's candidates are the commit's.
+    /// cache. The one test both [`scan_units`] and the VM's walk ([`crate::ui_unit::live`]) apply,
+    /// so the two offer the same units.
     pub(crate) fn candidacy<'a>(self, names: &'a NameCache, guid_val: u64) -> Candidacy<'a> {
         if !self.accepts(guid_val) {
             return Candidacy::Outside;
@@ -78,19 +78,6 @@ impl NameSearch {
             .resolve_unit(guid_val, None, Ask::Read)
             .map_or(Candidacy::Nameless, Candidacy::Named)
     }
-}
-
-/// `/target <name>`: resolve and select (`TargetByName`).
-#[derive(bevy::ecs::message::Message, Clone, Debug)]
-pub(crate) struct TargetByNameRequest {
-    pub(crate) name: String,
-}
-
-/// `/assist [name]`: select the basis unit's target (`AssistByName`, or bare
-/// `AssistUnit("target")`, whose basis is the current selection).
-#[derive(bevy::ecs::message::Message, Clone, Debug)]
-pub(crate) struct AssistRequest {
-    pub(crate) name: Option<String>,
 }
 
 /// The follow start gate's refusals with lines (`0x60fed0`'s mode-3 chain, after its silent arms)
@@ -144,17 +131,10 @@ enum FollowRefusal {
 pub(crate) struct ByNameScan<'w, 's> {
     /// Every known unit, our own avatar included: the reference has no self-exclusion here.
     units: UnitQuery<'w, 's>,
-    self_q: Query<
-        'w,
-        's,
-        (
-            Entity,
-            &'static Guid,
-            &'static GlobalTransform,
-            Option<&'static ObjectStore>,
-        ),
-        With<SelfPlayer>,
-    >,
+    self_q: Query<'w, 's, Entity, With<SelfPlayer>>,
+    /// The positions as of the call, each composed through its parents on demand, so a unit
+    /// created or moved this frame reads where it stands (`0x468380` measures it then).
+    transforms: bevy::transform::helper::TransformHelper<'w, 's>,
     /// Read-only: a sweep fires no name query, so an uncached name does not match, as in the
     /// reference.
     names: Res<'w, NameCache>,
@@ -171,10 +151,8 @@ impl ByNameScan<'_, '_> {
     /// The distance origin, the active player's position; without one the reference resolves
     /// nothing (`0x493ae0`).
     fn origin(&self) -> Option<Vec3> {
-        self.self_q
-            .single()
-            .ok()
-            .map(|(_, _, tf, _)| tf.translation())
+        let me = self.self_q.single().ok()?;
+        position(&self.transforms, me)
     }
 
     /// [`assistable_alive`] for a unit the scan walks.
@@ -241,7 +219,7 @@ impl ByNameScan<'_, '_> {
         scan_units(
             self.units
                 .iter()
-                .map(|(e, g, tf, store)| (e, g.0, tf.translation(), store)),
+                .filter_map(|(e, g, store)| Some((e, g.0, position(&self.transforms, e)?, store))),
             self.origin(),
             &self.names,
             query,
@@ -268,19 +246,19 @@ pub(crate) fn assistable_alive(
     })
 }
 
-/// One unit query's candidates, positioned by [`GlobalTransform`] as the VM's candidate feed
-/// (`ui_unit::held::feed_name_candidates`) does: nothing writes it during `Update`, so both walks
-/// read one value in a frame, and it adds no undeclared order against the systems that move units.
-type UnitQuery<'w, 's> = Query<
-    'w,
-    's,
-    (
-        Entity,
-        &'static Guid,
-        &'static GlobalTransform,
-        Option<&'static ObjectStore>,
-    ),
->;
+/// One unit query's candidates, the entities the scene places, each positioned at the call
+/// ([`position`]).
+type UnitQuery<'w, 's> =
+    Query<'w, 's, (Entity, &'static Guid, Option<&'static ObjectStore>), With<GlobalTransform>>;
+
+/// `entity`'s position in the world as of the call, composed from its `Transform` through its
+/// parents, so a propagation still to run this frame does not leave it where it stood.
+fn position(transforms: &bevy::transform::helper::TransformHelper, entity: Entity) -> Option<Vec3> {
+    transforms
+        .compute_global_transform(entity)
+        .ok()
+        .map(|g| g.translation())
+}
 
 /// The roster passes' input (`0x493b22`, `0x493ba7`): the party slots and the raid members, by the
 /// name the wire gave and whether the object manager holds them. A pick from it has a guid and no
@@ -392,10 +370,10 @@ fn scan_units<'a>(
 /// take [`ByNameScan`]: `DoEmote`'s target (`0x49fdb1`).
 #[derive(SystemParam)]
 pub(crate) struct PlayerLookup<'w, 's> {
-    /// World positions, [`GlobalTransform`]: the chat drain already reads it, where `Transform`
-    /// would put it in an undeclared order against every system that moves a unit.
-    units: Query<'w, 's, (Entity, &'static Guid, &'static GlobalTransform)>,
-    self_q: Query<'w, 's, &'static GlobalTransform, With<SelfPlayer>>,
+    units: Query<'w, 's, (Entity, &'static Guid), With<GlobalTransform>>,
+    self_q: Query<'w, 's, Entity, With<SelfPlayer>>,
+    /// The positions as of the call ([`position`]).
+    transforms: bevy::transform::helper::TransformHelper<'w, 's>,
 }
 
 impl PlayerLookup<'_, '_> {
@@ -411,12 +389,16 @@ impl PlayerLookup<'_, '_> {
         index: &GuidIndex,
         name: &str,
     ) -> Option<u64> {
-        let origin = self.self_q.single().ok().map(|tf| tf.translation());
+        let origin = self
+            .self_q
+            .single()
+            .ok()
+            .and_then(|me| position(&self.transforms, me));
         let roster = Roster::of(group, index);
         scan_units(
             self.units
                 .iter()
-                .map(|(e, g, tf)| (e, g.0, tf.translation(), None)),
+                .filter_map(|(e, g)| Some((e, g.0, position(&self.transforms, e)?, None))),
             origin,
             names,
             name,
@@ -430,7 +412,7 @@ impl PlayerLookup<'_, '_> {
     }
 }
 
-/// `/target <name>` and the Lua `TargetByName(name, exactMatch)` through [`scan::commit_owing`], the
+/// `TargetByName(name, exactMatch)`, the stock `/target`'s, through [`scan::commit_owing`], the
 /// stop, select, re-swing path a click takes. `exact` is the Lua second argument, which `0x489d8e`
 /// reads with default 0 as the resolver's exact-only flag (consumed at `0x493cab`). The pick goes
 /// to `SetSelection` as it is (`0x489daa`), so a party member out of range is selected by guid. A
@@ -472,7 +454,7 @@ fn missing_line(name: &str) -> &'static str {
     }
 }
 
-/// `AssistByName(name)` (`0x489c40`) and `/assist [name]`: the basis is the player a nonempty name
+/// `AssistByName(name)` (`0x489c40`), the stock `/assist`'s: the basis is the player a nonempty name
 /// resolves to (typemask 0x10, mode 0, `0x489c82`), else the selection (`0x489c89`), looked up as a
 /// unit (`0x489c9b`, typemask 8); [`SelectCommit::assist`] then selects its target. A basis the
 /// object manager does not hold, a party member out of range included, shows
@@ -504,36 +486,6 @@ pub(super) fn assist_named(
     commit.assist(basis, how);
 }
 
-/// Drain the chat layer's `/target <name>` asks.
-pub(super) fn target_by_name_requests(
-    mut requests: MessageReader<TargetByNameRequest>,
-    scan_params: ByNameScan,
-    mut commit: SelectCommit,
-    errors: Res<crate::ui_action::UiErrorKeys>,
-) {
-    for request in requests.read() {
-        target_named(&scan_params, &mut commit, &errors, &request.name, false);
-    }
-}
-
-/// Drain the chat layer's `/assist [name]` asks.
-pub(super) fn assist_requests(
-    mut requests: MessageReader<AssistRequest>,
-    scan_params: ByNameScan,
-    mut commit: SelectCommit,
-    errors: Res<crate::ui_action::UiErrorKeys>,
-) {
-    for request in requests.read() {
-        assist_named(
-            &scan_params,
-            &mut commit,
-            &errors,
-            request.name.as_deref().unwrap_or_default(),
-            "/assist",
-        );
-    }
-}
-
 /// What a follow request comes to at the start gate (`0x60fed0`).
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum FollowStart {
@@ -541,12 +493,14 @@ pub(crate) enum FollowStart {
     Refused(&'static str),
     /// The gate's silent return (`0x60ff8a`): the mover itself.
     Silent,
-    /// Armed (`0x611130`): the followee's name, `AUTOFOLLOW_BEGIN`'s argument (`0x610061`).
-    Started { name: String },
+    /// Armed (`0x611130`): the followee's name, `AUTOFOLLOW_BEGIN`'s argument (`0x610061`), and
+    /// whether the arm's stop (`0x61113e` → `0x60fb60`) ended a follow, which owes
+    /// `AUTOFOLLOW_END` (`0x60fb84`) first.
+    Started { name: String, replaced: bool },
 }
 
-/// The follow's start, from the chat layer's `/follow` and from `FollowUnit` and `FollowByName`
-/// inside their calls ([`crate::script_calls::ScriptCallHost`]); follow sends nothing on the wire.
+/// The follow's start, from `FollowUnit` and `FollowByName`, the stock `/follow`'s, inside their
+/// calls ([`crate::script_calls::ScriptCallHost`]); follow sends nothing on the wire.
 #[derive(SystemParam)]
 pub(crate) struct FollowSteps<'w, 's> {
     scan_params: ByNameScan<'w, 's>,
@@ -559,11 +513,6 @@ pub(crate) struct FollowSteps<'w, 's> {
 }
 
 impl FollowSteps<'_, '_> {
-    /// Whom the follow follows, 0 for none.
-    pub(crate) fn followee(&self) -> u64 {
-        self.follow.as_deref().and_then(|f| f.guid).unwrap_or(0)
-    }
-
     /// `request` through the start gate, and the follow armed when it passes.
     pub(crate) fn start(&mut self, request: &crate::player::FollowRequest) -> FollowStart {
         use crate::player::FollowRequest;
@@ -628,25 +577,13 @@ impl FollowSteps<'_, '_> {
                 if let Some(approach) = self.approach.as_deref_mut() {
                     approach.stop();
                 }
-                if let Some(follow) = self.follow.as_deref_mut() {
+                let replaced = self.follow.as_deref_mut().is_some_and(|follow| {
+                    let replaced = follow.stop();
                     follow.start(guid, name.clone());
-                }
-                FollowStart::Started { name }
+                    replaced
+                });
+                FollowStart::Started { name, replaced }
             }
-        }
-    }
-}
-
-/// Drain the chat layer's `/follow [name]` into [`crate::player`]: a refusal's line through the
-/// action feed, the signals from [`crate::ui_follow`]'s transitions.
-pub(super) fn follow_requests(
-    mut requests: MessageReader<crate::player::FollowRequest>,
-    mut steps: FollowSteps,
-    errors: Res<crate::ui_action::UiErrorKeys>,
-) {
-    for request in requests.read() {
-        if let FollowStart::Refused(key) = steps.start(request) {
-            errors.push(crate::ui_action::UiError::key(key));
         }
     }
 }
@@ -822,7 +759,7 @@ impl SelectCommit<'_, '_> {
         SelectDebt::default()
     }
 
-    /// Pay all of `debt` now, for a writer whose signals have no listeners to run first.
+    /// Pay all of `debt` now, for a test's writer whose signals have no listeners to run first.
     #[cfg(test)]
     pub(crate) fn pay_now(&mut self, mut debt: SelectDebt) {
         while debt != SelectDebt::default() {
@@ -914,6 +851,31 @@ impl SelectCommit<'_, '_> {
     pub(super) fn clear(&mut self) {
         if let Some(send) = super::click::deselect_owing(&mut self.selection, &mut self.seam) {
             self.owe_send(send);
+        }
+    }
+
+    /// `0x493910(guid, 1)`: nothing unless `guid` is still the selection (`0x493949`); else the
+    /// teardown, the last-target pair left as it is.
+    pub(super) fn tear_down(&mut self, guid: u64) {
+        if self.selection.guid != Some(guid) {
+            return;
+        }
+        if let Some(send) = super::click::clear_owing(&mut self.selection, &mut self.seam) {
+            self.owe_send(send);
+        }
+    }
+
+    /// [`Self::select_unit`] inside a packet's handler, which goes on after it: the store, the
+    /// send and the re-swing in place, and its signals owed at this place to the packet's end
+    /// ([`super::OwedSelect::Signals`]), whose listeners then run behind it.
+    pub(crate) fn select_unit_in_packet(&mut self, guid: u64, owed: &mut super::OwedSelects) {
+        let before = super::click::Standing::of(&self.selection, &self.seam);
+        let was = self.selection.guid;
+        self.select_unit(guid);
+        if self.selection.guid != was {
+            owed.push(super::OwedSelect::Signals(
+                before.owing_debt(SelectDebt::default()),
+            ));
         }
     }
 
@@ -1218,7 +1180,6 @@ mod tests {
         world.init_resource::<crate::ui_action::UiErrorKeys>();
         world.init_resource::<crate::player::FollowState>();
         world.init_resource::<crate::player::Approach>();
-        world.init_resource::<Messages<crate::player::FollowRequest>>();
         let mut names = NameCache::default();
         names.insert_player(ME, "Me".into(), None);
         names.insert_player(them.guid, "Them".into(), None);
@@ -1252,6 +1213,7 @@ mod tests {
                 SelfPlayer,
                 crate::net::ActiveMover,
                 Guid(me.guid),
+                Transform::default(),
                 GlobalTransform::default(),
                 alive(&me),
             ))
@@ -1260,6 +1222,7 @@ mod tests {
         let t = world
             .spawn((
                 Guid(them.guid),
+                Transform::from_translation(Vec3::X),
                 GlobalTransform::from_translation(Vec3::X),
                 alive(&them),
             ))
@@ -1276,21 +1239,20 @@ mod tests {
         selection.guid = target.map(|(_, g)| g);
     }
 
-    /// One request through the follow drain: the error lines it queued, and whom we follow after.
+    /// One request through the follow's start, as `FollowUnit`'s or `FollowByName`'s call makes
+    /// it: the line its refusal shows, and whom we follow after.
     fn drain(
         world: &mut World,
         request: crate::player::FollowRequest,
     ) -> (Vec<&'static str>, Option<u64>) {
-        world.write_message(request);
-        world
-            .run_system_cached(follow_requests)
-            .expect("the drain runs");
-        let keys = world
-            .resource_mut::<crate::ui_action::UiErrorKeys>()
-            .take()
-            .into_iter()
-            .map(|e| e.key)
-            .collect();
+        use bevy::ecs::system::RunSystemOnce;
+        let start = world
+            .run_system_once(move |mut steps: FollowSteps| steps.start(&request))
+            .expect("the start runs");
+        let keys = match start {
+            FollowStart::Refused(key) => vec![key],
+            _ => Vec::new(),
+        };
         (keys, world.resource::<crate::player::FollowState>().guid)
     }
 
@@ -1509,6 +1471,7 @@ mod tests {
         world.spawn((
             SelfPlayer,
             Guid(ME),
+            Transform::from_translation(Vec3::ZERO),
             GlobalTransform::from_translation(Vec3::ZERO),
         ));
         world
@@ -1542,6 +1505,7 @@ mod tests {
         let bobby = world
             .spawn((
                 Guid(BOBBY),
+                Transform::from_translation(Vec3::new(9.0, 0.0, 0.0)),
                 GlobalTransform::from_translation(Vec3::new(9.0, 0.0, 0.0)),
             ))
             .id();
@@ -1552,8 +1516,74 @@ mod tests {
         assert_eq!(find(&mut world, "Bo"), Some(BOBBY));
         // Once Bob is streamed too, the roster leaves him to the object pass; unnamed, he is
         // nobody's candidate.
-        let bob = world.spawn((Guid(BOB), GlobalTransform::default())).id();
+        let bob = world
+            .spawn((Guid(BOB), Transform::default(), GlobalTransform::default()))
+            .id();
         world.resource_mut::<GuidIndex>().0.insert(BOB, bob);
         assert_eq!(find(&mut world, "Bob"), Some(BOBBY));
+    }
+
+    /// The searches measure each unit where it stands at the call (`0x468380` with `0x493d30`):
+    /// of two players of an equal prefix, the one a handler moved nearer this frame wins, though
+    /// the scene's propagation, which runs after the frame's systems, still has it where it was.
+    #[test]
+    fn the_searches_measure_a_unit_moved_this_frame() {
+        use bevy::ecs::system::RunSystemOnce;
+        const ME: u64 = 0x10;
+        const BOBA: u64 = 0x20;
+        const BOBO: u64 = 0x30;
+        let mut world = World::new();
+        world.init_resource::<crate::ui_party::GroupState>();
+        world.init_resource::<GuidIndex>();
+        // The relation inputs the scan holds.
+        world.init_resource::<crate::net::Reputations>();
+        world.init_resource::<crate::spell::group_relation::GroupRoster>();
+        world.insert_resource(crate::net::SelfGuid(Some(ME)));
+        world.init_resource::<NameCache>();
+        let at = |x: f32| {
+            let v = Vec3::new(x, 0.0, 0.0);
+            (
+                Transform::from_translation(v),
+                GlobalTransform::from_translation(v),
+            )
+        };
+        world.spawn((SelfPlayer, Guid(ME), at(0.0)));
+        let boba = world.spawn((Guid(BOBA), at(5.0))).id();
+        let bobo = world.spawn((Guid(BOBO), at(9.0))).id();
+        for (guid, entity, name) in [(BOBA, boba, "Boba"), (BOBO, bobo, "Bobo")] {
+            world.resource_mut::<GuidIndex>().0.insert(guid, entity);
+            world
+                .resource_mut::<NameCache>()
+                .insert_player(guid, name.into(), None);
+        }
+        let find = |world: &mut World| {
+            world
+                .run_system_once(
+                    |lookup: PlayerLookup,
+                     scan: ByNameScan,
+                     names: Res<NameCache>,
+                     group: Res<crate::ui_party::GroupState>,
+                     index: Res<GuidIndex>| {
+                        (
+                            lookup.find(&names, &group, &index, "Bob"),
+                            scan.resolve(
+                                "Bob",
+                                NameSearch::PlayerOnly,
+                                Filter::AcceptAll,
+                                Match::PrefixOk,
+                            ),
+                        )
+                    },
+                )
+                .expect("the searches run as a one-shot system")
+        };
+        assert_eq!(find(&mut world), (Some(BOBA), Some(BOBA)), "the nearer");
+        // A handler moves Bobo to 1 yard; the propagation has not run.
+        world.get_mut::<Transform>(bobo).unwrap().translation = Vec3::new(1.0, 0.0, 0.0);
+        assert_eq!(
+            find(&mut world),
+            (Some(BOBO), Some(BOBO)),
+            "where it stands now"
+        );
     }
 }

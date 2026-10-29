@@ -20,7 +20,6 @@ use crate::net::{ClientCommand, Embodied, NetCommands, TeleportMessage, Worldpor
 use crate::ui_script::InspectMode;
 use benilla_assets::coords::wow_to_bevy;
 use benilla_assets::AssetSet;
-use benilla_world::interact::{WorldClick, WorldRightClick};
 use benilla_world::schedule::WorldStage;
 
 mod approach;
@@ -83,8 +82,9 @@ mod walk;
 mod wire_in;
 pub(crate) use wire_in::regain_control_on_arrival;
 
-/// The create's control restore (`regain_control_on_arrival`): every system that reads `Player`'s
-/// control flags runs after it in the frame, so it sees the restored flags, not the lost ones.
+/// The net drain, whose self create gives control back ([`regain_control_on_arrival`]): every
+/// system that reads the mover's lock runs after it in the frame, so it sees the restored lock,
+/// not the lost one.
 #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct ControlRestore;
 
@@ -95,32 +95,35 @@ use controller::control;
 pub(crate) use controller::LookSample;
 // The private camera and `state` items are re-imported for the modules beside this one, which
 // name them `super::X`.
-pub(crate) use camera::{head_height, CameraControl, CameraPivot};
+pub(crate) use camera::{head_height, CameraControl, CameraPivot, LookConfig, PressGesture};
 use camera::{model_pivot_height, run_look_session, FlyCam, LookButton};
 use camera_zoom::{apply_zoom_scroll, CAM_DIST_DEFAULT};
 // `/follow`: chat sends the request, `crate::target` resolves the subject into the state, and
 // `follow` owns the motion.
+#[cfg(test)]
+pub(crate) use follow::release_owed_for_test;
 pub(crate) use follow::{FollowRequest, FollowState};
 // Click to Move: `crate::target`'s dispatchers start it and run the verb it owes on arrival.
-#[cfg(test)]
 pub(crate) use approach::on_cvar as approach_on_cvar;
 pub(crate) use approach::{
-    can_auto_interact, cancel_move_action_on_ui_shutdown, Approach, ApproachVerb, AutoMove,
-    Refused, Subject, RANGE_STOP_FRACTION, TALK_STOP,
+    can_auto_interact, cancel_move_action_on_ui_shutdown, end_auto_move, stop_auto_move, Approach,
+    ApproachVerb, AutoMove, AutoMoveStop, Refused, Subject, RANGE_STOP_FRACTION, TALK_STOP,
 };
 /// `SetStandState` run inside a script call.
 pub(crate) use posture::{stand_up_for_attack, stand_up_refused, StandSetter};
+pub(crate) use press::{CallAutorun, CommandSteps};
+pub(crate) use state::{
+    view_is_out, MoverInput, MoverLock, OwnControlLost, Player, PlayerCapsule, StandPending,
+    CAPSULE_HEIGHT, CAPSULE_RADIUS, CREATURE_STEP_UP_HEIGHT, DEFAULT_COLLISION_HEIGHT,
+    FEATHER_TERMINAL_VELOCITY, GRAVITY, HOVER_CLIMB_RATE, HOVER_HEIGHT, SETTLE_TIMEOUT,
+    STEP_UP_HEIGHT, TERMINAL_VELOCITY,
+};
 use state::{
     MoveSpeed, PlayerRide, AIR_NUDGE_SPEED, FALL_FAR_DROP, FALL_FAR_TIME, FOOT_CONE_HEIGHT,
     GROUND_COS, GROUND_PROBE, JUMP_SPEED, LAND_PROBE, RUN_BACK_RATIO, SKIN_WIDTH,
     STATIONARY_CHASE_RATE, STEP_SLOPE_RATIO, STEP_SNAP_SLACK, STEP_UP_ADVANCE_PER_YARD, TURN_RATE,
     TURN_RATE_MOVING, WALK_RATIO, WATER_WALK_PITCH_FLOOR, WEDGE_MIN_FALL, WEDGE_STALL_RATIO,
     WEDGE_STILL_FRAMES,
-};
-pub(crate) use state::{
-    OwnControlLost, Player, PlayerCapsule, StandPending, CAPSULE_HEIGHT, CAPSULE_RADIUS,
-    CREATURE_STEP_UP_HEIGHT, DEFAULT_COLLISION_HEIGHT, FEATHER_TERMINAL_VELOCITY, GRAVITY,
-    HOVER_CLIMB_RATE, HOVER_HEIGHT, SETTLE_TIMEOUT, STEP_UP_HEIGHT, TERMINAL_VELOCITY,
 };
 /// The swim boundary `0.75·h`, also the wade ceiling, for the creature swim marker and the
 /// footstep splash, which have no `Player`.
@@ -282,9 +285,9 @@ pub(crate) struct PlayerControlSet;
 
 /// The world's mouse among the frame's input records, after the UI's ([`crate::ui_script::UiInput`],
 /// whose hover and press consumption it reads) and ahead of the net drain: which buttons the world
-/// owns, the right press's hook, and the look session with its click tests
-/// ([`controller::sample_look`]), as the reference's world-frame mouse handlers run in the window
-/// input (`0x423920` at `0x420d23`).
+/// owns and the look session ([`controller::sample_look`]), as the reference's world-frame mouse
+/// handlers run in the window input (`0x423920` at `0x420d23`). The world click is the input
+/// records' own ([`crate::target::world_steps`]).
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct WorldMouse;
 
@@ -326,13 +329,13 @@ impl Plugin for PlayerPlugin {
                     .after(WorldFocusSet)
                     .in_set(crate::vm_pass::VmPass::Member),
             );
-        app.add_observer(camera::on_cvar);
-        app.add_observer(camera_dynamics::on_cvar);
         app.init_resource::<camera::LookConfig>();
         app.init_resource::<camera_zoom::ZoomLimit>();
         app.init_resource::<camera::FollowConfig>();
         app.init_resource::<OwnControlLost>();
+        app.init_resource::<MoverLock>();
         app.init_resource::<StandPending>();
+        app.init_resource::<press::CallAutorun>();
         app.init_resource::<camera_dynamics::CameraOptions>();
         // Far sight resolves `PLAYER_FARSIGHT` to a pose before `control` seats the camera: a
         // separate system, as `control` holds our `Transform` mutably and cannot read another's.
@@ -462,14 +465,12 @@ impl Plugin for PlayerPlugin {
                 .after(crate::lanes::fire_in_order)
                 .in_set(crate::client_state::InWorldGated),
         )
-        // The world's right mouse-down, off that latch and ahead of the look session, as
-        // `0x483c40` runs its hook before `ExecuteBinding`; off in capture mode, like `control`.
-        // Then the look session, whose release settles the click tests, and the tick the frame's
-        // command presses and releases run (`0x515090` → `0x514640`), after the press's hand-off.
+        // The look session, off that latch, and the tick the frame's command presses and releases
+        // run (`0x515090` → `0x514640`), after the press's hand-off; off in capture mode, like
+        // `control`.
         .add_systems(
             Update,
             (
-                camera::send_world_right_press,
                 controller::sample_look,
                 press::press_commands,
                 press::press_tick,

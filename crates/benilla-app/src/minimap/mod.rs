@@ -17,7 +17,7 @@ mod composite;
 mod interior;
 /// The minimap ping, engine-owned and pinned to a world point.
 mod ping;
-pub(crate) use ping::{MinimapPing, MinimapSteps};
+pub(crate) use ping::{MemberPing, MinimapPing, MinimapSteps};
 
 use std::collections::HashMap;
 
@@ -156,7 +156,10 @@ pub(crate) struct MinimapZoom {
 
 /// The app's mirror of the two zoom CVars, each on its own field: the record's integer as the
 /// reference's raw copy takes it into the zoom cell (`0x6d9013`), unclamped.
-pub(crate) fn on_cvar(ev: On<crate::cvars::CvarChanged>, mut zoom: ResMut<MinimapZoom>) {
+pub(crate) fn on_cvar(
+    ev: &crate::cvars::CvarChanged,
+    mut zoom: bevy::prelude::Mut<'_, MinimapZoom>,
+) {
     match ev.key().as_str() {
         "minimapzoom" => zoom.outdoor = zoom_index(&ev.new),
         "minimapinsidezoom" => zoom.inside = zoom_index(&ev.new),
@@ -360,7 +363,7 @@ fn emit_minimap(
     wmos: Res<Assets<WmoModel>>,
     world: benilla_world::world_point::WorldPoint,
     asset_server: Res<AssetServer>,
-    corpse: Res<MinimapCorpse>,
+    statics: Res<MinimapStatics>,
     blip_inputs: blips::BlipInputs,
     mut composite: ResMut<composite::MinimapComposite>,
     rig: Option<Res<composite::CompositeRig>>,
@@ -673,8 +676,9 @@ fn emit_minimap(
         blips::emit_landmarks(
             ctx,
             pois.as_ref().map(|p| &p.0),
+            statics.quest.as_ref(),
             poi_marker.on_map(map.0),
-            corpse.0.as_ref(),
+            statics.corpse.as_ref(),
             map.0,
             assets.tex(MinimapArtSlot::Icons),
             &mut quads,
@@ -844,10 +848,14 @@ fn stage_masks(
     (blit, tile)
 }
 
-/// The corpse's static blip while the corpse is on the player's map, set by
-/// [`feed_minimap_arrows`] (which reads its `CORPSE_RED` name off the VM) for the landmark draw.
+/// The static blips the VM names, set by [`feed_minimap_arrows`] for the landmark draw: the
+/// selected quest's point (slot 0) while the quest log holds one, and the corpse (slot 2) while the
+/// corpse is on the player's map, read with its `CORPSE_RED` name off the VM.
 #[derive(Resource, Default)]
-pub(crate) struct MinimapCorpse(pub(crate) Option<benilla_formats::AreaPoi>);
+pub(crate) struct MinimapStatics {
+    pub(crate) quest: Option<benilla_formats::AreaPoi>,
+    pub(crate) corpse: Option<benilla_formats::AreaPoi>,
+}
 
 /// Aim the minimap's arrow children, the arrow half of its render (`0x4ec950`), after the tick and
 /// before the paint that draws them: the landmark selection's three records (rebuilt when its
@@ -872,7 +880,7 @@ fn feed_minimap_arrows(
         ),
     >,
     self_store: Query<&crate::net::ObjectStore, With<crate::net::SelfPlayer>>,
-    mut corpse: ResMut<MinimapCorpse>,
+    mut statics: ResMut<MinimapStatics>,
     inside: Res<MinimapInside>,
     mut listed: Local<crate::ui_script::VmMemo<Option<Vec<blips::ArrowKey>>>>,
 ) {
@@ -885,10 +893,17 @@ fn feed_minimap_arrows(
         let dead = corpse_point
             .filter(|cp| cp.display_map == map.0 as i32)
             .map(|cp| cp.position);
-        let named = corpse.0.as_ref().map(|c| (c.pos, c.continent_id));
+        let named = statics.corpse.as_ref().map(|c| (c.pos, c.continent_id));
         if dead.map(|p| (p, map.0)) != named {
-            corpse.0 =
+            statics.corpse =
                 dead.map(|p| blips::corpse_landmark(p, map.0, script.global_text("CORPSE_RED")));
+        }
+        // The selected quest's slot-0 blip, on the map the player is on as its setter takes it.
+        let quest = script
+            .quest_blip()
+            .map(|b| blips::quest_landmark(&b, map.0));
+        if quest != statics.quest {
+            statics.quest = quest;
         }
         if assets.tex(MinimapArtSlot::Mask).is_none() || !player.active {
             return;
@@ -900,8 +915,9 @@ fn feed_minimap_arrows(
             pois.as_ref()
                 .into_iter()
                 .flat_map(|p| p.0.rows().map(|(_, poi)| poi)),
+            statics.quest.as_ref(),
             poi_marker.on_map(map.0),
-            corpse.0.as_ref(),
+            statics.corpse.as_ref(),
             map.0,
             wx,
             wy,
@@ -919,6 +935,27 @@ fn feed_minimap_arrows(
     })
 }
 
+/// The world entry rebuilds the landmark candidates and zeroes the static records (`0x6d8f92`,
+/// `0x6d8fb0`), the selected quest's blip with them: it comes back at the next
+/// `SelectQuestLogEntry`, which the stock log runs as it updates.
+fn clear_quest_blip_on_world_entry(
+    In(ev): In<benilla_protocol::SessionEvent>,
+    mut hosted_vm: crate::script_calls::HostedVm,
+) {
+    if !matches!(
+        ev,
+        benilla_protocol::SessionEvent::Connected { .. }
+            | benilla_protocol::SessionEvent::Worldport { .. }
+    ) {
+        return;
+    }
+    hosted_vm.run(|script| {
+        if let Some(script) = script {
+            script.clear_quest_blip();
+        }
+    })
+}
+
 /// Push the player's facing onto the Minimap's player-arrow `Model` every frame, as the reference's
 /// per-frame `CMinimap::SetPlayerFacing` (`0x4eb8e0`) writes `[+0x39c]`, what `Model:GetFacing()`
 /// reads. `player.facing()` is an unbounded accumulator, so it is normalized to `[0, 2π)`, the
@@ -930,25 +967,6 @@ fn feed_minimap_player_facing(mut hosted_vm: crate::script_calls::HostedVm, play
     })
 }
 
-/// Push the game clock `GetGameTime()` answers when its hour or minute changes, the API's own
-/// resolution: the clock's fields as they stand (`0x515ee0`), -1, -1 while it is unset.
-fn feed_game_time(
-    mut hosted_vm: crate::script_calls::HostedVm,
-    time: Res<crate::net::ServerTime>,
-    mut last: Local<crate::ui_script::VmMemo<Option<(i32, i32)>>>,
-) {
-    hosted_vm.run(|script| {
-        let Some(script) = script else { return };
-        let last = last.get(script);
-        let now = (time.0.hour(), time.0.minute());
-        if *last == Some(now) {
-            return;
-        }
-        *last = Some(now);
-        script.set_game_time(now.0, now.1);
-    })
-}
-
 /// The app half of the `<Minimap>` widget. The zone label feed is `crate::area`'s: the reference
 /// fires `MINIMAP_ZONE_CHANGED` from the same area-update pass as the `ZONE_CHANGED` family
 /// (`0x494970` beside `0x494780`).
@@ -957,14 +975,19 @@ pub(crate) struct MinimapPlugin;
 impl Plugin for MinimapPlugin {
     fn build(&self, app: &mut App) {
         ping::register(app);
-        app.add_observer(on_cvar);
+        {
+            use crate::net::NetHandlerApp;
+            use benilla_protocol::SessionEventKind as K;
+            app.net_handler(K::Connected, clear_quest_blip_on_world_entry)
+                .net_handler(K::Worldport, clear_quest_blip_on_world_entry);
+        }
         app.init_resource::<MinimapWidget>()
             .init_resource::<MinimapZoom>()
             .init_resource::<MinimapTileCache>()
             .init_resource::<blips::MinimapBlipHover>()
             .init_resource::<MinimapInside>()
             .init_resource::<MinimapPing>()
-            .init_resource::<MinimapCorpse>()
+            .init_resource::<MinimapStatics>()
             .init_resource::<composite::MinimapComposite>()
             .add_systems(Startup, setup_minimap.after(AssetSet::Open))
             .add_systems(Startup, composite::setup_composite)
@@ -996,26 +1019,18 @@ impl Plugin for MinimapPlugin {
                         .after(crate::ui_chat::ChatDrain)
                         .after(crate::ui_party::drain_party)
                         .after(crate::poi_marker::expire_marker)
-                        .after(crate::poi_marker::clear_on_world_entry)
+                        .after(crate::lanes::UiLanes)
                         .after(feed_minimap_art)
                         .before(crate::ui_script::UiPaint),
                     // After the tick that can set the art, before the emit that draws with it.
                     feed_minimap_art
                         .in_set(crate::ui_script::UiDrain)
                         .before(UiQuadAppend),
-                    // Before the script tick, after the indoor push the radius reads. Gated on the
-                    // in-game UI: a member's ping in the login burst has no player to land on
-                    // (`0x4ee341`), so it is dropped, not signalled to the glue VM.
-                    ping::drive_minimap_ping
+                    // Before the script tick, after the indoor push the radius reads.
+                    ping::feed_minimap_player
                         .after(feed_minimap_inside)
                         .in_set(crate::ui_script::UiFeed)
                         .run_if(crate::ui_script::ingame_ui_up),
-                    ping::drop_inbound_pings
-                        .after(ping::drive_minimap_ping)
-                        .in_set(crate::ui_script::UiFeed)
-                        .run_if(not(crate::ui_script::ingame_ui_up)),
-                    // Before the script tick, so GameTimeFrame reads this frame's minute.
-                    feed_game_time.in_set(crate::ui_script::UiFeed),
                     // In the feed, off the hover the last walk left; after the world drive only so
                     // the two VM writers keep one order.
                     blips::drive_blip_tooltip

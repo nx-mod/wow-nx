@@ -19,13 +19,15 @@ use benilla_world::vis_chain::VisChainOnly;
 
 use super::motion::{
     create_spline, gameobject_rotation, monster_move_spline, pose_transform, resolve_facing,
-    trace_create_spline, trace_move_snap, wire_yaw, write_pose, SplineStopped, ROOT_APPLY_WIPE,
+    set_raw_facing, smoothed, trace_create_spline, trace_move_snap, wire_yaw, write_pose,
+    SplineStopped, ROOT_APPLY_WIPE,
 };
 use super::{
     ActiveMover, FieldChanged, Guid, GuidIndex, NetCommands, NetEntity, NetHandlerApp, ObjectStore,
-    RemoteMotion, SelfGuid, SpeedChangeMessage, Spline, UnitMoveModes, UnitSpeeds,
+    RemoteMotion, SelfGuid, SelfPlayer, SpeedChangeMessage, Spline, UnitMoveModes, UnitSpeeds,
 };
 
+mod arrival;
 mod update;
 
 pub(crate) use update::{release_unheld, Listed, ReleasePending, Released};
@@ -49,7 +51,7 @@ fn gameobject_anim_event(
 pub(super) fn register(app: &mut App) {
     use SessionEventKind as K;
     update::register(app);
-    app.net_handler(K::ItemTemplate, on_item)
+    app.net_handler(K::ItemTemplate, on_item_answer)
         .net_handler(K::ItemTime, on_item)
         .net_handler(K::ItemEnchantTime, on_item)
         .net_handler(K::MoveTimeSkipped, on_move_time_skipped)
@@ -80,6 +82,7 @@ pub(crate) struct Scene<'w, 's> {
     remote: Query<'w, 's, &'static mut RemoteMotion>,
     modes: Query<'w, 's, &'static mut UnitMoveModes>,
     xp_awarded: Query<'w, 's, (), With<crate::ui_chat::combat::watch::XpAwarded>>,
+    client_controlled: Query<'w, 's, (), With<super::ClientControlled>>,
     riders: Query<'w, 's, &'static mut crate::transport::TransportRider>,
     /// A transport's clock, which only a new object's create sets (`0x5f7080`).
     anchors: Query<'w, 's, &'static crate::transport::TransportAnchor>,
@@ -91,14 +94,13 @@ pub(crate) struct Scene<'w, 's> {
     item_lane: ResMut<'w, crate::item_lane::ItemLane>,
     /// The bag cache `0xbdd060` the bag seats' runs rescan and the bag events number from.
     bag_cache: ResMut<'w, crate::item_watch::BagCache>,
-    /// Where the frame's bag view changes: its first write of our player or an item.
-    bag_view: ResMut<'w, crate::ui_items::feed::BagView>,
     /// What each packet changed in the stores, for the views a listener reads
     /// ([`crate::ui_unit::views`]).
     view_log: ResMut<'w, crate::ui_unit::views::ViewLog>,
     field_notices: ResMut<'w, crate::field_watch::NoticeLane>,
-    /// The guid-scoped selection teardowns (`0x493910(guid, 1)`) a watcher raises.
-    deselect: MessageWriter<'w, crate::target::DeselectGuid>,
+    /// The guid-scoped selection teardowns (`0x493910(guid, 1)`) a watcher raises, run at the
+    /// packet's end; absent in a harness without targets.
+    deselect: Option<ResMut<'w, crate::target::OwedSelects>>,
     speed_changes: MessageWriter<'w, SpeedChangeMessage>,
     self_moves: MessageWriter<'w, super::SelfMoveMessage>,
     hard_landings: MessageWriter<'w, crate::creature_anim::HardLanding>,
@@ -123,6 +125,21 @@ pub(crate) struct Scene<'w, 's> {
     house: Option<ResMut<'w, crate::ui_auction::HouseLane>>,
     // The loot window's rows and the pushes that wait on an item's record.
     loot: Option<ResMut<'w, crate::ui_loot::LootState>>,
+    // The group loot rolls and their lines that wait on an item's record.
+    loot_rolls: crate::ui_loot_roll::RollRecordAnswers<'w>,
+    // The vendor window's row and buy-back callbacks.
+    merchant: crate::ui_merchant::MerchantRecordAnswers<'w>,
+    // The state pass the trainer's watches and item callbacks run (`0x4d7d40`).
+    trainer: crate::ui_trainer::TrainerPasses<'w>,
+    // The questgiver rows' callbacks' `QUEST_ITEM_UPDATE`.
+    quest_giver: Option<ResMut<'w, crate::ui_quest::QuestGiverLane>>,
+    // The quest log's leaderboard's object waits' `QUEST_LOG_UPDATE`.
+    quest_log: Option<ResMut<'w, crate::ui_quest_log::QuestLog>>,
+    /// The quest chat lines waiting on a record, and the notices an elite accept's tutorial
+    /// fires on ([`crate::ui_quest::lines`]).
+    quest_lines: Option<ResMut<'w, crate::ui_quest::QuestLines>>,
+    // The mail rows' and notices' callbacks' `MAIL_INBOX_UPDATE`.
+    mail: Option<ResMut<'w, crate::ui_mail::MailLane>>,
     pass: ResMut<'w, update::UpdatePass>,
     released: ResMut<'w, Released>,
     nets: Query<'w, 's, &'static NetEntity>,
@@ -135,6 +152,29 @@ pub(crate) struct Scene<'w, 's> {
     pending: Query<'w, 's, (Entity, &'static Guid), With<update::ReleasePending>>,
     creatures: Option<Res<'w, crate::entities::Creatures>>,
     held_displays: Query<'w, 's, &'static mut update::HeldDisplay>,
+    /// What our own `ShowHelm` and `ShowCloak` calls left on the model, which a hide bit's edge
+    /// ends.
+    worn_pins: Query<'w, 's, &'static mut crate::entities::WornPins>,
+    /// The viewer's zone and the objects' positions a party member's snapshot stores (`0x5f0880`).
+    place: crate::ui_party::net::SnapshotPlace<'w, 's>,
+    /// The active mover, which its unit's release and destroy zero.
+    mover: Option<ResMut<'w, super::MoverClaim>>,
+    /// The far-sight subject, whose view-out term the stun's tick reads.
+    view_subject: Option<Res<'w, crate::player::ViewSubject>>,
+    /// The active mover's auto-move, which its release and the watchers' stops end.
+    follow: Option<ResMut<'w, crate::player::FollowState>>,
+    approach: Option<ResMut<'w, crate::player::Approach>>,
+    /// Autorun as the frame's calls leave it, which an auto-move's stop clears.
+    call_autorun: Option<ResMut<'w, crate::player::CallAutorun>>,
+    /// Our own control, which our arrival restores and `IsClientControlled` reads for our
+    /// character (`0x5fa5f0`).
+    own_control_lost: Option<ResMut<'w, crate::player::OwnControlLost>>,
+    /// Who we drive and whether we may, which our own arrival gives back.
+    mover_lock: Option<ResMut<'w, crate::player::MoverLock>>,
+    /// The area spirit healer the ghost flag's clear empties (`0x5dea20` → `0x4921c0`), and the
+    /// aura cancel it runs.
+    spirit: Option<ResMut<'w, crate::ui_dialog_verbs::AreaSpiritHealer>>,
+    aura: crate::ui_aura::AuraGate<'w>,
 }
 
 /// The item watchers' reads of the scene ([`crate::item_watch::Watch`]).
@@ -157,98 +197,320 @@ fn item_watch<'a, 'w, 's>(
     }
 }
 
-/// Items past their create block: `SMSG_ITEM_QUERY_SINGLE_RESPONSE`, whose refusal the next
-/// create or entry change of that entry asks again; and the lifetime and enchant countdowns,
-/// written into the item's own [`crate::items::Countdowns`].
-fn on_item(In(ev): In<SessionEvent>, mut sc: Scene) {
-    match ev {
-        SessionEvent::ItemTemplate { entry, info } => {
-            let info = info.map(|b| *b);
-            debug!("net: item template {entry} → {info:?}");
-            let answered = info.is_some();
-            sc.items.insert_template(entry, info);
-            // The callbacks the lookups that missed registered, in the order they asked
-            // (`0x55ba30`, the dedupe flag 0): each item's set-up (`0x5d8390`) and entry change's
-            // (`0x5d96b0`), the loot window's rows (`0x4c2ac0`) and pushes (`0x491ee0`), the trade
-            // getters' (`0x4c0340`), the ammo getters' (`0x4c84f0`), and the parked swaps'
-            // (`0x5e1020`) and auto-equips' (`0x5e17a0`).
-            let callbacks = sc.items.take_callbacks(entry);
-            // An answer an item of ours waited on changes what the bag view shows of it.
-            if answered
-                && callbacks.iter().any(|c| {
-                    matches!(
-                        c,
-                        crate::items::RecordCallback::SetUp(_)
-                            | crate::items::RecordCallback::Entry(_)
-                    )
-                })
-            {
-                sc.bag_view.wrote();
+/// A paper row's callback (`0x4acbf0`) on the answer for `entry`, a record or a refusal: it
+/// counts one down, the last rebuilding the list off the record now cached (`0x4acbf8`).
+fn paper_answered(
+    In(entry): In<u32>,
+    paper: Option<crate::ui_mail::StationeryRebuild>,
+    items: Res<Items>,
+) {
+    if let Some(mut paper) = paper {
+        paper.answered(entry, &items);
+    }
+}
+
+/// `SMSG_ITEM_QUERY_SINGLE_RESPONSE` as `ItemCacheReceive` (`0x55bdb0`, from the handler
+/// `0x555140`) runs it: the record stored, or the refusal taken, and the VM's copy with it
+/// ([`crate::ui_items::feed::push_answered_record`]), then every callback the lookups that missed
+/// registered, in the order they asked (`0x55ba30` links each at the head with the dedupe flag 0,
+/// and `0x55bf12`-`0x55bf39` walk from the tail), each in place: what a callback signals fires at
+/// this packet's place among the frame's other packets, and what it sends goes out ahead of a
+/// later packet's. A refusal walks the callbacks its own add as [`crate::items::Items`]'s walk says,
+/// and is asked again by the next create or entry change of that entry.
+fn on_item_answer(In(ev): In<SessionEvent>, world: &mut World) {
+    let SessionEvent::ItemTemplate { entry, info } = ev else {
+        return;
+    };
+    let info = info.map(|b| *b);
+    debug!("net: item template {entry} → {info:?}");
+    let answered = info.is_some();
+    let Some(mut items) = world.get_resource_mut::<Items>() else {
+        return;
+    };
+    items.insert_template(entry, info);
+    let callbacks = items.take_callbacks(entry);
+    run_answer_step(world, crate::ui_items::feed::push_answered_record, entry);
+    if answered {
+        for callback in callbacks {
+            run_callback(world, entry, callback, true);
+        }
+        run_answer_step(world, run_answer_tail, entry);
+    } else {
+        walk_refusal(world, entry, callbacks, true);
+    }
+}
+
+/// The record answer for `entry` run as its handler runs it ([`on_item_answer`]), for a test with
+/// no net stack: `info` stored, or refused, and its callbacks walked.
+#[cfg(test)]
+pub(crate) fn answer_item(
+    world: &mut World,
+    entry: u32,
+    info: Option<benilla_protocol::messages::ItemInfo>,
+) {
+    on_item_answer(
+        In(SessionEvent::ItemTemplate {
+            entry,
+            info: info.map(Box::new),
+        }),
+        world,
+    );
+}
+
+/// A refusal's walk of `list` for `entry`, and with `tail` the callbacks run after the list; when
+/// a listener of what it signalled may add to it, the walk goes on behind those signals
+/// ([`continue_refusal_walk`]).
+fn walk_refusal(
+    world: &mut World,
+    entry: u32,
+    list: Vec<crate::items::RecordCallback>,
+    tail: bool,
+) {
+    let Some(items) = world.get_resource::<Items>() else {
+        return;
+    };
+    items.begin_refusal_walk(entry, list);
+    let from = items.walk_began();
+    while let Some(callback) = world.resource::<Items>().next_walk_step() {
+        run_callback(world, entry, callback, false);
+    }
+    if tail {
+        run_answer_step(world, run_answer_tail, entry);
+    }
+    if let (true, Some(from)) = (world.resource::<Items>().end_refusal_walk(), from) {
+        crate::field_callbacks::walk_on(world, entry, from);
+    }
+}
+
+/// The walk of `entry` that began at `from`, gone on behind its signals: what their listeners
+/// added, walked with status 0 in the order added.
+pub(crate) fn continue_refusal_walk(world: &mut World, entry: u32, from: crate::lanes::Mark) {
+    let Some(items) = world.get_resource::<Items>() else {
+        return;
+    };
+    let list = items.take_walk_tail(entry, from);
+    if !list.is_empty() {
+        walk_refusal(world, entry, list, false);
+    }
+}
+
+/// One callback of an answer's list, for a record (`answered`) or a refusal.
+fn run_callback(
+    world: &mut World,
+    entry: u32,
+    callback: crate::items::RecordCallback,
+    answered: bool,
+) {
+    {
+        use crate::items::RecordCallback as Cb;
+        match callback {
+            // The equip callbacks run with the VM, their sends inside them.
+            Cb::Swap | Cb::AutoEquip => {
+                crate::ui_bind_confirm::replay_at_answer(world, entry, callback, answered)
             }
-            for callback in callbacks {
-                use crate::items::RecordCallback as Cb;
-                match callback {
-                    // A refusal finishes no set-up (its found byte is clear, `0x5d83b8`) and runs
-                    // no entry change (`0x5d96bb`).
-                    Cb::SetUp(_) | Cb::Entry(_) if !answered => {}
-                    Cb::SetUp(guid) => {
-                        let run = item_watch(&sc.index, &sc.stores, &sc.self_guid, &sc.items)
-                            .set_up_run(guid, entry, &sc.bag_cache);
-                        if run.notice.is_some() {
-                            replay_enchant_times(
-                                &mut sc.items,
-                                &mut sc.countdowns,
-                                &sc.index,
-                                guid,
-                            );
-                        }
-                        sc.item_lane.push(run);
-                    }
-                    Cb::Entry(guid) => {
-                        let run = item_watch(&sc.index, &sc.stores, &sc.self_guid, &sc.items)
-                            .entry_run(guid, entry, &sc.bag_cache);
-                        sc.item_lane.push(run);
-                    }
-                    // A refusal releases a row ([`crate::ui_loot`]'s deviation).
-                    Cb::LootRow => {
-                        if let Some(loot) = sc.loot.as_mut() {
-                            loot.row_answered(&sc.items);
-                        }
-                    }
-                    Cb::Push => {
-                        if let Some(loot) = sc.loot.as_mut() {
-                            loot.push_answered(&sc.items, entry);
-                        }
-                    }
-                    // The trade and the ammo getters' callbacks run for a ready record only
-                    // (`0x4c0343`, `0x4c84f6`).
-                    Cb::Trade if answered => sc.item_lane.push(crate::item_watch::Run {
-                        notice: Some(crate::item_watch::ItemNotice::TradeRecord { entry }),
-                        ..Default::default()
-                    }),
-                    Cb::Ammo if answered => {
-                        sc.field_notices
-                            .write(crate::field_watch::FieldNotice::Player {
-                                id: crate::field_watch::id::UNIT_INVENTORY_CHANGED,
-                            })
-                    }
-                    Cb::Trade | Cb::Ammo => {}
-                    // The equip callbacks run with the VM, after the feeds push the answer
-                    // ([`crate::ui_bind_confirm::replay_equip_records`]).
-                    Cb::Swap | Cb::AutoEquip => sc.items.run_with_vm(entry, callback, answered),
+            Cb::ItemCooldown => {
+                run_answer_step(world, crate::spell::net::item_cooldown_answered, entry)
+            }
+            // The query again for a found record only (`0x6e2f78`).
+            Cb::CooldownQuery if answered => {
+                run_answer_step(world, crate::spell::net::cooldown_query_answered, entry)
+            }
+            Cb::CooldownQuery => {}
+            Cb::Stationery => run_answer_step(world, paper_answered, entry),
+            // `ShowItemCastFailure 0x6e29b0`, for a record and a refusal alike: the line again,
+            // on the cast lane here.
+            Cb::CastFailure { spell, reason } => {
+                if let Some(mut reports) = world.get_resource_mut::<crate::ui_cast::CastReports>() {
+                    reports.redisplay(spell, reason, entry);
                 }
             }
-            // The combat log's callback for its held lines (`0x6294b0`), which writes each one
-            // whose item the cache now holds.
-            if let Some(chat) = &sc.chat {
-                chat.answer_landed(crate::ui_chat::Answer::Item(entry));
+            // `QUEST_LOG_UPDATE` for a ready record only (`0x4e0838`), held and parked here.
+            Cb::QuestLog if answered => crate::ui_items::feed::quest_log_answered(world),
+            // The tooltips' rebuilds for a found record only (`0x52e551`, `0x52f826`).
+            Cb::Tooltip if answered => crate::ui_items::feed::tooltips_answered(world, entry),
+            Cb::QuestLog | Cb::Tooltip => {}
+            // The profession and craft lists' rebuilds, for a found record only.
+            Cb::TradeSkill | Cb::TradeSkillBuild | Cb::Craft => {
+                if answered {
+                    crate::ui_tradeskill::record_answered(world, callback);
+                }
             }
-            // The auction lists' callbacks (`0x4cc9bf`, `0x4ccbff`, `0x4cce4f`), a record or a
-            // refusal: a page that now waits on nothing runs its tail.
-            if let (Some(auction), Some(house)) = (sc.auction.as_mut(), sc.house.as_mut()) {
-                crate::ui_auction::record_answered(auction, house, &sc.items, entry);
+            _ => run_answer_step(world, run_record_callback, (entry, callback, answered)),
+        }
+    }
+}
+
+/// Run one step of an answer's callbacks as a one-shot, its unit edits applied as it returns; a
+/// harness without its state runs nothing.
+fn run_answer_step<T: 'static, M>(
+    world: &mut World,
+    step: impl IntoSystem<In<T>, (), M> + 'static,
+    input: T,
+) {
+    if let Err(err) = world.run_system_cached_with(step, input) {
+        debug!("net: an item answer's callback did not run: {err}");
+    }
+    crate::creature_anim::apply_unit_edits(world);
+}
+
+/// One callback an item lookup registered, for the answer of `entry`, a record (`answered`) or a
+/// refusal: each item's set-up (`0x5d8390`) and entry change's (`0x5d96b0`), the loot window's rows
+/// (`0x4c2ac0`) and pushes (`0x491ee0`), the trade getters' (`0x4c0340`), the ammo getters'
+/// (`0x4c84f0`), the vendor rows' (`0x4fada0`, `0x4fb570`), the trainer rows' (`0x4d9140`,
+/// `0x4d9db0`), the questgiver rows' (`0x5018c0`), the turn-in's reward lines' (`0x5dc7b0`), the
+/// mail rows' and notices' (`0x4af0a0`, `0x4ad010`), the mail attachment's (`0x4ae710`) and the
+/// auction notices' lines (`0x4cd190`). The equip callbacks are the VM's
+/// ([`crate::ui_bind_confirm::replay_at_answer`]).
+fn run_record_callback(
+    In((entry, callback, answered)): In<(u32, crate::items::RecordCallback, bool)>,
+    mut sc: Scene,
+) {
+    use crate::items::RecordCallback as Cb;
+    match callback {
+        // A refusal finishes no set-up (its found byte is clear, `0x5d83b8`) and runs
+        // no entry change (`0x5d96bb`).
+        Cb::SetUp(_) | Cb::Entry(_) if !answered => {}
+        Cb::SetUp(guid) => {
+            let run = item_watch(&sc.index, &sc.stores, &sc.self_guid, &sc.items).set_up_run(
+                guid,
+                entry,
+                &sc.bag_cache,
+            );
+            if run.notice.is_some() {
+                replay_enchant_times(&mut sc.items, &mut sc.countdowns, &sc.index, guid);
+            }
+            sc.item_lane.push(run);
+        }
+        Cb::Entry(guid) => {
+            let run = item_watch(&sc.index, &sc.stores, &sc.self_guid, &sc.items).entry_run(
+                guid,
+                entry,
+                &sc.bag_cache,
+            );
+            sc.item_lane.push(run);
+        }
+        // A refusal releases a row ([`crate::ui_loot`]'s deviation).
+        Cb::LootRow => {
+            if let Some(loot) = sc.loot.as_mut() {
+                loot.row_answered(&sc.items);
             }
         }
+        Cb::Push => {
+            if let Some(loot) = sc.loot.as_mut() {
+                loot.push_answered(&sc.items, entry);
+            }
+        }
+        // The trade and the ammo getters' callbacks run for a ready record only
+        // (`0x4c0343`, `0x4c84f6`).
+        Cb::Trade if answered => sc.item_lane.push(crate::item_watch::Run {
+            notice: Some(crate::item_watch::ItemNotice::TradeRecord { entry }),
+            ..Default::default()
+        }),
+        Cb::Ammo if answered => sc
+            .field_notices
+            .write(crate::field_watch::FieldNotice::Player {
+                id: crate::field_watch::id::UNIT_INVENTORY_CHANGED,
+            }),
+        Cb::Trade | Cb::Ammo => {}
+        // The bar's recount of the entry, for a ready record only (`0x4e5b86` → `0x4e5c70`).
+        Cb::ActionSlots if answered => sc.item_lane.push(crate::item_watch::Run {
+            notice: Some(crate::item_watch::ItemNotice::ActionRecord { entry }),
+            ..Default::default()
+        }),
+        Cb::ActionSlots => {}
+        Cb::Swap
+        | Cb::AutoEquip
+        | Cb::ItemCooldown
+        | Cb::CooldownQuery
+        | Cb::Stationery
+        | Cb::CastFailure { .. }
+        | Cb::QuestLog
+        | Cb::Tooltip
+        | Cb::TradeSkill
+        | Cb::TradeSkillBuild
+        | Cb::Craft => {}
+        // The vendor's run for a record and a refusal alike (`0x4fb0f0`, `0x4fb570`).
+        Cb::Merchant => sc.merchant.row_answered(),
+        Cb::Buyback => sc.merchant.buyback_answered(),
+        // The trainer getters' run the state pass for a ready record only (`0x4d9146`,
+        // `0x4d9db6`).
+        Cb::Trainer if answered => sc.trainer.owed(),
+        Cb::Trainer => {}
+        // `QUEST_ITEM_UPDATE` for a ready record only (`0x5018d6`, `0x5018f5`,
+        // `0x501903`), whatever the window shows then.
+        Cb::Quest if answered => {
+            if let Some(lane) = sc.quest_giver.as_mut() {
+                lane.push(crate::ui_quest::QuestGiverEvent::ItemUpdate);
+            }
+        }
+        Cb::Quest => {}
+        // The turn-in's reward line, shown with a ready record (`0x5dc7b0`).
+        Cb::QuestReward => {
+            if let (Some(lines), Some(lane)) = (sc.quest_lines.as_mut(), sc.quest_giver.as_mut()) {
+                lines.item_answered(entry, &sc.items, lane);
+            }
+        }
+        // `MAIL_INBOX_UPDATE` for a ready record only (`0x4af0a6`, `0x4ad016`); the
+        // notice's subject reads the record as its row resolves.
+        Cb::Mail if answered => {
+            if let Some(lane) = sc.mail.as_mut() {
+                lane.push(crate::ui_mail::MailEvent::InboxUpdate);
+            }
+        }
+        Cb::Mail => {}
+        // An auction notice's line, shown with the name or, for a refusal, dropped
+        // (`0x4cd190`).
+        Cb::AuctionMessage => {
+            if let (Some(auction), Some(house)) = (sc.auction.as_mut(), sc.house.as_mut()) {
+                crate::ui_auction::message_answered(auction, house, &sc.items, entry);
+            }
+        }
+        // `MAIL_SEND_INFO_UPDATE` for a ready record only (`0x4ae716`, `0x4ae71f`).
+        Cb::SendMail if answered => {
+            if let Some(lane) = sc.mail.as_mut() {
+                lane.push(crate::ui_mail::MailEvent::SendInfoUpdate);
+            }
+        }
+        Cb::SendMail => {}
+        // `NEW_AUCTION_UPDATE` for a ready record only (`0x4ce2f6`-`0x4ce2ff`).
+        Cb::AuctionSellItem if answered => {
+            if let Some(house) = sc.house.as_mut() {
+                crate::ui_auction::sell_item_answered(house);
+            }
+        }
+        Cb::AuctionSellItem => {}
+        // A roll's or its line's, for a record and a refusal alike: the start's opens the roll
+        // (`0x61b460` → `0x61b430`), a line's goes on to its name or is shown (`0x61c4b0`,
+        // `0x61bd50`, `0x61b7d0`).
+        Cb::LootRoll(wait) => sc.loot_rolls.item_answered(
+            wait,
+            answered,
+            &sc.items,
+            &sc.names,
+            &sc.net,
+            sc.self_guid.0,
+        ),
+    }
+}
+
+/// The answer's callbacks registered outside the lookups' list, run after it.
+fn run_answer_tail(In(entry): In<u32>, mut sc: Scene) {
+    // The combat log's callback for its held lines (`0x6294b0`), which writes each one
+    // whose item the cache now holds.
+    if let Some(chat) = &sc.chat {
+        chat.answer_landed(crate::ui_chat::Answer::Item(entry));
+    }
+    // The auction lists' callbacks (`0x4cc9bf`, `0x4ccbff`, `0x4cce4f`), a record or a
+    // refusal: a page that now waits on nothing runs its tail.
+    if let (Some(auction), Some(house)) = (sc.auction.as_mut(), sc.house.as_mut()) {
+        crate::ui_auction::record_answered(auction, house, &sc.items, entry);
+    }
+}
+
+/// Items past their create block: the lifetime and enchant countdowns, written into the item's
+/// own [`crate::items::Countdowns`].
+fn on_item(In(ev): In<SessionEvent>, mut sc: Scene) {
+    match ev {
         // `0x5e4f30`'s two arms share the item lookup (`0x468460`, `TYPEMASK_ITEM`) and differ on
         // a miss.
         SessionEvent::ItemTime { item_guid, seconds } => {
@@ -382,6 +644,10 @@ fn on_monster_move(In(ev): In<SessionEvent>, mut sc: Scene) {
     } = ev
     {
         let rooted = modes_of(guid, &sc.index, &sc.modes).rooted();
+        let smooth =
+            sc.index.0.get(&guid).is_some_and(|&e| {
+                smoothed(sc.nets.get(e).ok().map(|n| n.kind), sc.movers.contains(e))
+            });
         monster_move(
             guid,
             transport,
@@ -394,11 +660,30 @@ fn on_monster_move(In(ev): In<SessionEvent>, mut sc: Scene) {
             flying,
             run_mode,
             rooted,
+            smooth,
             &mut sc.commands,
             &sc.index,
             &mut sc.transforms,
             &mut sc.riders,
         );
+        // A path started on the active mover runs its input tick (`0x6187a0` → `0x602053`), whose
+        // precondition the server's spline fails (`0x5144e0`): the teardown leg stops the auto-move
+        // (`0x5146d6`). A stop starts no path, and nor does a rooted mover: the start returns 0 on
+        // the root bit `0x1000` (`0x6187c2`-`0x6187c7`), so `0x601fee` skips the tick.
+        let mover_rooted = sc
+            .player
+            .as_deref()
+            .is_some_and(crate::player::Player::rooted);
+        if !stop && !mover_rooted {
+            update::stop_auto_move(
+                sc.mover.as_deref(),
+                sc.follow.as_deref_mut(),
+                sc.approach.as_deref_mut(),
+                sc.call_autorun.as_deref_mut(),
+                &mut sc.field_notices,
+                guid,
+            );
+        }
     }
 }
 
@@ -419,6 +704,12 @@ fn on_gameobject_info(In(ev): In<SessionEvent>, mut sc: Scene) {
             &data,
             &mut sc.go_templates,
         );
+        // The leaderboard's callback `0x4e0800` signals for a landed record (`0x4e081a`).
+        if sc.go_templates.take_quest_wait(entry) {
+            if let Some(log) = sc.quest_log.as_mut() {
+                log.ready(crate::ui_quest_log::QuestEvent::Named);
+            }
+        }
     }
 }
 
@@ -427,6 +718,8 @@ fn on_gameobject_info(In(ev): In<SessionEvent>, mut sc: Scene) {
 fn on_gameobject_unknown(In(ev): In<SessionEvent>, mut sc: Scene) {
     if let SessionEvent::GameObjectUnknown { entry } = ev {
         sc.go_templates.refuse(entry);
+        // A refusal runs the leaderboard's callback with status 0, which only logs (`0x4e080a`).
+        sc.go_templates.take_quest_wait(entry);
     }
 }
 
@@ -687,6 +980,11 @@ fn object_create(
             if let Some(s) = walk {
                 entity.insert(s);
             }
+            // Our own player is the active one from its write: the reference finds it by its guid
+            // (`0x468550`), here by the tag, given in the same commands as the entity.
+            if sc.self_guid.0 == Some(guid) {
+                entity.insert(SelfPlayer);
+            }
             let e = entity.id();
             sc.index.0.insert(guid, e);
             crate::target::object_held(sc.selection.as_mut(), guid, e);
@@ -843,10 +1141,11 @@ fn tear_down(mut ent: EntityWorldMut) {
     ent.insert(DespawnFade::default());
 }
 
-/// `SMSG_MONSTER_MOVE` or `SMSG_MONSTER_MOVE_TRANSPORT`: settles transport membership, snaps the
-/// facing, then attaches or clears the spline. With a `transport`, `start`, the path and an
-/// `Angle` facing are deck-local and the unit rides as a [`TransportRider`]; without one, a riding
-/// unit leaves the deck, as vmangos drops it (`MoveSplineInit.cpp:156-159`).
+/// `SMSG_MONSTER_MOVE` or `SMSG_MONSTER_MOVE_TRANSPORT`: settles transport membership, then
+/// attaches the spline, or clears it and turns the unit to the facing at once. With a
+/// `transport`, `start`, the path and an `Angle` facing are deck-local and the unit rides as a
+/// [`TransportRider`]; without one, a riding unit leaves the deck, as vmangos drops it
+/// (`MoveSplineInit.cpp:156-159`).
 fn monster_move(
     guid: u64,
     transport: Option<u64>,
@@ -859,6 +1158,8 @@ fn monster_move(
     flying: bool,
     run_mode: bool,
     rooted: bool,
+    // The display smoother turns this unit (`facing::smoothed`).
+    smooth: bool,
     commands: &mut Commands,
     index: &GuidIndex,
     transforms: &mut Query<&mut Transform>,
@@ -877,9 +1178,43 @@ fn monster_move(
             stop,
             duration_ms,
         );
-        // Transport membership, settled before any pose is read, and above the root gate, which
-        // refuses only the path. An `Angle` facing is deck-local (`MoveSplineInit.cpp:87`); a
-        // `Spot` or `Target` is not converted server-side, so it is rebased by the deck's yaw.
+        // A rooted unit takes no path: `0x6187a0`, the only route into the spline installer
+        // `0x7c6a50`, returns on ROOT (`0x6187c2`). Only the path is refused: the un-nock tail runs
+        // on every path (`0x6020ef`), and the rest for a rooted unit is untraced.
+        let spline = if rooted {
+            None
+        } else {
+            monster_move_spline(
+                path,
+                spline_id,
+                stop,
+                duration_ms,
+                flying,
+                run_mode,
+                facing,
+                transport,
+            )
+        };
+        // The final facing (moveType 2/3/4) turns the unit now only when no path installs
+        // (`0x601fee` to `0x60205e`): an `Angle` through `0x6198e0`, a `Target` through `0x602e80`,
+        // a `Spot` as `0x47f220` from the unit's position, each into the raw facing. A path keeps
+        // it for its end (`0x618840`, `0x618870`, `0x6188a0`; [`Spline::final_facing`]).
+        let face_now = if spline.is_none() {
+            facing
+        } else {
+            MonsterMoveFacing::None
+        };
+        let target_pos = |g: u64| {
+            index
+                .0
+                .get(&g)
+                .and_then(|&te| transforms.get(te).ok())
+                .map(|t| bevy_to_wow(t.translation))
+        };
+        // Transport membership, settled before any pose is read and whether or not the path was
+        // refused: the root gate refuses only the path. An `Angle` facing is deck-local
+        // (`MoveSplineInit.cpp:87`); a `Spot` or `Target` is not converted server-side, so it is
+        // rebased by the deck's yaw.
         let deck_yaw = |t: u64| {
             index
                 .0
@@ -887,25 +1222,17 @@ fn monster_move(
                 .and_then(|&te| transforms.get(te).ok())
                 .map(|tf| tf.rotation.to_euler(EulerRot::YXZ).0)
         };
+        // The unit's own position anchors the bearing (`0x6020a5`, `0x602ec1`, its world
+        // `GetPosition`), not the wire's `start`.
+        let world_pos = transforms.get(e).ok().map(|tf| bevy_to_wow(tf.translation));
         if let Some(t) = transport {
-            let local_facing = match facing {
+            let local_facing = match face_now {
                 MonsterMoveFacing::None => None,
                 MonsterMoveFacing::Angle(a) => Some(a),
-                other => {
-                    let target_pos = |g: u64| {
-                        index
-                            .0
-                            .get(&g)
-                            .and_then(|&te| transforms.get(te).ok())
-                            .map(|tf| bevy_to_wow(tf.translation))
-                    };
-                    // The world position anchors the bearing; the wire's `start` is deck-local.
-                    let world_pos = transforms.get(e).ok().map(|tf| bevy_to_wow(tf.translation));
-                    world_pos
-                        .and_then(|p| resolve_facing(other, p, target_pos))
-                        .zip(deck_yaw(t))
-                        .map(|(world, yaw)| world - yaw)
-                }
+                other => world_pos
+                    .and_then(|p| resolve_facing(other, p, target_pos))
+                    .zip(deck_yaw(t))
+                    .map(|(world, yaw)| world - yaw),
             };
             match riders.get_mut(e) {
                 Ok(mut rider) => {
@@ -923,28 +1250,21 @@ fn monster_move(
                     });
                 }
             }
-        } else if riders.get(e).is_ok() {
-            commands
-                .entity(e)
-                .remove::<crate::transport::TransportRider>();
-        }
-        // The final facing (moveType 2/3/4) snaps the raw facing (`0x7c6f30`) and resets the
-        // display smoother. A following path overrides it with the tangent each frame (`0x7c5490`),
-        // so it sticks only on a stop. A deck packet's facing is the rider's `local_orientation`.
-        if transport.is_none() && !matches!(facing, MonsterMoveFacing::None) {
-            let target_pos = |g: u64| {
-                index
-                    .0
-                    .get(&g)
-                    .and_then(|&te| transforms.get(te).ok())
-                    .map(|t| bevy_to_wow(t.translation))
-            };
-            if let Some(orientation) = resolve_facing(facing, start, target_pos) {
-                if let Ok(mut t) = transforms.get_mut(e) {
+        } else {
+            if riders.get(e).is_ok() {
+                commands
+                    .entity(e)
+                    .remove::<crate::transport::TransportRider>();
+            }
+            // Only the raw facing turns; the display follows through `0x600cd0`, never reset on
+            // a move. A body the smoother does not govern shows it at once.
+            if let Some(orientation) =
+                world_pos.and_then(|p| resolve_facing(face_now, p, target_pos))
+            {
+                if smooth {
+                    set_raw_facing(commands, e, orientation);
+                } else if let Ok(mut t) = transforms.get_mut(e) {
                     t.rotation = Quat::from_rotation_y(orientation);
-                    commands
-                        .entity(e)
-                        .remove::<crate::net::motion::DisplayFacing>();
                 }
             }
         }
@@ -961,24 +1281,13 @@ fn monster_move(
             e,
             crate::creature_anim::PrecastTail::Moving(!rooted),
         );
-        // A rooted unit takes no path: `0x6187a0`, the only route into the spline installer
-        // `0x7c6a50`, returns on ROOT (`0x6187c2`). Only the path is refused: the un-nock tail runs
-        // on every path (`0x6020ef`), and the rest for a rooted unit is untraced.
         if rooted {
             return;
         }
         // The spline supersedes the relay stream: a splined player (charge, taxi) would otherwise
         // keep stale flags that outrank the spline in the anim selector.
         commands.entity(e).remove::<RemoteMotion>();
-        match monster_move_spline(
-            path,
-            spline_id,
-            stop,
-            duration_ms,
-            flying,
-            run_mode,
-            transport,
-        ) {
+        match spline {
             Some(spline) => {
                 commands.entity(e).insert(spline).remove::<SplineStopped>();
             }
@@ -2628,6 +2937,7 @@ mod tests {
                             false,
                             true,
                             rooted,
+                            false,
                             &mut commands,
                             &index,
                             &mut transforms,
@@ -2692,6 +3002,7 @@ mod tests {
                             false,
                             true,
                             rooted,
+                            false,
                             &mut commands,
                             &index,
                             &mut transforms,
@@ -2755,6 +3066,7 @@ mod tests {
                         false,
                         true,
                         false,
+                        false,
                         &mut commands,
                         &index,
                         &mut transforms,
@@ -2769,10 +3081,14 @@ mod tests {
                 .expect("a transport path attaches its rider");
             assert_eq!(rider.transport_guid, BOAT);
             assert_eq!(rider.local_pos, [1.5, -2.5, 0.75], "seeded deck-local");
-            assert!(
-                (rider.local_orientation - 1.25).abs() < 1e-6,
-                "Angle is deck-local"
+            assert_eq!(
+                rider.local_orientation, 0.0,
+                "a path that installs keeps its facing for its end"
             );
+            assert!(matches!(
+                w.entity(e).get::<Spline>().expect("a path").final_facing,
+                MonsterMoveFacing::Angle(a) if a == 1.25
+            ));
             assert_eq!(
                 w.entity(e).get::<Spline>().expect("a path").deck,
                 Some(BOAT),
@@ -2802,6 +3118,7 @@ mod tests {
                         false,
                         true,
                         false,
+                        false,
                         &mut commands,
                         &index,
                         &mut transforms,
@@ -2817,6 +3134,112 @@ mod tests {
                 "a plain path takes the unit off the deck"
             );
             assert_eq!(w.entity(e).get::<Spline>().expect("a path").deck, None);
+        }
+
+        /// Runs one `monster_move` of `facing` at `start` on `e` (guid `MOB`); `duration_ms` 0
+        /// installs no path.
+        fn arrive(
+            w: &mut World,
+            start: [f32; 3],
+            facing: MonsterMoveFacing,
+            duration_ms: u32,
+            smooth: bool,
+        ) {
+            w.run_system_once(
+                move |mut commands: Commands,
+                      index: Res<GuidIndex>,
+                      mut transforms: Query<&mut Transform>,
+                      mut riders: Query<&mut crate::transport::TransportRider>| {
+                    monster_move(
+                        MOB,
+                        None,
+                        start,
+                        9,
+                        vec![start, [start[0] + 10.0, start[1], start[2]]],
+                        facing,
+                        false,
+                        duration_ms,
+                        false,
+                        true,
+                        false,
+                        smooth,
+                        &mut commands,
+                        &index,
+                        &mut transforms,
+                        &mut riders,
+                    );
+                },
+            )
+            .unwrap();
+        }
+
+        fn standing_unit(w: &mut World) -> Entity {
+            let e = w
+                .spawn((
+                    Transform::default(),
+                    NetEntity {
+                        kind: EntityKind::Unit,
+                        display_id: None,
+                        scale: 1.0,
+                    },
+                    ObjectStore::default(),
+                ))
+                .id();
+            let mut index = GuidIndex::default();
+            index.0.insert(MOB, e);
+            w.insert_resource(index);
+            e
+        }
+
+        fn yaw(w: &World, e: Entity) -> f32 {
+            let r = w.entity(e).get::<Transform>().unwrap().rotation;
+            r.to_euler(EulerRot::YXZ).0
+        }
+
+        /// A path that installs stores the facing (`0x601fee`); the unit is not turned on arrival.
+        #[test]
+        fn a_path_that_installs_does_not_turn_the_unit_on_arrival() {
+            let mut w = World::new();
+            let e = standing_unit(&mut w);
+            arrive(&mut w, [0.0; 3], MonsterMoveFacing::Angle(2.0), 3000, false);
+            assert_eq!(yaw(&w, e), 0.0);
+            assert!(w.entity(e).get::<Spline>().is_some());
+        }
+
+        /// No path (`0x60205e`): the raw facing turns now, and a smoothed unit's display follows
+        /// through the smoother rather than snapping; it is never reset.
+        #[test]
+        fn with_no_path_the_unit_turns_through_the_smoother() {
+            let mut w = World::new();
+            w.init_resource::<crate::ui_session::InteractNpc>();
+            let e = standing_unit(&mut w);
+            arrive(&mut w, [0.0; 3], MonsterMoveFacing::Angle(1.0), 0, true);
+            assert_eq!(yaw(&w, e), 0.0, "the display is not snapped");
+            w.run_system_once(crate::net::motion::drive_display_facing)
+                .unwrap();
+            assert!((yaw(&w, e) - 0.5).abs() < 1e-5, "half way: {}", yaw(&w, e));
+            for _ in 0..16 {
+                w.run_system_once(crate::net::motion::drive_display_facing)
+                    .unwrap();
+            }
+            assert!((yaw(&w, e) - 1.0).abs() < 1e-5, "settled: {}", yaw(&w, e));
+        }
+
+        /// A body the smoother does not govern shows the facing at once; a `Spot` heads from the
+        /// unit's own position (`0x6020a5`), not the packet's start.
+        #[test]
+        fn with_no_path_an_unsmoothed_body_faces_its_spot_from_where_it_stands() {
+            let mut w = World::new();
+            let e = standing_unit(&mut w);
+            arrive(
+                &mut w,
+                [5.0, 5.0, 0.0],
+                MonsterMoveFacing::Spot([0.0, 10.0, 0.0]),
+                0,
+                false,
+            );
+            let got = yaw(&w, e);
+            assert!((got - std::f32::consts::FRAC_PI_2).abs() < 1e-5, "{got}");
         }
     }
 }

@@ -25,17 +25,17 @@ pub(crate) mod glue_mgr;
 pub(crate) mod glue_scene;
 mod input;
 mod movie;
+pub(crate) mod raise_origin;
 mod records;
 /// The server alert's fetch and `LaunchURL`'s browser, for the stock glue screens.
 pub(crate) mod server_alert;
+#[cfg(test)]
+pub(crate) use input::dispatch_input_records;
 #[cfg(test)]
 pub(crate) use input::feed_keys;
 #[cfg(test)]
 pub(crate) use records::records_from_planes;
 pub(crate) use records::{collect_input_records, InputRecord, InputRecords, Record};
-// Test-only: the bindings tests run the UI's wheel sweep ahead of the dispatch pass.
-#[cfg(test)]
-pub(crate) use input::feed_wheel;
 #[cfg(test)]
 pub(crate) mod layer_tests;
 mod load_log;
@@ -172,11 +172,6 @@ impl WorldPresses {
     }
 }
 
-/// Whether the cursor carries a payload, a `Send` mirror. A click on sky with one held never
-/// deselects: the reference gates its nothing-leg `SetSelection(0,0)` on no payload (`0x492d30`).
-#[derive(Resource, Default)]
-pub(crate) struct CursorPayloadHeld(pub(crate) bool);
-
 /// What [`extract::tick_script`] hands [`extract::paint_script`]; with `live` false (no VM or
 /// window) the paint does nothing.
 #[derive(Resource, Default)]
@@ -198,7 +193,7 @@ pub(crate) struct UiPassState {
 /// is the gated sub-phase): every push this frame's tick must see, as in the reference's tick,
 /// where the packets (category 6, `0x420d55`) follow the window input and precede the frame pass's
 /// `OnUpdate`. Every VM holder in `Update` is in the frame's input records ([`UiInput`],
-/// [`crate::player::WorldMouse`], [`crate::target::WorldClicks`]), in this set or
+/// [`crate::player::WorldMouse`]), in this set or
 /// `.after(UiTick)`, as `game_plugins::schedule_tests` checks.
 #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct UiFeed;
@@ -246,6 +241,21 @@ pub(crate) struct UiClock {
     pub(crate) anchor: std::time::Instant,
     /// The VM clock after that tick, in seconds since this process started.
     pub(crate) ui_now: f64,
+}
+
+/// [`UiClock`] as the call host reads it. The system that ticks the VM lends the host and writes
+/// [`UiClock`], so the host reads this copy, made after each tick and at a new VM's seed: the last
+/// tick's pair until the next, which maps an instant onto `GetTime` the same way, as both of its
+/// legs move by the same steps.
+#[derive(Resource, Default)]
+pub(crate) struct HostClock(pub(crate) UiClock);
+
+/// The copy after the tick ([`HostClock`]).
+fn copy_host_clock(clock: Res<UiClock>, mut host: ResMut<HostClock>) {
+    host.0 = UiClock {
+        anchor: clock.anchor,
+        ui_now: clock.ui_now,
+    };
 }
 
 /// The pre-boot pair, replaced by [`lifecycle::seed_vm_clock`] at the first VM.
@@ -411,7 +421,10 @@ pub(crate) fn window_to_ui(screen: UiScreen, cursor: Vec2) -> Vec2 {
 pub(crate) struct UiScriptPlugin;
 
 /// `uiScale`'s change callback: the dial's own `[0.5, 1.5]` clamp.
-pub(crate) fn on_cvar(ev: On<crate::cvars::CvarChanged>, mut scale: ResMut<UiScaleCvar>) {
+pub(crate) fn on_cvar(
+    ev: &crate::cvars::CvarChanged,
+    mut scale: bevy::prelude::Mut<'_, UiScaleCvar>,
+) {
     if ev.is("uiScale") {
         scale.0 = ev.num().clamp(0.5, 1.5);
     }
@@ -436,7 +449,7 @@ fn console_reload_ui(steps: &mut crate::console::ConsoleSteps, _args: &str) -> V
 impl Plugin for UiScriptPlugin {
     fn build(&self, app: &mut App) {
         use crate::console::ConsoleCommandApp;
-        app.add_observer(on_cvar);
+        crate::ui_script::raise_origin::arm_each_frame(app);
         // Category 1 with no help (`0x402ba6`-`0x402bb4`).
         app.console_command_in_call(
             "reloadUI",
@@ -450,8 +463,6 @@ impl Plugin for UiScriptPlugin {
             .init_non_send_resource::<glue_mgr::SharedGlueMgr>()
             .init_resource::<UiAutoScaleCache>()
             .init_resource::<UiFrameCost>()
-            .init_resource::<crate::bindings::WheelNotches>()
-            .init_resource::<crate::bindings::WorldWheel>()
             .init_resource::<UiCostWanted>()
             .init_resource::<PointerOverUi>()
             .init_resource::<SyntheticPointer>()
@@ -467,8 +478,8 @@ impl Plugin for UiScriptPlugin {
             .init_resource::<PlayerUiClickConsumed>()
             .init_resource::<PlayerUiPressConsumed>()
             .init_resource::<WorldPresses>()
-            .init_resource::<CursorPayloadHeld>()
             .init_resource::<UiClock>()
+            .init_resource::<HostClock>()
             .init_resource::<benilla_world::frame_pace::FrameStep>()
             .init_resource::<AddOnIdentity>()
             // After `AssetSet::Open`: the VM's first load is the chain's `GlobalStrings.lua`.
@@ -543,7 +554,9 @@ impl Plugin for UiScriptPlugin {
             .configure_sets(Update, UiDrain.after(UiTick))
             .configure_sets(
                 Update,
-                UiInputViews.in_set(UiInput).before(input::feed_ui_input),
+                UiInputViews
+                    .in_set(UiInput)
+                    .before(input::dispatch_input_records),
             )
             // `GetFramerate()`'s ring, a static of the client's that no reload or logout
             // resets: the feed hands a new VM its rate before the tick, and each world frame's
@@ -576,18 +589,18 @@ impl Plugin for UiScriptPlugin {
             // In `Last`, after a look session's end has put the cursor back, so the next frame's
             // records start from where the pointer is.
             .add_systems(Last, records::note_frame_end_cursor)
+            .init_resource::<input::RecordWalk>()
             .add_systems(
                 Update,
-                (
-                    input::feed_ui_input.run_if(
+                input::dispatch_input_records
+                    .run_if(
                         in_state(crate::client_state::ClientState::InWorld).or(glue::glue_ui_up),
-                    ),
-                    input::feed_ui_wheel.run_if(
-                        in_state(crate::client_state::ClientState::InWorld).or(glue::glue_ui_up),
-                    ),
-                )
-                    .chain()
+                    )
                     .in_set(UiInput)
+                    // Exclusive, as its records' world steps run the click's legs: placed among
+                    // the hosts by hand, so the pass chains it as it did the walk.
+                    .in_set(crate::vm_pass::VmPass::Member)
+                    .after(glue::skip_unattended_startup_movie)
                     // Each record's binding runs inside its walk, between the pass's head and tail.
                     .after(crate::bindings::BindingHead)
                     .before(crate::bindings::BindingTail),
@@ -596,6 +609,7 @@ impl Plugin for UiScriptPlugin {
                 Update,
                 (
                     extract::tick_script,
+                    copy_host_clock,
                     // After the input pass's hover walk and the pump's leaves and re-pick, for the
                     // pick after the pass.
                     crate::vplates::seed_plate_hover,
@@ -608,13 +622,7 @@ impl Plugin for UiScriptPlugin {
             // A scripted run's startup movie skipped before its first tick.
             .add_systems(Update, glue::skip_unattended_startup_movie.in_set(UiInput))
             // The movie audio's play times, a feed of the tick whose clock reads them.
-            // After the tutorial's selection judge, which reads the same VM.
-            .add_systems(
-                Update,
-                movie::feed_movie_audio
-                    .in_set(UiFeed)
-                    .after(crate::tutorial::judge_selections),
-            )
+            .add_systems(Update, movie::feed_movie_audio.in_set(UiFeed))
             // The movie pictures the tick showed, ahead of the paint that draws them.
             .init_resource::<movie::MovieScreen>()
             .add_systems(
@@ -674,14 +682,15 @@ impl Plugin for UiScriptPlugin {
     }
 }
 
-/// The mouse and key feed once, for a test over the whole client: the input pass's Lua over the
-/// records the test's planes and key messages make, with the call host the world lends.
+/// The mouse and key feed once, for a test over the whole client: the input records the test's
+/// planes and key messages make, each walked and its world steps taken, with the call host the
+/// world lends.
 #[cfg(test)]
 pub(crate) fn feed_input_once(world: &mut World) {
     use bevy::ecs::system::RunSystemOnce;
     records_from_planes(world);
     world
-        .run_system_once(input::feed_ui_input)
+        .run_system_once(input::dispatch_records_alone)
         .expect("the input feeds");
 }
 
@@ -724,7 +733,7 @@ pub(crate) use sweep::test_support as sweep_test;
 #[cfg(test)]
 pub(crate) use sweep::WorldLeaveSweep;
 pub(crate) use sweep::{
-    run_leave_world_sweep, sweep_on_worldport, LeavingWorldArmed, SweepApp, SweepLeg, SweptWorlds,
+    add_worldport_sweep, run_leave_world_sweep, LeavingWorldArmed, SweepApp, SweepLeg, SweptWorlds,
 };
 #[cfg(test)]
 mod sweep_tests;
@@ -759,8 +768,15 @@ fn record_world_frame_time(
     times.0.push(step.delta.as_secs_f32());
 }
 
+/// The demo's stances, Battle, Defensive and Berserker, which a UI capture's known spells list
+/// (`crate::capture`) and [`demo_unit_feed`] seeds the entries of.
+pub(crate) const DEMO_STANCES: [u32; 3] = [2457, 71, 2458];
+
 /// Synthetic player and target snapshots for a server-less UI capture, and its first events once.
-fn demo_unit_feed(mut hosted_vm: crate::script_calls::HostedVm, mut fired: Local<VmMemo<bool>>) {
+pub(crate) fn demo_unit_feed(
+    mut hosted_vm: crate::script_calls::HostedVm,
+    mut fired: Local<VmMemo<bool>>,
+) {
     hosted_vm.run(|script| {
         /// The synthetic target's guid: a creature high part; only its distinctness matters.
         const DEMO_TARGET_GUID: u64 = 0xF130_0000_0000_0001;
@@ -821,21 +837,10 @@ fn demo_unit_feed(mut hosted_vm: crate::script_calls::HostedVm, mut fired: Local
                 sex: 0,
                 // The tooltip's level line reads "Level 3 Beast".
                 creature_type_name: Some("Beast".into()),
-                // `GetComboPoints` reports only points banked on the current target's guid.
                 guid: DEMO_TARGET_GUID,
                 ..Default::default()
             }),
         );
-        // The combo dots need a rogue and banked points, seeded only for `ui-combopoints`.
-        if std::env::var("WOW_CAPTURE").as_deref() == Ok("ui-combopoints") {
-            script.set_player_req_state(benilla_ui::script::PlayerReqState {
-                level: 12,
-                class_id: 4, // rogue
-                ..Default::default()
-            });
-            script.set_combo_points(4, DEMO_TARGET_GUID);
-            script.fire_event("PLAYER_COMBO_POINTS", vec![]);
-        }
         if !*fired {
             // Battle-stance page slots (actions 73..); slot 80 is a consumable stack of 5, since
             // stock `ActionButton_UpdateCount` shows only a consumable's count
@@ -916,8 +921,9 @@ fn demo_unit_feed(mut hosted_vm: crate::script_calls::HostedVm, mut fired: Local
                     }),
                 );
             }
-            // The stance bar: battle active (bonus offset 1), defensive uncastable, berserker
-            // cooling.
+            // The stance bar's entries, which its getters read with no player held, for the
+            // [`DEMO_STANCES`] the known spells list: battle active (bonus offset 1), defensive
+            // uncastable, berserker cooling.
             script.set_shapeshift_forms(vec![
                 benilla_ui::script::ShapeshiftFormView {
                     spell_id: 2457,
@@ -1131,7 +1137,7 @@ mod surface_gate;
 
 /// The reader of every fire site, for the event gates.
 #[cfg(test)]
-mod fire_scan;
+pub(crate) mod fire_scan;
 
 /// The event argument-shape gate: every fire site against `reference/event_args.tsv`.
 #[cfg(test)]

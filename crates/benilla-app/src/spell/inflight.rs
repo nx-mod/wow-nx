@@ -432,10 +432,31 @@ pub(crate) struct SelfCancel<'w> {
     ground: ResMut<'w, super::targeting::SpellTargeting>,
 }
 
+/// `0x495920`, the drop that losing control (`0x495901`) and a world port (`0x40194c`) both make:
+/// `ClearCursor(1, 1)` (`0x495927`), signalled with the host lent, then `CancelCast(1, 1, 0x1c)`
+/// (`0x49592c`-`0x495932`), which `cancel` runs on the cast state of `P`.
+pub(crate) fn drop_hold<P: bevy::ecs::system::SystemParam + 'static>(
+    vm: &mut crate::script_calls::VmWith<'_, '_, P>,
+    cancel: impl FnOnce(bevy::ecs::system::SystemParamItem<'_, '_, P>),
+) {
+    vm.run(|script| {
+        if let Some(script) = script {
+            script.clear_cursor_payload();
+        }
+    });
+    cancel(vm.own());
+}
+
 impl SelfCancel<'_> {
     /// `SpellStopCasting()` (`0x6e6e80`), the ESC chain's cast rung.
     pub(crate) fn stop_casting(&mut self) {
         self.cancel(true, false, false);
+    }
+
+    /// A movement command's cancel inside its call (`0x51512a`, `0x515193`, `Script::Jump`'s
+    /// `0x513c43`); `mover_is_player` gates the channel's.
+    pub(crate) fn cancel_for_move(&mut self, mover_is_player: bool) {
+        self.cancel(false, true, mover_is_player);
     }
 
     /// `CancelCast(1, 1, 0x1c)` (`0x6e4940`) as `UseSoulstone`'s item leg calls it (`0x48ae6b`),
@@ -809,7 +830,6 @@ mod tests {
                 .add_message::<crate::net::FieldChanged>()
                 .init_resource::<CastReports>()
                 .init_resource::<crate::items::Items>()
-                .init_resource::<crate::ui_action::CastFailRedisplays>()
                 .init_resource::<crate::ui_chat::ChatLog>()
                 .init_resource::<crate::sound::MessageSounds>()
                 .init_resource::<PendingCast>()
@@ -878,22 +898,39 @@ mod tests {
             crate::creature_anim::apply_unit_edits(app.world_mut());
         }
 
-        /// `SpellStopCasting()`, its answer, with the cast's cancel lent as the host, which applies
+        /// `SpellStopCasting()`, its answer, with the world lent as the host: its test reads the
+        /// cast state at the call ([`crate::ui_cast::CastLive`]), and the cast's cancel applies
         /// the call inside the verb as `crate::script_calls` does.
         fn stop_casting(app: &mut App) -> Option<i64> {
-            app.world_mut()
-                .run_system_once(|mut script: NonSendMut<UiScript>, mut cancel: SelfCancel| {
-                    let mut host = crate::script_calls::FnHost(|_: &mut UiScript, call| {
-                        if call == ScriptCall::SpellStopCasting {
-                            cancel.stop_casting();
-                        }
-                    });
-                    script.hosted(&mut host, |s| {
-                        s.eval::<Option<i64>>("return SpellStopCasting()")
-                    })
-                })
-                .unwrap()
-                .unwrap()
+            use crate::script_calls::live::LiveFamily;
+            use benilla_ui::script::{CallHost, CallTail};
+            use bevy::ecs::system::SystemState;
+
+            struct Host<'a>(&'a mut World);
+
+            impl CallHost for Host<'_> {
+                fn apply(&mut self, _: &mut UiScript, call: ScriptCall) -> Option<CallTail> {
+                    if call == ScriptCall::SpellStopCasting {
+                        let mut cancel = SystemState::<SelfCancel>::new(self.0);
+                        cancel.get_mut(self.0).stop_casting();
+                        cancel.apply(self.0);
+                    }
+                    None
+                }
+
+                fn read_live(&mut self, ask: &mut benilla_ui::script::live::LiveAsk<'_>) -> bool {
+                    let mut live = SystemState::<crate::ui_cast::CastLive>::new(self.0);
+                    live.get(self.0).answer(ask)
+                }
+            }
+
+            let world = app.world_mut();
+            let mut script = world.remove_non_send_resource::<UiScript>().expect("a VM");
+            let answer = script.hosted(&mut Host(world), |s| {
+                s.eval::<Option<i64>>("return SpellStopCasting()")
+            });
+            world.insert_non_send_resource(script);
+            answer.unwrap()
         }
 
         #[test]

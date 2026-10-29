@@ -17,15 +17,18 @@ mod action;
 mod action_bar_toggles;
 mod addon_message;
 mod auction;
+mod auction_live;
 mod aura;
 mod backdrop;
 mod bank;
+mod battlefield_live;
 mod battlefield_positions;
 mod battlefield_queue;
 mod battlefield_score;
 mod bind_confirm;
 mod binder;
 pub(crate) mod binding_abi;
+mod dialog_live;
 mod dialog_verbs;
 mod tutorial;
 mod worldmap_arrow;
@@ -57,6 +60,7 @@ pub(crate) use editbox::{
     adopt_text_region, apply_xml_bytes, editbox_text_region_wrapper, set_history_lines,
     set_selection_color,
 };
+pub(crate) use messageframe::set_xml_bytes as set_message_xml_bytes;
 pub(crate) use messageframe::set_xml_insets as set_message_xml_insets;
 pub(crate) use tooltip::post_load as tooltip_post_load;
 pub(crate) mod addon;
@@ -77,6 +81,7 @@ mod follow;
 pub(crate) mod font;
 mod font_block;
 mod frame_enum;
+pub mod origin;
 mod roster_read;
 pub use char_name::{check_char_name, NameCharsets, NameLists, NoNameLists, CHAR_NAME_SUCCESS};
 mod glue;
@@ -108,6 +113,7 @@ mod gossip;
 mod guild;
 mod guild_read;
 mod handler_prof;
+mod held;
 mod host;
 mod hyperlink;
 mod lfg;
@@ -131,6 +137,7 @@ mod keyboard;
 mod layer_batch;
 mod lock_check;
 mod protected;
+mod requirements;
 mod stat_read;
 pub(crate) mod taint;
 pub(crate) mod texel;
@@ -173,6 +180,7 @@ pub(crate) mod region;
 mod region_map;
 mod reputation;
 mod saved;
+mod script_map;
 mod scrollframe;
 mod session;
 mod shapeshift;
@@ -181,6 +189,7 @@ mod skills;
 mod slash;
 mod slider;
 mod social;
+mod social_read;
 mod sound;
 mod spellbook;
 mod stable;
@@ -188,6 +197,10 @@ mod statusbar;
 mod stdlib;
 /// An mlua error's bare Lua message, the one value the error handler is called with.
 pub use stdlib::lua_message;
+pub(crate) use stdlib::{
+    call_global_under_error_function, execute_buffer, execute_buffer_reported,
+    run_under_error_function,
+};
 mod summon;
 mod talent;
 mod taxi;
@@ -221,8 +234,9 @@ pub(crate) mod xml_layout;
 mod zone_text;
 
 pub use action::{
-    macro_slot_id, macro_slot_word, ActionBarCall, ActionSlot, ActionState, ActionUse, CastView,
-    OpenProfessions, Profession, WearsItem,
+    macro_slot_id, macro_slot_word, ActionAttackFaceNow, ActionBarCall, ActionConsumableNow,
+    ActionCountNow, ActionSlot, ActionState, ActionStateNow, ActionTextureNow, ActionUsableNow,
+    ActionUse, CastView, CastViewNow, OpenProfessions, Profession, WearsItem,
 };
 pub use addon::{addon_load_context, AddOnInfo, AddonLoad, AddonReply, AddonSecurity};
 pub use addon_enable::{AddonStateFiles, EnableHash, EnableStore};
@@ -233,11 +247,18 @@ pub use auction::{
     AuctionStartRequest, AuctionState, AuctionSubCategory, BidVerdict, BIDDER, LIST, OWNER,
     SORT_KEYS,
 };
+pub use auction_live::{AuctionCanQuery, AuctionDepositRate, AuctionRowQuery};
 pub use aura::{
     AuraCall, AuraListRead, AuraRead, AuraState, PlayerBuffExpiry, TrackingState, UnitAuraList,
 };
 pub use backdrop::{Backdrop, Insets};
-pub use bank::{BankCall, BankState};
+pub use bank::{BankCall, BankSlotsQuery, BankState};
+pub use battlefield_live::{
+    BattlefieldFlagQuery, BattlefieldIconScaleQuery, BattlefieldListQuery,
+    BattlefieldPositionCountQuery, BattlefieldPositionQuery, BattlefieldScoreRead,
+    BattlefieldScoreRowQuery, BattlefieldScoreSummary, BattlefieldScoreSummaryQuery,
+    BattlefieldSlotQuery, BattlefieldStatColumnQuery, BattlefieldTimes, BattlefieldTimesQuery,
+};
 pub use battlefield_positions::{BattlefieldFlagView, BattlefieldPositionView};
 pub use battlefield_queue::{
     BattlefieldCall, BattlefieldListView, BattlefieldMapInfo, BattlefieldQueueSlot,
@@ -245,21 +266,25 @@ pub use battlefield_queue::{
 pub use battlefield_score::{BattlefieldScoreRow, BattlefieldScores, BattlefieldStatColumn};
 pub use bind_confirm::PendingEquipAnswer;
 pub use binder::BinderCall;
-pub use binding_abi::{ftol, s_str_to_float, s_str_to_int};
+pub use binding_abi::{ftol, record_float, s_str_to_float, s_str_to_int};
 pub use calls::{spell_owner, ItemCallback, NearestMode, QueuedCall, RecordAsk, ScriptCall};
 pub use camera_view::{CameraViewRequest, CAMERA_VIEW_COUNT};
-pub use channel::{ChannelCommand, JoinedChannel, RecruitmentPlan, ZoneChannelRow};
+pub use channel::{
+    channel_send_target, ChannelCommand, JoinedChannel, JoinedChannelsQuery, RecruitmentPlan,
+    ZoneChannelRow,
+};
 pub use char_stats::{
-    weapon_subclass_skill, BankBagSlots, InvSlotView, InventorySlots, BANK_BAG_SLOT_COUNT,
-    INVENTORY_SLOT_COUNT, SKILL_DEFENSE, SKILL_UNARMED,
+    weapon_subclass_skill, AlertInputs, AlertItem, BankBagSlots, InvSlotView, InventoryAlertInputs,
+    InventorySlots, BANK_BAG_SLOT_COUNT, INVENTORY_SLOT_COUNT, SKILL_DEFENSE, SKILL_UNARMED,
 };
 pub use chat_misc::EmoteRequest;
 pub use chat_send::{
-    expand_target_tokens, validate_escapes, ChatGroup, ChatSend, InvalidEscape, INVALID_ESCAPE,
-    SEND_CHAT_TOKENS,
+    expand_target_tokens, validate_escapes, ChatGroup, ChatSend, DefaultLanguageQuery,
+    InvalidEscape, KnownLanguagesQuery, INVALID_ESCAPE, SEND_CHAT_TOKENS,
 };
 pub use chat_types::ChatTypeColor;
 pub use chat_window::{message_group_index, ChatWindowLook, MESSAGE_GROUPS};
+pub use clock::GameTimeQuery;
 pub use console_exec::s_str_tokenize;
 pub use console_exec::{console_word, cvar_name_arg, no_such_cvar, set_args};
 pub use container::{
@@ -267,26 +292,30 @@ pub use container::{
     PendingWrap, PetitionSlotView, RandomPropertyView, UiCursorMode, UseArm, UseFork,
 };
 pub use cooldown_read::{CooldownQuery, CooldownTriple};
-pub use craft::{CraftCall, CraftDifficulty, CraftReagent, CraftRecipe, CraftState, CraftTooltip};
+pub use craft::{
+    CraftBookQuery, CraftCall, CraftDifficulty, CraftDisplayLineQuery, CraftNameQuery,
+    CraftReagent, CraftRecipe, CraftRecipeQuery, CraftState, CraftTooltip,
+};
 pub use cursor::equip::{AutoEquip, BIND_WHEN_EQUIPPED};
 pub use cursor::money::coin_icon;
 pub use cursor::swap::Swap;
 pub use cursor::{
-    CursorAction, CursorItem, CursorMacro, CursorMerchantItem, CursorMoney, CursorPayload,
-    CursorPetAction, CursorSpell, CursorStablePet, EnchantAnswer, EnchantConfirm, HeldCursor,
-    ItemPick, WorldPick, EQUIPMENT_BAG,
+    CursorAction, CursorAmmo, CursorItem, CursorMacro, CursorMerchantItem, CursorMoney,
+    CursorPayload, CursorPetAction, CursorSpell, CursorStablePet, EnchantAnswer, EnchantConfirm,
+    HeldCursor, ItemPick, TargetingWants, TargetingWantsQuery, WorldPick, EQUIPMENT_BAG,
+};
+pub use cvar_checks::{
+    check_anisotropic, check_dist_cull, check_error_filter, check_error_level_max,
+    check_error_level_min, check_ffx_echo, check_footstep_bias, check_horizon_farclip,
+    check_lod_dist, check_map_obj_light_lod, check_max_lights, check_particle_density,
+    check_shadow_bias, check_target_nearest_distance, check_texture_lod_dist, check_unit_draw_dist,
+    check_water_lod, check_weather_density, scanf_f_prefix,
 };
 pub use cvar_checks::{
     check_base_mip, check_camera_decay, check_camera_distance_max, check_camera_pitch,
     check_camera_rate, check_camera_smooth_style, check_camera_time, check_camera_view,
     check_camera_yaw, check_farclip, check_frill_density, check_refresh, check_shadow_level,
     check_small_cull, check_tex_lod_bias, check_triple_buffer, CvarCheck, CvarRows, CvarVerdict,
-};
-pub use cvar_checks::{
-    check_dist_cull, check_error_filter, check_ffx_echo, check_footstep_bias,
-    check_horizon_farclip, check_lod_dist, check_map_obj_light_lod, check_max_lights,
-    check_particle_density, check_shadow_bias, check_target_nearest_distance,
-    check_texture_lod_dist, check_unit_draw_dist, check_water_lod, scanf_f_prefix,
 };
 pub use cvars::small_cull_text;
 pub use cvars::{
@@ -295,21 +324,30 @@ pub use cvars::{
     CVAR_WORLD_DETAIL, IN_WORLD_READ_ONLY_CVARS, LUA_CVAR_LIMIT, VIDEO_DEFAULT_CVARS,
     WORLD_DETAIL_STOPS,
 };
-pub use death::{DeathAction, DeathUiState};
+pub use death::{DeathAction, DeathQuery, DeathUiState, ResSicknessLevelQuery};
+pub use dialog_live::{
+    meeting_stone_text, AreaSpiritHealerSecsQuery, BinderPendingQuery, CanResetInstancesQuery,
+    InstanceBootSecsQuery, InstanceTypeQuery, MeetingStoneQuery, MeetingStoneStatus,
+    MeetingStoneText, PetUntrainerPendingQuery, SummonConfirmQuery,
+};
 pub use dialog_verbs::MeetingStoneCall;
 pub use dressup::DressUpIntent;
 pub use duel::DuelRequest;
 pub use follow::FollowRequest;
 pub use gm_survey::{GmSurveyTables, SurveyAnswerSend};
 pub use gm_ticket::{GmTicketCall, GmTicketIntent, GmTicketWrite};
-pub use gossip::{GossipCall, GossipMenu, GossipOptionView, GossipQuestRow};
+pub use gossip::{GossipCall, GossipMenu, GossipOptionView, GossipQuery, GossipQuestRow};
 pub use guild::{
     GuildCall, GuildCells, GuildMemberInfo, GuildRankEdit, GuildRankInfo, GuildState, LastOnline,
     UnitGuild, MAX_RANKS, MIN_RANKS, RANK_RIGHT_BITS,
 };
 pub use guild_read::{GuildAnswer, GuildRead, OwnGuild, UnitGuildRead};
-pub use host::{CallHost, CallTail, Deferring};
-pub use input_verbs::{BindingInput, FiredInput, HeldInput, LookCall, PostureCall, ViewAxis};
+pub use held::{BagGuidQuery, BagHead, BagItemsQuery, BagQuery, BagSlotQuery, HasKeyQuery};
+pub use host::{CallHost, CallTail, Deferring, LiveReader};
+pub use input_verbs::{
+    BindingInput, ClickCall, ClickMode, ClickPress, FiredInput, HeldInput, LookCall, PostureCall,
+    ViewAxis,
+};
 pub use item_calls::ItemCall;
 pub use item_read::{ItemInfoFields, ItemKey, ItemRead, ItemRoll};
 pub use lfg::LfgDungeon;
@@ -320,45 +358,55 @@ pub use movieframe::{
     MovieReader,
 };
 pub use petition::{
-    validate_guild_name, PetitionCall, PetitionRecordView, PetitionState, PETITION_TYPE_CHARTER,
-    PETITION_TYPE_PETITION,
+    validate_guild_name, PetitionCall, PetitionQuery, PetitionRecordView, PetitionState,
+    PETITION_TYPE_CHARTER, PETITION_TYPE_PETITION,
 };
 pub use protected::InputEvents;
 pub use roster_read::{
-    GroupCells, GroupCellsQuery, GroupRow, MemberOrPetQuery, MemberQuery, Membership, RaidRowQuery,
-    RosterName, RosterNames, RosterNamesQuery, RowQuery,
+    GroupCells, GroupCellsQuery, GroupRow, GroupRows, GroupRowsQuery, MemberOrPetQuery,
+    MemberQuery, Membership, RaidRowQuery, RosterName, RosterNames, RosterNamesQuery, RowQuery,
 };
 pub use stat_read::{CombatRead, NoPlayer, SelfRead, UnitCombatStats};
 pub use tabard::{
-    emblem_mask_path, TabardCall, TabardHost, EMBLEM_MASK_TOKEN, TABARD_COUNTS,
+    emblem_mask_path, TabardCall, TabardHost, TabardHostQuery, EMBLEM_MASK_TOKEN, TABARD_COUNTS,
     TABARD_CREATION_COST,
 };
 pub use video_pairs::VIDEO_PAIR_CVARS;
 pub use worldmap_arrow::ARROW_MODEL;
 
 pub(crate) use button::{refresh_label_lua, state_font_lua, LabelFont};
-pub(crate) use font_block::{face_loads, own_font_lua, SAME_FONT_HEIGHT};
-pub use inspect::{InspectCall, UnitReach};
+pub(crate) use font_block::{face_loads, font_size_loads, own_font_lua, SAME_FONT_HEIGHT};
+pub use inspect::{InspectCall, UnitReach, UnitReachQuery, VisibleSlotQuery};
 pub use instance::InstanceCall;
 pub use item_stats::{
-    item_usable, ItemRecipe, ItemSetView, ItemSpellLine, ItemTemplateView, PlayerReqState,
-    TaughtSpell,
+    item_usable, ItemRecipe, ItemSetQuery, ItemSetView, ItemSpellLine, ItemTemplateView,
+    LiveItemSet, PlayerReqState, TaughtSpell,
 };
-pub use item_text::{ItemTextCall, ItemTextState};
+pub use item_text::{ItemTextCall, ItemTextCreator, ItemTextQuery, ItemTextState, ItemTextView};
 pub use layout_cache::{AnchorLayout, FrameLayout, LayoutPoint};
-pub use lock_check::{check_lock, LockCheck, LockOpener, LockOpeners, LockSlotView};
-pub use loot::{LootCall, LootRow, LootState, LOOT_PORTRAIT_UNIT};
-pub use loot_roll::{LootRollCall, LootRollEntry, LootRollsState};
+pub use lock_check::{
+    check_lock, LockCheck, LockOpener, LockOpeners, LockOpenersQuery, LockSlotView,
+};
+pub use loot::{
+    LootCall, LootRow, LootSlotQuery, LootState, LootWindow, LootWindowQuery, MasterLootCandidate,
+    MasterLootCandidateQuery, LOOT_PORTRAIT_UNIT,
+};
+pub use loot_roll::{LootRollCall, LootRollEntry, LootRollQuery, LootRollsState};
 pub use macros::{
-    macro_lines, MacroBinding, MacroDerives, MacroState, MacroView, CHARACTER_ID_BASE, MAX_MACROS,
+    macro_lines, MacroBinding, MacroState, MacroView, CHARACTER_ID_BASE, MAX_MACROS,
     MAX_MACRO_BODY, MAX_MACRO_NAME,
 };
 pub use mail::{
-    MailCall, MailInboxRow, MailInvoice, MailRowVerb, MailSendRequest, MailState, PackageView,
-    StationeryView,
+    MailBox, MailBoxQuery, MailCall, MailInboxRow, MailInvoice, MailLookup, MailRowQuery,
+    MailRowVerb, MailSendRequest, MailState, NewMailQuery, PackageQuery, PackageView,
+    StationeryQuery, StationeryTextureQuery, StationeryView, MAIL_ROW_STRINGS,
 };
 pub use measure::TextMeasure;
-pub use merchant::{ItemStatsHead, MerchantCall, MerchantItem, MerchantState, RepairCosts};
+pub use merchant::{
+    BuybackRowQuery, ItemRepairCostQuery, ItemStatsHead, MerchantCall, MerchantHead,
+    MerchantHeadQuery, MerchantItem, MerchantRowQuery, MerchantState, RepairAllCostQuery,
+    RepairCostQuery, RepairCosts,
+};
 pub(crate) use minimap::apply_model_attrs as apply_minimap_model_attrs;
 pub use minimap::{
     MinimapCall, MinimapRimArrow, CORPSE_ARROW as MINIMAP_CORPSE_ARROW,
@@ -373,16 +421,24 @@ pub use model::{
 pub use party::{
     PartyMemberInfo, PartyRequest, PartyState, RaidMemberInfo, ReadyCheckState, SavedInstanceInfo,
 };
-pub use pet::{PetActionView, PetCall, PetStats, PET_DISMISS_WORD};
-pub use pvp::{
-    decorated_name, pvp_name_global_keys, HonorState, InspectHonorData, PvpCall, RankTitle,
+pub use pet::{
+    PetActionView, PetBarFlags, PetBarFlagsView, PetBookNow, PetCall, PetMenuNow, PetSlot,
+    PetSlots, PetStats, PetStatsNow, PET_DISMISS_WORD,
 };
-pub use quest::{QuestCall, QuestItemView, QuestPanel, QuestRewardSpell, QuestSelect, QuestState};
+pub use pvp::{
+    decorated_name, pvp_name_global_keys, HonorNow, HonorState, InspectHonorData, InspectHonorNow,
+    InspectHonorSlot, PvpCall, RankTitle,
+};
+pub use quest::{
+    QuestCall, QuestGiverQuery, QuestItemView, QuestPanel, QuestRewardSpell, QuestSelect,
+    QuestState,
+};
 pub use quest_live::{
-    QuestClock, QuestClockRead, QuestCoinage, QuestHeld, QuestSlots, QuestStanding,
+    QuestClock, QuestClockRead, QuestCoinage, QuestCreatureName, QuestHeld, QuestObjectName,
+    QuestPlayer, QuestSlots, QuestStanding, QuestText,
 };
 pub use quest_log::{
-    QuestLogCarry, QuestObjectiveView, QuestRecordView, QuestSlotView, QUEST_LOG_SLOTS,
+    QuestBlip, QuestLogCarry, QuestObjectiveView, QuestRecordView, QuestSlotView, QUEST_LOG_SLOTS,
 };
 pub(crate) use region::{
     apply_texture_name, apply_wrap_attrs, implicit_creation_anchor_lua, install_loaded_texture,
@@ -393,51 +449,71 @@ pub use reputation::{
     Book, FactionEntry, FactionQuery, FactionRead, ReputationBook, ReputationCall,
     ReputationListOp, ReputationState,
 };
+pub use requirements::{
+    DualWieldQuery, KnowsSpellQuery, ProficiencyQuery, RepRankQuery, ReqHead, ReqHeadQuery,
+    ReqRead, ReqSkillQuery, SkinningQuery,
+};
 pub use session::SessionRequest;
-pub use shapeshift::ShapeshiftFormView;
+pub use shapeshift::{ShapeshiftForm, ShapeshiftFormView, ShapeshiftList};
 pub(crate) use simplehtml::{
     element_fonts_lua as simplehtml_element_fonts_lua,
     element_of_xml_tag as simplehtml_element_of_xml_tag,
 };
-pub use skills::{SkillCall, SkillEntry, SkillsState};
+pub use skills::{SkillCall, SkillEntry, SkillLinesNow, SkillSlotWords, SkillWords, SkillsState};
 pub use social::{FriendInfo, IgnoreInfo, SocialCall, SocialState, WhoInfo};
+pub use social_read::{SocialAnswer, SocialRead};
 pub use sound::{MusicRequest, SoundRequest};
 pub use spellbook::{
-    resolve_spell_in_books, NamedSpell, PetBookState, SpellBookState, SpellSlotView, SpellTabName,
-    SpellTabView,
+    resolve_spell_in_books, BookNow, BookSlot, BookSpell, BookTabs, NamedSpell, PetBookState,
+    SpellBookState, SpellCanTargetQuery, SpellSlotView, SpellTabName, SpellTabView,
 };
-pub use stable::{StableCall, StableIntent, StablePetSlot, StableState, NUM_STABLE_SLOTS};
+pub use stable::{
+    StableCall, StableIntent, StablePetSlot, StableQuery, StableState, StableView, NUM_STABLE_SLOTS,
+};
 pub use summon::{SummonCall, SummonConfirmUiState};
 pub use talent::{
-    TalentCall, TalentPrereqView, TalentReq, TalentTabView, TalentUiState, TalentView,
+    CharacterPoints, TalentAt, TalentCall, TalentCount, TalentMasterPending, TalentPrereqView,
+    TalentReq, TalentTabView, TalentTabs, TalentUiState, TalentView,
 };
-pub use taxi::{TaxiCall, TaxiNodeType, TaxiUiNode, TaxiUiState};
-pub use tooltip_aura::{AuraKey, AuraTooltipView};
-pub use tooltip_spell::{ReputationRequirement, SpellTooltipView};
+pub use taxi::{
+    TaxiCall, TaxiMapHead, TaxiMapQuery, TaxiNodeQuery, TaxiNodeType, TaxiUiNode, TaxiUiState,
+};
+pub use tooltip_aura::{AuraKey, AuraTooltipView, AuraViewQuery};
+pub use tooltip_item::SpellCastUiQuery;
+pub use tooltip_spell::{ReputationRequirement, SpellTooltipView, SpellViewQuery};
 pub use tooltip_text::{KeyedArg, TextPart, TooltipText};
-pub use trade::{TradeCall, TradeOpenItem, TradeSideState, TradeSlotItem, TradeState, TRADE_SLOTS};
+pub use trade::{
+    TradeCall, TradeMoney, TradeMoneyQuery, TradeOpenItem, TradeSideState, TradeSlotItem,
+    TradeSlotQuery, TradeState, TRADE_SLOTS,
+};
 pub use tradeskill::{
-    TradeSkillCall, TradeSkillDifficulty, TradeSkillReagent, TradeSkillRecipe, TradeSkillState,
+    TradeSkillBookQuery, TradeSkillCall, TradeSkillDifficulty, TradeSkillLineQuery,
+    TradeSkillReagent, TradeSkillRecipe, TradeSkillRecipeQuery, TradeSkillState,
 };
 pub use trainer::{
     ProductWait, TrainerAbilityReq, TrainerCall, TrainerGroup, TrainerService,
-    TrainerServiceCategory, TrainerSkillReq, TrainerState, TrainerTooltip, TRAINER_GROUP_KNOWN,
+    TrainerServiceCategory, TrainerServiceLive, TrainerServiceQuery, TrainerSkillReq, TrainerState,
+    TrainerTooltip, TRAINER_GROUP_KNOWN,
 };
-pub use tutorial::TutorialCall;
+pub use tutorial::{TutorialCall, TutorialsEnabledQuery};
 pub(crate) use types::{monochrome_flag, FontMask, MeasuredText, RegionData};
 pub use types::{
     BlendMode, EditAction, EditBoxAdvanceRequest, EditBoxTextUi, EditOutcome, EditUnit,
     ExtractedQuad, FontObject, FontShadow, Gradient, JustifyH, JustifyV, LineMeasureRequest,
     MeasureRequest, Outline, QuadContent, ScriptValue, TexCoords, TextShadow,
 };
-pub use unit::by_name::{self, NameCandidate, SeatedSelection};
+pub use unit::by_name::{
+    self, HeldCandidatesQuery, LiveCandidate, LiveCandidates, NameCandidate, SeatedSelection,
+};
 pub use unit::{
     grey_band, level_reads_unknown, parse_unit_token, power_token, resolve_unit_in, unit_is_grey,
-    ObjectNameQuery, PlayerNameQuery, PlayerRecord, SelectionGlobals, SelectionQuery,
-    SelectionRequest, UnitBase, UnitGuids, UnitIdentityRead, UnitObject, UnitObjectRead,
-    UnitRecord, UnitRecordQuery, UnitRelations, UnitState, UnitTokenGlobals, UnitTokenObjects,
+    ObjectNameQuery, PlayerNameQuery, PlayerRecord, RelationAnswer, RelationQuery,
+    SelectionGlobals, SelectionQuery, SelectionRequest, UnitBase, UnitGuids, UnitHeld,
+    UnitHeldQuery, UnitIdentityRead, UnitObject, UnitObjectRead, UnitRecord, UnitRecordQuery,
+    UnitRelations, UnitState, UnitStateAnswer, UnitStateQuery, UnitTokenGlobals, UnitTokenObjects,
     UnitTokenParse,
 };
+pub use use_gates::ControlBypassQuery;
 pub use weapon_enchant::WeaponEnchant;
 pub use who_sort::{WhoSortChain, WhoSortKey};
 pub use worldmap::{
@@ -445,8 +521,8 @@ pub use worldmap::{
     WorldMapOverlayView, WorldMapSheetRow, WorldMapState, WorldMapZoneView,
 };
 pub use worldstate::WorldStateUiView;
-pub use worn_display::WornDisplay;
-pub use zone_text::{ZonePvp, ZoneTexts};
+pub use worn_display::{WornDisplay, WornDisplaySet};
+pub use zone_text::{PlayerFactionMasksQuery, ZonePvp, ZoneTexts};
 
 use mlua::Lua;
 
@@ -573,92 +649,12 @@ pub(crate) fn ping_args(token: &str, a: f64, b: f64) -> Vec<ScriptValue> {
 /// which a top-level `SetPoint` without `relativeTo` anchors to; frame ids, from 1, are the rest.
 pub const SCREEN: crate::layout::Handle = 0;
 
-/// The FrameScript handler kinds `SetScript` accepts, each only with the code that fires it
-/// ([`crate::script::object::events_regions::set_script`]). The list is flat, where the reference
-/// resolves names per widget type (base map `0x76a0d0` plus the type's own; a `<Frame>` has no
-/// `OnClick`), so any widget accepts any kind here.
-///
-/// `OnValueChanged` is the StatusBar's (`+0x32c`) and the Slider's (`+0x330`) own slot; the
-/// ScrollFrame's three scroll kinds are `+0x32c`/`+0x334`/`+0x33c` (script-name map `0x786c40`).
-/// The EditBox's vtable (`0x81c910`) replaces the key and char slots: an EditBox never fires
-/// `OnKeyDown`, and fires `OnChar` only from `Insert`, with the inserted text (`0x77c13c`).
-const SCRIPT_KINDS: [&str; 46] = [
-    "OnLoad",
-    "OnEvent",
-    "OnUpdate",
-    // The model pane's two: `OnUpdateModel` from its paint in the draw pass
-    // (`paint_model_panes`), `OnAnimFinished` from its clock advance in the update walk
-    // (`advance_pane`) when the armed sequence completes.
-    "OnUpdateModel",
-    "OnAnimFinished",
-    "OnShow",
-    "OnHide",
-    "OnClick",
-    "OnEnter",
-    "OnLeave",
-    "OnMouseDown",
-    "OnMouseUp",
-    "OnMouseWheel",
-    "OnValueChanged",
-    "OnEnterPressed",
-    "OnEscapePressed",
-    "OnSpacePressed",
-    "OnTabPressed",
-    "OnTextChanged",
-    "OnTextSet",
-    // The caret leg's own (`0x77da80`), fired by the box's flush on dirty bit 2, which a caret
-    // move, an edit, a focus change and a re-seat raise: the edge `ScrollingEdit_OnCursorChanged`
-    // scrolls a multiline box by.
-    "OnCursorChanged",
-    "OnEditFocusGained",
-    "OnEditFocusLost",
-    // The EditBox's input-method slot (script map `0x77a310`, `0x77a40d`, `+0x430`), fired only
-    // when an input-method event changes the box's language (`0x77abb0`, stored at `0x77abf2`).
-    // benilla has no input method, so it is stored and never runs, as on a western layout.
-    "OnInputLanguageChanged",
-    "OnHorizontalScroll",
-    "OnVerticalScroll",
-    "OnScrollRangeChanged",
-    "OnDragStart",
-    "OnDragStop",
-    "OnReceiveDrag",
-    // A text frame's hyperlink button hands it these ([`hyperlink`]): the click as
-    // `OnHyperlinkClick(link, text, button)`, which `ChatFrameTemplate` passes to `SetItemRef`
-    // (`ChatFrame.xml:15`, `ChatFrame.lua:1534`), and the enter and leave with the link alone.
-    "OnHyperlinkClick",
-    "OnHyperlinkEnter",
-    "OnHyperlinkLeave",
-    // The ScrollingMessageFrame's own (script map `0x787d90`, `+0x3bc`), fired by a relayout that
-    // moved its anchor (`0x788a9a`).
-    "OnMessageScrollChanged",
-    // The GameTooltip's engine-fired scripts: money render, money clear and world-hover default
-    // placement, all three wired by the stock template (`GameTooltipTemplate.xml:617-625`).
-    "OnTooltipAddMoney",
-    "OnTooltipCleared",
-    "OnTooltipSetDefaultAnchor",
-    // The ColorSelect's own slot (script map `0x78b4f0`, `+0x338`), fired by its `SetColorRGB`.
-    "OnColorSelect",
-    // The Button/CheckButton double click (script map `0x778c50`, `+0x4d4`), fired by
-    // [`pointer`]'s release edge in place of the second `OnClick` within 300 ms (`0x77937b`).
-    "OnDoubleClick",
-    // The layout event (base map `0x76a0d0`, `+0x120`), fired by the resolve pass on a size change.
-    "OnSizeChanged",
-    // The movie frame's three (script map `0x78c2e0`), fired by its player ([`movieframe`]).
-    "OnMovieFinished",
-    "OnMovieShowSubtitle",
-    "OnMovieHideSubtitle",
-    // The key channels: `OnChar` and `OnKeyDown` fired by [`keyboard`]'s walks (`0x765df0`,
-    // `0x765f10`), `OnKeyUp` by the key-up dispatcher (`0x765fd0`) on the frame that took the
-    // key's down. A frame carrying only `OnKeyUp` still consumes every key-down and runs nothing
-    // on it, the reference's own asymmetry.
-    "OnChar",
-    "OnKeyDown",
-    "OnKeyUp",
-];
-
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 // UiScript: the public host
 // ─────────────────────────────────────────────────────────────────────────────────────────────
+
+/// The budget aborts' messages waiting for the error function ([`UiScript::set_instruction_budget`]).
+struct BudgetAborts(std::rc::Rc<std::cell::RefCell<Vec<String>>>);
 
 /// The Lua scripting host: owns the VM, whose `Model` lives in `lua.app_data`. Its `impl` blocks
 /// sit beside their concerns: [`extract`], [`tick`], [`editbox::seam`], [`layout`] and [`pointer`].
@@ -725,10 +721,11 @@ fn open_state(vm: VmKind) -> mlua::Result<Lua> {
 fn install_framescript(vm: VmKind) -> mlua::Result<Lua> {
     let lua = open_state(vm)?;
 
-    // `0x51bb20` (table `0x8503f4`): `GetTime`, `GetGameTime` and `ConsoleExec`. `ReadFile`,
-    // `DeleteFile` and `AppendToFile` are not built.
+    // `0x51bb20` (table `0x8503f4`): `GetTime`, `GetGameTime`, `ConsoleExec`, then the file trio
+    // `ReadFile`, `DeleteFile` and `AppendToFile`, each a refusal.
     clock::install(&lua)?;
     console_exec::install(&lua)?;
+    denied::install_files(&lua)?;
 
     // `0x706350`: `CreateFrame`, `CreateFont`, `GetNumFrames`, `EnumerateFrames` (table
     // `0x872e74`), then the widget method tables `0x7a2e70`..`0x78dc60`.
@@ -850,6 +847,8 @@ impl UiScript {
         let lua = install_framescript(VmKind::InGame)?;
         install_in_game(&lua)?;
         object::guard_receivers(&lua)?;
+        #[cfg(any(test, feature = "test-support"))]
+        census::survey_listener(&lua);
         Ok(Self::host(lua))
     }
 
@@ -940,9 +939,21 @@ impl UiScript {
     /// session's first frame. Deviation: the client's Lua has no such bound, as nothing sets a
     /// hook (`lua_sethook`, `0x6fba40`, has no caller and no pointer to it), so a load that
     /// never ends hangs it.
+    ///
+    /// An abort runs no error handler, so its message waits and is handed to the error function
+    /// when the budget is disarmed, as a compile failure is (`0x704b42`), once per arming: the
+    /// player's `ScriptErrors` names the runaway loop.
     pub fn set_instruction_budget(&self, budget: u64) {
         let used = self.instructions.clone();
         used.store(0, std::sync::atomic::Ordering::Relaxed);
+        let aborts = match self.lua.app_data_ref::<BudgetAborts>() {
+            Some(a) => a.0.clone(),
+            None => {
+                let a = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+                self.lua.set_app_data(BudgetAborts(a.clone()));
+                a
+            }
+        };
         let _ = self.lua.set_hook(
             mlua::HookTriggers {
                 every_nth_instruction: Some(INSTRUCTION_HOOK_STEP),
@@ -954,10 +965,14 @@ impl UiScript {
                     std::sync::atomic::Ordering::Relaxed,
                 ) + u64::from(INSTRUCTION_HOOK_STEP);
                 if n > budget {
-                    return Err(mlua::Error::runtime(format!(
+                    let message = format!(
                         "benilla: instruction budget exhausted after {n} VM instructions — \
                          treating this as a non-terminating loop"
-                    )));
+                    );
+                    if n - u64::from(INSTRUCTION_HOOK_STEP) <= budget {
+                        aborts.borrow_mut().push(message.clone());
+                    }
+                    return Err(mlua::Error::runtime(message));
                 }
                 Ok(mlua::VmState::Continue)
             },
@@ -967,6 +982,16 @@ impl UiScript {
     /// Remove the instruction budget; the counter keeps its value for [`Self::instructions_used`].
     pub fn clear_instruction_budget(&self) {
         self.lua.remove_hook();
+        let waiting = self
+            .lua
+            .app_data_ref::<BudgetAborts>()
+            .map(|a| std::mem::take(&mut *a.0.borrow_mut()))
+            .unwrap_or_default();
+        for message in waiting {
+            host::unheld(&self.lua, || {
+                stdlib::call_error_function(&self.lua, message.as_bytes())
+            });
+        }
     }
 
     /// VM instructions since the last [`Self::set_instruction_budget`], to the resolution of
@@ -1192,14 +1217,12 @@ impl UiScript {
         self.run_chunk_named(chunk, "(chunk)")
     }
 
-    /// Run a chunk under the name the 1.12 client gives it ([`addon_chunk_name`] for addon files).
+    /// Run a chunk under the name the 1.12 client gives it ([`addon_chunk_name`] for addon files),
+    /// as a file runs (`0x704ae0`): its error, or its compile failure, reaches the Lua error
+    /// handler before this returns it.
     pub fn run_chunk_named(&self, chunk: &[u8], name: &str) -> mlua::Result<()> {
         host::unheld(&self.lua, || {
-            self.lua
-                .load(crate::source::chunk(chunk))
-                .set_name(name)
-                .set_mode(mlua::ChunkMode::Text)
-                .exec()
+            execute_buffer(&self.lua, crate::source::chunk(chunk), name, |_| {})
         })
     }
 
@@ -1689,47 +1712,6 @@ impl UiScript {
     /// Drain the non-fatal host warnings, for the host to log.
     pub fn take_warnings(&mut self) -> Vec<String> {
         std::mem::take(&mut self.model_mut().warnings)
-    }
-
-    /// Report a script error the host caught outside the VM's dispatch (an addon file that failed
-    /// to compile or raised at file scope): it joins the handler-dispatch queue and the retained
-    /// log, not `errors`, since the caller has already logged it. `log` is the decorated text the
-    /// log keeps; `handler` is the one value the error handler is called with, the bare Lua
-    /// message as `lua_pcall` leaves it (`0x703b40`).
-    pub fn report_script_error(&self, log: &str, handler: &str) {
-        // A Load row, not an Error one: to the player a file scope that raised and a missing file
-        // are the same fact, the addon is not running.
-        diagnostics::record_load_failure(&self.lua, log);
-        self.model_mut()
-            .pending_error_dispatch
-            .push(model::HandlerArg::Text(handler.to_string()));
-    }
-
-    /// Hand each queued script error to the Lua error handler, as the reference's catch closure
-    /// (`0x703b40`) calls the one `seterrorhandler` (`0x702900`) holds, read from its slot and not
-    /// through the `geterrorhandler` global; FrameXML installs `_ERRORMESSAGE`, the ScriptErrors
-    /// dialog (`BasicControls.xml:16`). With none installed the error stays on the host channel,
-    /// [`UiScript::errors`], alone; a handler that raises is recorded there only and stops the
-    /// batch, so the path cannot recurse.
-    pub fn dispatch_script_errors_to_handler(&mut self) {
-        let pending = std::mem::take(&mut self.model_mut().pending_error_dispatch);
-        if pending.is_empty() {
-            return;
-        }
-        let Some(handler) = stdlib::error_handler(&self.lua) else {
-            return;
-        };
-        for arg in pending {
-            let ran = host::unheld(&self.lua, || {
-                arg.value(&self.lua).and_then(|v| handler.call::<()>(v))
-            });
-            if let Err(e) = ran {
-                self.model_mut()
-                    .errors
-                    .push(format!("error handler itself failed: {e}"));
-                break;
-            }
-        }
     }
 
     /// Register a named [`FontObject`] (a resolved `<Font>`), its block replaced by `font` and the

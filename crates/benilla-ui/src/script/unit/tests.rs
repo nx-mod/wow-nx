@@ -998,14 +998,6 @@ fn a_seated_selection_carries_its_target_of_target() {
     }));
     assert_eq!(tot(&s).as_deref(), Some("Blue Whelp"), "a held hop");
 
-    s.seat_selection(Some(crate::script::SeatedSelection {
-        guid: 0x31,
-        held: true,
-        target: 0x22,
-        target_held: false,
-    }));
-    assert_eq!(tot(&s).as_deref(), Some("Bob"), "an unheld groupmate");
-
     s.seat_selection(Some(alone(0x32)));
     assert!(s
         .eval::<bool>("return UnitExists('targettarget') == nil")
@@ -1019,7 +1011,7 @@ fn a_seated_selection_carries_its_target_of_target() {
 /// Every selecting verb commits through `SetSelection 0x493540` before it returns, and the host
 /// seats the selection it committed as `"target"` for the rest of the chunk: the unit's by-name
 /// snapshot, else a pushed snapshot of its guid, else the unit as its guid alone, and nothing for a
-/// deselect. Each seat tells the feed to re-push `"target"` from the committed selection.
+/// deselect.
 #[test]
 fn a_seated_selection_is_the_target_for_the_rest_of_the_chunk() {
     let mut s = UiScript::new().unwrap();
@@ -1034,7 +1026,6 @@ fn a_seated_selection_is_the_target_for_the_rest_of_the_chunk() {
     mate.health = 45;
     s.set_unit("party1", Some(mate));
     s.set_name_candidate(0x31, Some(candidate(0x31, "Red Affinity", 4.0)));
-    assert!(!s.take_target_view_moved());
     let health = |s: &UiScript| s.eval::<i64>("return UnitHealth('target')").unwrap();
 
     s.seat_selection(Some(alone(0x31)));
@@ -1048,7 +1039,6 @@ fn a_seated_selection_is_the_target_for_the_rest_of_the_chunk() {
         "the pick's whole snapshot, not only its name"
     );
     assert_eq!(s.model_ref().unit_guids.target, 0x31);
-    assert!(s.take_target_view_moved());
 
     s.seat_selection(Some(alone(0x22)));
     assert_eq!(
@@ -1070,11 +1060,10 @@ fn a_seated_selection_is_the_target_for_the_rest_of_the_chunk() {
         .eval::<bool>("return UnitExists('target') == nil")
         .unwrap());
     assert_eq!(s.model_ref().unit_guids.target, 0);
-    assert!(s.take_target_view_moved());
 }
 
-/// Seating the unit the feed's own `"target"` push already shows keeps that push (here, a health
-/// the candidate's does not share), and the view has not moved.
+/// Seating the unit the `"target"` copy already shows keeps that copy (here, a health the
+/// candidate's does not share).
 #[test]
 fn seating_the_shown_target_keeps_the_feeds_push() {
     let mut s = UiScript::new().unwrap();
@@ -1089,7 +1078,6 @@ fn seating_the_shown_target_keeps_the_feeds_push() {
     s.set_name_candidate(0x21, Some(candidate(0x21, "Old Mob", 1.0)));
     s.seat_selection(Some(alone(0x21)));
     assert_eq!(s.eval::<i64>("return UnitHealth('target')").unwrap(), 12);
-    assert!(!s.take_target_view_moved());
 }
 
 /// With no host to commit them, the selecting verbs move nothing: the VM never guesses a
@@ -1121,7 +1109,6 @@ fn a_selecting_verb_with_no_host_leaves_the_target_alone() {
         );
         assert_eq!(s.take_script_calls().len(), 1, "{lua}: kept for a host");
     }
-    assert!(!s.take_target_view_moved());
 }
 
 /// `0x516cf0` tests `UNIT_FIELD_CHARMEDBY` (fields 10-11) non-zero, not a `UNIT_FIELD_FLAGS` bit.
@@ -1380,6 +1367,62 @@ fn an_unrecognised_unit_token_raises_and_a_recognised_empty_one_does_not() {
     assert!(s.run(r#"UnitIsUnit("player", "bogus")"#).is_err());
     assert!(s.run(r#"UnitIsUnit("bogus", "player")"#).is_err());
     assert!(s.run(r#"UnitIsUnit("player", "party3")"#).is_ok());
+}
+
+/// The 13 ungated unit predicates (`tables/unit_gates.tsv`) read the token with `lua_tostring`
+/// (`0x6f3690`), NULL for a boolean or a table, which the resolver answers as GUID 0 (`0x515992`):
+/// quiet, and "normal" for `UnitClassification`. A number's text and an unknown token raise in the
+/// resolver (`0x515c14`), as they do through `UnitPlayerControlled` (`0x51641f`), `UnitIsCivilian`
+/// (`0x519e11`) and `UnitCreatureType` (`0x51a2b1`).
+#[test]
+fn ungated_predicates_take_any_value_and_every_resolver_raises_for_an_unknown_token() {
+    let mut s = UiScript::new().unwrap();
+    s.set_unit("player", Some(player()));
+    let ungated = [
+        "UnitExists",
+        "UnitIsVisible",
+        "UnitIsPlayer",
+        "UnitIsCorpse",
+        "UnitIsPartyLeader",
+        "UnitInParty",
+        "UnitPlayerOrPetInParty",
+        "UnitInRaid",
+        "UnitPlayerOrPetInRaid",
+        "UnitPlayerControlled",
+        "UnitIsCharmed",
+        "UnitIsPlusMob",
+        "UnitClassification",
+    ];
+    for name in ungated {
+        for arg in ["true", "false", "{}", "print"] {
+            let call = format!("return {name}({arg})");
+            let answer = s
+                .eval::<Option<String>>(&call)
+                .unwrap_or_else(|e| panic!("{call}: {e}"));
+            let quiet = if name == "UnitClassification" {
+                Some("normal")
+            } else if name == "UnitIsPartyLeader" {
+                Some("1") // GUID 0 matches the ungrouped leader's zero
+            } else {
+                None
+            };
+            assert_eq!(answer.as_deref(), quiet, "{call}");
+        }
+        for arg in ["5", r#""foo""#] {
+            let call = format!("{name}({arg})");
+            let err = s.run(&call).expect_err(&call).to_string();
+            assert!(err.contains("Unknown unit name"), "{call}: {err}");
+        }
+    }
+    for call in [
+        r#"UnitIsCivilian("foo")"#,
+        "UnitIsCivilian(5)",
+        r#"UnitCreatureType("foo")"#,
+        "UnitCreatureType(5)",
+    ] {
+        let err = s.run(call).expect_err(call).to_string();
+        assert!(err.contains("Unknown unit name"), "{call}: {err}");
+    }
 }
 
 /// The resolver compares bytes with an ASCII fold, so a non-ASCII token matches no prefix and

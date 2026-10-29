@@ -31,11 +31,11 @@ pub(crate) struct SocialSteps<'w> {
 }
 
 impl SocialSteps<'_> {
-    /// Apply `call` inside its verb, then seat the selections it leaves for the verb's next line.
+    /// Apply `call` inside its verb; the getters read what it left through the host.
     pub(crate) fn apply(&mut self, script: &mut UiScript, call: SocialCall) {
         match call {
             SocialCall::ShowFriends => self.send(ClientCommand::FriendListRequest),
-            SocialCall::AddFriend(name) => self.add_friend(script, name),
+            SocialCall::AddFriend(name) => self.add_friend(name),
             SocialCall::RemoveFriendIndex(index) => self.remove_friend_index(index),
             SocialCall::RemoveFriendName(name) => self.remove_friend_name(&name),
             SocialCall::SelectFriend(index) => self.select_friend(index),
@@ -58,10 +58,6 @@ impl SocialSteps<'_> {
                 self.send(ClientCommand::SetLookingForGroup { slots, comment })
             }
         }
-        script.set_social_selection(
-            self.social.selected_friend_index(),
-            self.social.selected_ignore_index(),
-        );
     }
 
     fn send(&self, command: ClientCommand) {
@@ -82,10 +78,9 @@ impl SocialSteps<'_> {
     /// `FriendList::AddFriend` (`0x5ae670`): tutorial 21 acknowledged through `0x4b54c0`
     /// (`0x5ae677`), its `CMSG_TUTORIAL_FLAG` sent there, then `CMSG_ADD_FRIEND` with the name as
     /// given (`0x5ae6b9`).
-    fn add_friend(&mut self, script: &mut UiScript, name: String) {
+    fn add_friend(&mut self, name: String) {
         if let Some(tutorials) = self.tutorials.as_deref() {
             tutorials.acknowledge_now(crate::tutorial::id::FRIENDS, &self.net);
-            script.set_tutorial_bank(tutorials.acknowledged_bank());
         }
         self.send(ClientCommand::AddFriend { name });
     }

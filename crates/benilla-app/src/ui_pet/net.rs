@@ -14,7 +14,7 @@ use benilla_assets::coords::wow_to_bevy;
 
 use super::PetBar;
 use crate::net::{GuidIndex, NetHandlerApp, PetDismissSoundMessage, PetTalkMessage};
-use crate::ui_action::{PetTameFailures, Spells, UiError, UiErrorKeys};
+use crate::ui_action::{FillArg, Spells, UiError, UiErrorKeys};
 use crate::ui_cast::CastReports;
 
 pub(super) fn register(app: &mut App) {
@@ -63,6 +63,8 @@ fn on_spells(
         lane.write(crate::field_watch::FieldNotice::Global {
             id: crate::field_watch::id::SPELLS_CHANGED,
         });
+        // Then the macros that follow the pet's book derived again (`0x4bdae0` → `0x4f0ce0`).
+        lane.write(crate::field_watch::FieldNotice::PetMacros);
         // `SetPetGuid`'s signals at the packet's place (`0x4bdaf0` → `0x4bc7e0`): the pet frame's
         // `UnitExists("pet")` reads our summon field as this packet left it.
         lane.write(crate::field_watch::FieldNotice::PetGuidSet {
@@ -99,9 +101,9 @@ fn on_cast_failed(In(ev): In<SessionEvent>, mut reports: ResMut<CastReports>) {
     }
 }
 
-fn on_tame_failure(In(ev): In<SessionEvent>, mut failures: ResMut<PetTameFailures>) {
+fn on_tame_failure(In(ev): In<SessionEvent>, errors: Res<UiErrorKeys>) {
     if let SessionEvent::PetTameFailure { reason } = ev {
-        pet_tame_failure(reason, &mut failures);
+        pet_tame_failure(reason, &errors);
     }
 }
 
@@ -144,11 +146,7 @@ fn pet_spells(
         if bar.spells.pet_guid != 0 {
             debug!("net: pet bar torn down");
         }
-        // The teardown's `SetPet` signals too (`0x4bdaf0` → `0x4bc90c`): the count goes on.
-        let signals = bar.bar_signals.wrapping_add(1);
         bar.clear();
-        bar.bar_signals = signals;
-        bar.book_sorts = bar.book_sorts.wrapping_add(1);
         return new_pet;
     }
     debug!(
@@ -213,18 +211,12 @@ fn pet_spells(
             .seed_pet(cd, display, mods.unwrap_or(&no_mods), pad, now);
     }
     bar.spells = spells;
-    // `SetPet` (`0x4bc7e0`) ends in `SignalEvent(0x161)` on every packet (`0x4bc90c`), whatever
-    // changed: the one repaint a packet that moves only the pet's cooldowns gets.
-    bar.bar_signals = bar.bar_signals.wrapping_add(1);
-    // The book's sort (`0x4bdadb`) and the macro derivation after it (`0x4bdae0`), every packet.
-    bar.book_sorts = bar.book_sorts.wrapping_add(1);
     new_pet
 }
 
 /// `SMSG_PET_MODE` (`0x4bdb10`): the state word alone, applied only when the packet's guid is the
 /// bar's cached one (`0x4bdb33`, `0x4bdb3f`), a zero guid against no bar included; whether it was,
-/// for the signal that follows the store (`0x4bdb4f`). The signal is the bar's whole source moving,
-/// as `SetPet`'s is, so the feed repaints without a second event.
+/// for the signal that follows the store (`0x4bdb4f`).
 fn pet_mode(mode: PetMode, bar: &mut PetBar) -> bool {
     if bar.spells.pet_guid != mode.pet_guid {
         return false;
@@ -232,7 +224,6 @@ fn pet_mode(mode: PetMode, bar: &mut PetBar) -> bool {
     debug!("net: pet mode — state {:#010x}", mode.state);
     // The whole dword, as the client stores both packets' state (`0x4bc930`).
     bar.spells.state = mode.state;
-    bar.bar_signals = bar.bar_signals.wrapping_add(1);
     true
 }
 
@@ -258,14 +249,18 @@ fn pet_feedback_key(reason: u8) -> Option<&'static str> {
     })
 }
 
-/// `SMSG_PET_TAME_FAILURE`: the reason byte, queued. vmangos also sends it for a summon while a
-/// pet or a charmed unit is out (`Spell.cpp:5467`).
-fn pet_tame_failure(reason: u8, failures: &mut PetTameFailures) {
-    debug!(
-        "net: pet tame failure {reason} ({})",
-        benilla_protocol::messages::pet_tame_failure_key(reason)
-    );
-    failures.0.push(reason);
+/// `SMSG_PET_TAME_FAILURE` (`0x6e97e0` → `0x6e6a20`), the handler's one signal: the reason's
+/// `PETTAME_*` string (the jump table `0x6e6ac0`, `PETTAME_UNKNOWNERROR` outside 1 to 11), read
+/// through `FrameScript_GetText` (`0x6e6a91`, `""` when missing) as `ERR_TAME_FAILED`'s `%s`
+/// (`DisplayError(0xee)`, `0x6e6ab4`). vmangos also sends it for a summon while a pet or a charmed
+/// unit is out (`Spell.cpp:5467`).
+fn pet_tame_failure(reason: u8, errors: &UiErrorKeys) {
+    let key = benilla_protocol::messages::pet_tame_failure_key(reason);
+    debug!("net: pet tame failure {reason} ({key})");
+    errors.push(UiError::args(
+        "ERR_TAME_FAILED",
+        vec![FillArg::Global(key.to_string())],
+    ));
 }
 
 /// `SMSG_PET_NAME_INVALID`, an empty body: the reference raises `ERR_INVALID_PETNAME` and reads

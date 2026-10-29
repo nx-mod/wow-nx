@@ -409,9 +409,13 @@ pub enum SessionEvent {
     ServerUnixTime { unix_time: u32 },
     /// The hearthstone bind (`SMSG_BINDPOINTUPDATE`): the AreaTable id the `$z` token names.
     BindPoint { area: u32 },
-    /// `SMSG_GMTICKET_GETTICKET`, `None` for no ticket. The Help window re-polls every 10 minutes
-    /// and fires `UPDATE_TICKET` on each answer, changed or not: count these, never diff them.
-    GmTicket { ticket: Option<Box<GmTicket>> },
+    /// `SMSG_GMTICKET_GETTICKET`: the wire status, and the ticket (`None` for no ticket). The Help
+    /// window re-polls every 10 minutes and fires `UPDATE_TICKET` on each answer, changed or not:
+    /// count these, never diff them.
+    GmTicket {
+        status: u32,
+        ticket: Option<Box<GmTicket>>,
+    },
     /// `SMSG_GMTICKET_CREATE`: 2 created, 3 refused, 1 already exists (vmangos never sends 1, and
     /// sometimes sends nothing at all).
     GmTicketCreated { response: u32 },
@@ -542,6 +546,17 @@ pub enum SessionEvent {
     /// `SMSG_GAMEOBJECT_PAGETEXT`: the reference resolves the GameObject and opens the item-text
     /// reader on it (`0x5f88c0` → `0x4e32e0(guid, 0)`), as a right-click on a TEXT object does.
     GameObjectPageText { guid: u64 },
+    /// `SMSG_READ_ITEM_OK` (`0x5ec600`): the book may be read; the reference marks the item read
+    /// and shows its page.
+    ReadItemOk { guid: u64 },
+    /// `SMSG_READ_ITEM_FAILED` (`0x5ec600`): reason 0 shows the page, 1 shows it untranslated and
+    /// signals `ITEM_TEXT_TRANSLATION` with `milliseconds`, any other closes the reader when the
+    /// guid is its item.
+    ReadItemFailed {
+        guid: u64,
+        reason: u8,
+        milliseconds: i32,
+    },
     /// `SMSG_OPEN_CONTAINER`: the reference fires `BAG_OPEN` with 0 for our own guid (the
     /// backpack), 1..10 for a bag-cache slot, and nothing for a miss.
     OpenContainer { item: u64 },

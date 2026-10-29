@@ -302,20 +302,21 @@ fn client() -> Client {
     c.frame(vec![]);
     c.frame(vec![]);
     c.eval::<()>(false, "Seen = {} PetSeen = {} DeepSeen = {}");
+    // The VM's copy of our experience, which no feed pushes: `UnitXP` reads it through the host.
+    crate::script_calls::with_hosted_vm(c.app.world_mut(), |s| {
+        s.expect("a VM").set_player_xp(1234, 0)
+    });
     c
 }
 
-/// Wherever the frame's snapshots are current, every token form names the same unit live as off
-/// the snapshot: what the live resolver reads of the objects is what the snapshot's build read.
+/// Every token form names its unit live, as the resolver reads the objects and the group rows
+/// inside the call (`0x515970`): each base, a hop off each, the chains, a member out of view and
+/// the pet its record names, our own raid row and its pet, and nobody.
 #[test]
-fn every_token_form_names_the_same_unit_live_as_off_the_snapshot() {
+fn every_token_form_names_its_unit_live() {
     let mut c = client();
-    let snapshot = c.answers(false);
     let live = c.answers(true);
-    assert_eq!(snapshot.len(), TOKENS.len());
-    let differ: Vec<(&String, &String)> =
-        snapshot.iter().zip(&live).filter(|(s, l)| s != l).collect();
-    assert!(differ.is_empty(), "snapshot vs live: {differ:#?}");
+    assert_eq!(live.len(), TOKENS.len());
     // The fixture reaches every leg: each base, a hop off each, a three-hop chain, a member out
     // of view and the pet its record names, our own raid row and its pet, and nobody.
     for line in [

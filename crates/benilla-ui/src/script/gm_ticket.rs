@@ -59,6 +59,7 @@ impl super::UiScript {
     }
 
     /// The `Stuck()` calls a harness's VM kept, each one cast of spell 7355.
+    #[cfg(test)]
     pub fn take_stuck_casts(&mut self) -> u32 {
         self.take_calls_like(&super::ScriptCall::GmTicket(GmTicketCall::Stuck)) as u32
     }
@@ -100,6 +101,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             lua.create_function(move |lua, ()| {
                 if needs_player
                     && !super::battlefield_queue::player_exists(
+                        lua,
                         &lua.app_data_ref::<Model>().expect("model app_data"),
                     )
                 {
@@ -114,13 +116,22 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     // empty text sends nothing and shows `ERR_TICKET_NO_TEXT` (`push 0x157; call 0x496720`): the
     // senders test the copied text's first byte, a new ticket at `0x5ef802`-`0x5ef80a` and an
     // update at `0x5efadf`-`0x5efae9`. Stock `HelpFrame.lua:478-486` leaves the check to them.
-    for (name, is_new) in [("NewGMTicket", true), ("UpdateGMTicket", false)] {
+    for (name, is_new, usage) in [
+        ("NewGMTicket", true, "Usage: NewGMTicket(type, text)"),
+        ("UpdateGMTicket", false, "Usage: UpdateGMTicket(type, text)"),
+    ] {
         g.set(
             name,
-            lua.create_function(move |lua, (category, text): (u32, String)| {
+            lua.create_function(move |lua, (category, text): (Value, Value)| {
+                // `is-number` on the type and `is-number-or-string` on the text, else the verb's
+                // usage line (`0x842acc`, `0x842aec`; `0x48ca40`, `0x48cad0`). The type is
+                // `_ftol`ed with no range check (`0x48c9fe`), so a negative one is sent.
+                let category = super::binding_abi::index_arg32(lua, category, usage)?;
+                let text = super::binding_abi::string_arg(lua, text, usage)?;
                 // With no active player the binding calls nothing (`0x48ca29`-`0x48ca30`,
                 // `0x48cab9`-`0x48cac0`).
                 if !super::battlefield_queue::player_exists(
+                    lua,
                     &lua.app_data_ref::<Model>().expect("model app_data"),
                 ) {
                     return Ok(());

@@ -1,7 +1,8 @@
 //! The item and bag getters read the item cache and the item objects as they run, through the
 //! lent host, as the reference's read the slot's object and its record (`GetContainerItemInfo`,
 //! `0x6228a0` then `0x55ba30`): the live answer and the frame's snapshot agree on every getter
-//! wherever the snapshot is current, and the cache and the object answer where it is not.
+//! wherever the snapshot is current, and the cache and the object answer where it is not. The bag
+//! getters have no snapshot: they read the bags at the call ([`crate::ui_items::BagLive`]).
 
 use benilla_protocol::field::{
     FIELD_CONTAINER_SLOT_1, FIELD_ITEM_STACK_COUNT, FIELD_PLAYER_INV_SLOT_HEAD,
@@ -410,9 +411,14 @@ fn client(window: Window) -> Client {
     }
     // Bob shows the rolled sword in his main hand (`PLAYER_VISIBLE_ITEM_16_*`).
     let visible = FIELD_PLAYER_VISIBLE_ITEM_1_CREATOR + 12 * 15;
+    // Both Human, so the host's reach holds Bob cooperative (`0x4944e4`), beside us.
+    use crate::target::relations::fixture::{factions, HUMAN};
+    c.app.insert_resource(factions());
+    seats.push((35, HUMAN));
     let bob = [
         // `OBJECT_FIELD_TYPE`: object, unit, player.
         (2, 0x19),
+        (35, HUMAN),
         (visible + 2, 25),
         (visible + 3, ENCHANT),
         (visible + 10, ROLL),
@@ -431,6 +437,11 @@ fn client(window: Window) -> Client {
     world
         .resource_mut::<crate::ui_bank::BankOpen>()
         .open(BANKER);
+    // The banker's cell in the VM, which the open writes beside it (`0x4f850e`), for the vault.
+    crate::script_calls::with_hosted_vm(world, |s| {
+        s.expect("a VM")
+            .set_bank(Some(benilla_ui::script::BankState::default()))
+    });
     match window {
         Window::Trade => {
             world
@@ -452,7 +463,7 @@ fn client(window: Window) -> Client {
     }
     c.frame(vec![]);
     c.frame(vec![]);
-    // Bob within inspect range, as the unit feed's reach would hold a friendly player beside us.
+    // Bob within inspect range, as the host's reach holds him, for the snapshot's side.
     c.app
         .world_mut()
         .non_send_resource_mut::<UiScript>()
@@ -467,9 +478,12 @@ fn client(window: Window) -> Client {
 }
 
 /// Wherever the frame's snapshots are current, every item getter answers the same off the cache
-/// and the objects as off the snapshot, across the bags, the bank, the worn and inspected slots,
-/// the trade and the mail: the fields the snapshots hold are the ones the live read derives
-/// ([`crate::ui_items::live::LiveItem`]).
+/// and the objects as off the snapshot, across the bags, the bank, the worn slots, the trade and
+/// the mail: the fields the snapshots hold are the ones the live read derives
+/// ([`crate::ui_items::live::LiveItem`]). The inspected slots have no snapshot pushed, and read
+/// the visible block live ([`crate::ui_inspect::InspectLive`]); nor have the bags, the trade or
+/// the mail ([`crate::ui_trade::TradeLive`], [`crate::ui_mail::MailLive`]), which read nothing off
+/// the VM alone.
 #[test]
 fn every_item_getter_answers_the_same_live_as_off_the_snapshot() {
     let mut c = client(Window::Trade);
@@ -479,6 +493,9 @@ fn every_item_getter_answers_the_same_live_as_off_the_snapshot() {
     live.extend(c.answers(true));
     // The fixture shows what it means to on every surface.
     let rolled = format!("Hitem:25:{ENCHANT}:{ROLL}:{SUFFIX}|h[Item 25 of the Bear]");
+    let bag = |l: &str| {
+        l.starts_with("GetContainerItem") || l.starts_with("GetTrade") || l.starts_with("GetInbox")
+    };
     for want in [
         "GetContainerItemInfo 0:1 Interface\\Icons\\INV_Sword_04,17,1,-1,nil",
         "GetContainerItemInfo 0:2 Interface\\Icons\\INV_Sword_04,2,1,-1,1",
@@ -487,9 +504,6 @@ fn every_item_getter_answers_the_same_live_as_off_the_snapshot() {
         "GetInventoryItemTexture player:16 Interface\\Icons\\INV_Sword_04",
         "GetInventoryItemBroken player:17 1",
         "GetInventoryItemTexture player:20 Interface\\Icons\\INV_Sword_04",
-        "GetInventoryItemTexture target:16 Interface\\Icons\\INV_Sword_04",
-        // Visible gear carries no suffix factor.
-        "GetInventoryItemLink target:16 |cff1eff00|Hitem:25:1900:862:0|h[Item 25 of the Bear]",
         "GetItemInfo 25 Item 25,item:25:0:0:0,2,5,",
         "GetItemInfo rolled Item 25 of the Bear,",
         "GetTradePlayerItemInfo 1 Item 2589,",
@@ -497,9 +511,10 @@ fn every_item_getter_answers_the_same_live_as_off_the_snapshot() {
         "GetInboxItem 1 Item 25 of the Bear,",
         "GetSendMailItem Item 955,",
     ] {
+        let read = if bag(want) { &live } else { &snapshot };
         assert!(
-            snapshot.iter().any(|l| l.starts_with(want)),
-            "{want}: {snapshot:#?}"
+            read.iter().any(|l| l.starts_with(want)),
+            "{want}: {read:#?}"
         );
     }
     for at in [
@@ -507,22 +522,46 @@ fn every_item_getter_answers_the_same_live_as_off_the_snapshot() {
         "GetInventoryItemLink player:16",
         "GetTradeTargetItemLink 1",
     ] {
+        let read = if bag(at) { &live } else { &snapshot };
         assert!(
-            snapshot
-                .iter()
+            read.iter()
                 .any(|l| l.starts_with(at) && l.contains(&rolled)),
-            "{at} links the roll: {snapshot:#?}"
+            "{at} links the roll: {read:#?}"
+        );
+    }
+    // Off the VM alone a bag, trade or inbox getter returns nothing: no view stands in for them.
+    assert!(
+        snapshot
+            .iter()
+            .filter(|l| bag(l))
+            .all(|l| l.ends_with(' ') || l.contains(" nil,nil,0,0,nil")),
+        "{snapshot:#?}"
+    );
+    for want in [
+        "GetInventoryItemTexture target:16 Interface\\Icons\\INV_Sword_04",
+        // Visible gear carries no suffix factor.
+        "GetInventoryItemLink target:16 |cff1eff00|Hitem:25:1900:862:0|h[Item 25 of the Bear]",
+    ] {
+        assert!(
+            live.iter().any(|l| l.starts_with(want)),
+            "{want}: {live:#?}"
         );
     }
     assert_eq!(snapshot.len(), live.len());
-    let differ: Vec<(&String, &String)> =
-        snapshot.iter().zip(&live).filter(|(s, l)| s != l).collect();
+    let differ: Vec<(&String, &String)> = snapshot
+        .iter()
+        .zip(&live)
+        // The send slot's stack is its source bag slot's.
+        .filter(|(s, l)| {
+            s != l && !s.contains(" target:") && !bag(s) && !s.starts_with("GetSendMailItem")
+        })
+        .collect();
     assert!(differ.is_empty(), "snapshot vs live: {differ:#?}");
 }
 
 /// A stack a packet changed after the frame's pushes, and a record that landed after them, read
-/// as the object and the cache hold them now, through the host; the snapshot still holds the
-/// push, and the live hit asks for nothing.
+/// as the object and the cache hold them now, through the host; off the VM alone the bags and the
+/// trade read none, and the live hit asks for nothing.
 #[test]
 fn an_item_getter_reads_the_object_and_the_cache_as_it_runs() {
     let mut c = client(Window::Trade);
@@ -538,12 +577,12 @@ fn an_item_getter_reads_the_object_and_the_cache_as_it_runs() {
     let live: (i64, i64, Option<String>) = c.eval(true, chunk);
     assert_eq!(live, (3, 3, Some("Item 99999".into())));
     assert!(c.item_queries().is_empty(), "a cached record asks nothing");
-    let snapshot: (i64, i64, Option<String>) = c.eval(false, chunk);
-    assert_eq!(snapshot, (17, 17, None));
+    let snapshot: (Option<i64>, i64, Option<String>) = c.eval(false, chunk);
+    assert_eq!(snapshot, (None, 0, None));
 }
 
 /// The bag getters' per-call cost: 10k `GetContainerItemInfo` calls over the three filled backpack
-/// slots, through the lent host and off the snapshot alone.
+/// slots, through the lent host.
 ///
 /// Run with `cargo nextest run -p benilla-app --lib item_getter_cost --run-ignored only
 /// --no-capture`.
@@ -569,9 +608,8 @@ fn item_getter_cost() {
         times.sort_by(f64::total_cmp);
         times[times.len() / 2]
     };
-    let (live, snapshot) = (median(true), median(false));
+    let live = median(true);
     eprintln!(
-        "item getters: 10k GetContainerItemInfo calls, median {live:.3} ms with the host lent, \
-         {snapshot:.3} ms off the snapshots alone"
+        "item getters: 10k GetContainerItemInfo calls, median {live:.3} ms with the host lent"
     );
 }

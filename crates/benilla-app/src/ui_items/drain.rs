@@ -8,39 +8,19 @@ use bevy::prelude::*;
 use benilla_protocol::messages::BAG_PLAYER_INVENTORY;
 use benilla_ui::script::{ContainerUse, UiScript, UseArm, UseFork, EQUIPMENT_BAG};
 
-use crate::items::Items;
-use crate::net::{ClientCommand, NetCommands, ObjectStore, Objects, SelfPlayer};
+use crate::net::{ClientCommand, NetCommands, ObjectStore, SelfPlayer};
 
-use super::{slot_guid, wire_pos, ITEM_CLASS_PROJECTILE};
+use super::{slot_guid, wire_pos};
 use crate::query_cache::Ask;
 
-/// The one auto-equip sender (`AutoEquipCursorItem`, `0x5e1480`, past its question). A
-/// projectile, the template class `0x5d9f30` reads (`0x5e16ff`, `0x5e1704`), loads by entry with
-/// `CMSG_SET_AMMO` and stays in its bag, and the arm's `ClearCursor(1,1)` unlocks it (`0x5e1711`,
-/// `0x5e1763`): an item the call's clear left locked, picked up before its template landed, is let
-/// go here. Anything else is `CMSG_AUTOEQUIP_ITEM`. The bind-on-equip question is the call's, not
-/// the sender's: the VM decided before this ran ([`benilla_ui::script::AutoEquip`]).
-pub(crate) fn send_auto_equip(
-    script: &mut UiScript,
-    objects: &Objects,
-    items: &Items,
-    commands: &NetCommands,
-    bag_index: u8,
-    slot: u8,
-    guid: Option<u64>,
-) {
-    let ammo = guid.and_then(|guid| {
-        let entry = objects.object(guid)?.object_entry()?;
-        // The class getter only reads (`0x5d9f30`).
-        let t = items.template(entry, guid, Ask::Read)?;
-        (t.class == ITEM_CLASS_PROJECTILE).then_some((guid, entry))
-    });
-    if let Some((guid, entry)) = ammo {
+/// The one auto-equip sender (`AutoEquipCursorItem`, `0x5e1480`, past its question): a projectile,
+/// as the VM decided by its cached record (`0x5e16ff`, `0x5e1704`), loads by its `ammo` entry
+/// with `CMSG_SET_AMMO` and stays in its bag; anything else is `CMSG_AUTOEQUIP_ITEM`. The question
+/// and the clear are the VM's too ([`benilla_ui::script::AutoEquip`]).
+pub(crate) fn send_auto_equip(commands: &NetCommands, bag_index: u8, slot: u8, ammo: Option<u32>) {
+    if let Some(entry) = ammo {
         debug!("ui_items: set ammo entry {entry} (wire {bag_index}/{slot})");
         let _ = commands.0.send(ClientCommand::SetAmmo { entry });
-        if script.item_locked(guid) {
-            script.unlock_item(guid);
-        }
     } else {
         debug!("ui_items: autoequip wire {bag_index}/{slot}");
         let _ = commands
@@ -54,13 +34,14 @@ pub(crate) fn send_auto_equip(
 pub(crate) struct ScriptItemUse<'w, 's> {
     self_q: Query<'w, 's, &'static ObjectStore, With<SelfPlayer>>,
     merchant: Res<'w, crate::ui_merchant::MerchantOpen>,
-    equip_sound: MessageWriter<'w, crate::sound::AutoEquipSound>,
     item_text: ResMut<'w, crate::ui_item_text::ItemTextOpen>,
     targeting: crate::spell::cast_target::CastTargeting<'w, 's>,
     // The item use's casts and sends.
     ladder: crate::spell::CastLadder<'w, 's>,
     ui_errors: Res<'w, crate::ui_action::UiErrorKeys>,
     gate: crate::ui_bind_confirm::BindGate<'w>,
+    /// What the use's requirement gate judges the item by, seated for it with the host out.
+    requirements: super::RequirementsLive<'w, 's>,
 }
 
 impl ScriptItemUse<'_, '_> {
@@ -69,6 +50,8 @@ impl ScriptItemUse<'_, '_> {
     /// (`0x4c7af0`): a worn quest-starter offers its quest. `on_self` binds the player in place of
     /// the selection (`0x4c8e48`). The call refused a locked item. Ids outside 1..=19 are refused.
     pub(crate) fn use_inventory_item(&mut self, script: &mut UiScript, id: u32, on_self: bool) {
+        // The use's requirement gate (`0x5d8e0e`) reads the player as the apply finds it.
+        self.requirements.seat(script);
         let Self {
             self_q,
             targeting,
@@ -130,10 +113,11 @@ impl ScriptItemUse<'_, '_> {
         script: &mut UiScript,
         call: ContainerUse,
     ) -> Option<crate::ui_loot::OpenItem> {
+        // The use's requirement gate (`0x5d8e0e`) reads the player as the apply finds it.
+        self.requirements.seat(script);
         let Self {
             self_q,
             merchant,
-            equip_sound,
             item_text,
             targeting,
             ladder,
@@ -146,28 +130,13 @@ impl ScriptItemUse<'_, '_> {
             slot,
             guid: item_guid,
             arm,
-            asks,
             on_self,
             ..
         } = call;
-        // A bind-on-equip equip the call asked about is filed whatever the slot holds now: the
-        // reference raised the question inside the call (`0x5e16c6`), the item is on the cursor,
-        // and the answer re-judges the slot (`0x5e1c23`) or only unlocks (`0x5e1c50`).
-        if asks {
-            gate.defer_equip(
-                script,
-                crate::ui_bind_confirm::PendingEquip::AutoEquip {
-                    bag,
-                    slot,
-                    guid: item_guid,
-                },
-            );
-            return None;
-        }
         let slot0 = u8::try_from(slot.saturating_sub(1)).ok();
-        // The slot must still hold the item the call resolved (`0x4fa1a6`). The reference sends
-        // inside the call, so nothing moves between; here the frame may have applied a move since,
-        // and then the arm goes out for nothing and its lock is let go.
+        // The slot must still hold the item the call resolved (`0x4fa1a6`), else nothing goes out.
+        // The call applies inside its verb, the bank and sale arms ahead of their lock, so no
+        // move lands between and there is no lock to let go.
         let still_there = slot0.is_some_and(|s0| {
             self_q
                 .iter()
@@ -178,9 +147,6 @@ impl ScriptItemUse<'_, '_> {
         let pos = wire_pos(bag, slot);
         let (Some((bag_index, wire_slot)), true) = (pos, still_there) else {
             debug!("ui_items: UseContainerItem({bag}, {slot}) no longer holds {item_guid:#x}");
-            if arm_locked(arm) {
-                script.unlock_item(item_guid);
-            }
             return None;
         };
         let fork = match arm {
@@ -203,8 +169,7 @@ impl ScriptItemUse<'_, '_> {
             // The whole stack sells (`CMSG_SELL_ITEM`, count 0).
             UseArm::Sell => {
                 let Some(vendor) = merchant.vendor else {
-                    debug!("ui_items: sale of {item_guid:#x} with no vendor open — let go");
-                    script.unlock_item(item_guid);
+                    debug!("ui_items: sale of {item_guid:#x} with no vendor open — not sent");
                     return None;
                 };
                 debug!("ui_items: sell lua bag {bag} slot {slot} (item {item_guid:#x})");
@@ -226,7 +191,6 @@ impl ScriptItemUse<'_, '_> {
                 guid: item_guid,
                 entry,
                 item_text_id: obj.item_text_id().unwrap_or(0),
-                display_info_id: t.display_info_id,
                 start_quest: t.start_quest,
                 spell_index: t.use_spell_index().unwrap_or(0),
                 use_spell: t.use_spell.map(|u| u.spell_id),
@@ -235,25 +199,6 @@ impl ScriptItemUse<'_, '_> {
             })
         });
         match (fork, clicked) {
-            // The call put the item on the cursor, `SetCursorItem` playing its pickup (`0x494c4a`),
-            // and ran `AutoEquipCursorItem`, whose clear plays the put-down (`0x49520a`). Both
-            // land inside the call, so the frame's cursor-sound diff sees nothing and this path
-            // plays the pair itself. A bind question leaves the item held instead, and the diff
-            // plays its pickup.
-            (UseFork::Equip, Some(c)) => {
-                send_auto_equip(
-                    script,
-                    &ladder.objects,
-                    &ladder.items,
-                    &ladder.commands,
-                    bag_index,
-                    wire_slot,
-                    Some(c.guid),
-                );
-                equip_sound.write(crate::sound::AutoEquipSound {
-                    display_id: c.display_info_id,
-                });
-            }
             // `CMSG_OPEN_ITEM` (emitter `0x5edd60`); vmangos swaps the entry back from
             // `character_gifts`.
             (UseFork::Unwrap, Some(c)) => {
@@ -293,7 +238,8 @@ impl ScriptItemUse<'_, '_> {
                     ui_errors,
                 );
             }
-            // The reader, with no packet (`0x4e32e0`); a re-click closes it.
+            // The reader (`0x4e32e0`), whose open sends `CMSG_READ_ITEM` for a book not yet read;
+            // a re-click closes it.
             (UseFork::Read, Some(c)) => {
                 if item_text.read_pages(c.guid) {
                     debug!("ui_items: re-click closes the book {:#x}", c.guid);
@@ -336,10 +282,7 @@ impl ScriptItemUse<'_, '_> {
             // cache since the call read it.
             (fork, clicked) => {
                 if fork != UseFork::Plain {
-                    debug!("ui_items: {fork:?} on {item_guid:#x} with no template — let go");
-                    if arm_locked(arm) {
-                        script.unlock_item(item_guid);
-                    }
+                    debug!("ui_items: {fork:?} on {item_guid:#x} with no template — not sent");
                     return None;
                 }
                 debug!("ui_items: use item (lua bag {bag} → wire {bag_index}/{wire_slot})");
@@ -372,6 +315,8 @@ impl ScriptItemUse<'_, '_> {
     /// whatever the protected-action gate said (`0x5d92c6`-`0x5d92cc`), so a doubled accept does
     /// nothing; the cast inside it asks tag 2 (`0x6e4bc1`).
     pub(crate) fn confirm_bind_on_use(&mut self, script: &mut UiScript, may_cast: bool) {
+        // The use's requirement gate (`0x5d8e0e`) reads the player as the apply finds it.
+        self.requirements.seat(script);
         let Self {
             targeting,
             ladder,
@@ -404,15 +349,6 @@ impl ScriptItemUse<'_, '_> {
     }
 }
 
-/// Whether the call took a lock for `arm`, which a send that never goes out lets go. A projectile's
-/// equip unlocked instead; letting it go again only signals again.
-fn arm_locked(arm: UseArm) -> bool {
-    matches!(
-        arm,
-        UseArm::Withdraw | UseArm::Deposit | UseArm::Sell | UseArm::Item(UseFork::Equip)
-    )
-}
-
 /// The clicked item's send data, read as the call applies.
 #[derive(Clone, Copy)]
 struct Clicked {
@@ -420,7 +356,6 @@ struct Clicked {
     entry: u32,
     /// Instance `ITEM_FIELD_ITEM_TEXT_ID`, nonzero on a letter made from mail.
     item_text_id: u32,
-    display_info_id: u32,
     start_quest: u32,
     spell_index: u8,
     /// The template's on-use spell, the key of the cast tail's in-flight guard.
@@ -447,6 +382,17 @@ pub(crate) fn use_fork(
     } else {
         dispatch_fork(t, inst_flags, item_text_id)
     }
+}
+
+/// The world frame's right-press hook's wrap leg (`0x492c20`): a pending gift wrap
+/// (`IsWrappingItem 0x5edf10` at `0x492c44`) clears the cursor, `ClearCursor(1, 1)` (`0x495190` at
+/// `0x492c54`), which ends the wrap with whatever it held ([`crate::target::right_press_hook`]).
+pub(crate) fn clear_wrap_on_right_press(mut hosted_vm: crate::script_calls::HostedVm) {
+    hosted_vm.run(|script| {
+        if let Some(script) = script.filter(|s| s.gift_wrap_armed().is_some()) {
+            script.clear_cursor_payload();
+        }
+    })
 }
 
 /// [`use_fork`] past the equip fork: the dispatcher's own arms, which `UseInventoryItem` reaches
@@ -548,7 +494,9 @@ fn harness_vm() -> UiScript {
 
 #[cfg(test)]
 mod tests {
+    use super::super::ITEM_CLASS_PROJECTILE;
     use super::*;
+    use crate::items::Items;
     use benilla_protocol::messages::{ItemInfo, ObjectFields, ITEM_FLAG_LOOTABLE};
 
     /// Small Barnacled Clam.
@@ -1532,6 +1480,7 @@ mod tests {
 #[cfg(test)]
 mod bind_confirm_tests {
     use super::*;
+    use crate::items::Items;
     use benilla_protocol::messages::{ItemInfo, ObjectFields};
     use benilla_ui::script::{ContainerSlot, ContainerState};
 

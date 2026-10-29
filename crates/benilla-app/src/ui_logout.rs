@@ -20,26 +20,47 @@ use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 
 use crate::net::{ClientCommand, LoggedOutMessage, NetCommands, SelfGuid};
-use crate::ui_script::UiFeed;
 
 /// The refusal line for every non-zero reason, never `PLAYER_LOGOUT_FAILED_ERROR`: message `0x180`
 /// of the `DisplayError` at `0x5aaf26`, a key so the player's `GlobalStrings.lua` supplies it.
 const LOGOUT_FAILED_KEY: &str = "ERR_LOGOUT_FAILED";
 
-/// What the wire told us to say next, queued because a cancel can land in its response's frame.
+/// What a logout reply signals inside its handler, on the notice lane at the packet's place.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LogoutSignal {
-    /// A timed logout started: `PLAYER_CAMPING`.
+    /// A timed logout started: `PLAYER_CAMPING` (276, `0x5aaf17`).
     Camping,
-    /// The same for a quit: `PLAYER_QUITING`.
+    /// The same for a quit: `PLAYER_QUITING` (277), the quit byte added to the id (`0x5aaf0c`).
     Quiting,
-    /// The logout was cancelled: `LOGOUT_CANCEL`.
+    /// The logout was cancelled: `LOGOUT_CANCEL` (278, `0x5aaf72`).
     Cancelled,
-    /// Refused: an error line, no dialog.
+    /// Refused: the error line, no dialog (`0x5aaf26`).
     Refused,
 }
 
-/// The pending session exit and the signals owed to the UI.
+impl LogoutSignal {
+    /// The notice that signals it.
+    fn notice(self) -> crate::field_watch::FieldNotice {
+        use crate::field_watch::{id, FieldNotice};
+        match self {
+            Self::Camping => FieldNotice::Global {
+                id: id::PLAYER_CAMPING,
+            },
+            Self::Quiting => FieldNotice::Global {
+                id: id::PLAYER_QUITING,
+            },
+            Self::Cancelled => FieldNotice::Global {
+                id: id::LOGOUT_CANCEL,
+            },
+            Self::Refused => FieldNotice::Line {
+                key: LOGOUT_FAILED_KEY,
+            },
+        }
+    }
+}
+
+/// The session's logout bytes, which the replies' handlers and the session verbs read and write
+/// in place.
 #[derive(Resource, Default)]
 pub(crate) struct LogoutState {
     /// The reference's `[session+0x1b1c]`, the one bit the wire lacks, as a quit is also
@@ -56,7 +77,6 @@ pub(crate) struct LogoutState {
     /// the quit byte (`0x5ab020`-`0x5ab02a`), so a `Logout()` on a worldport's loading screen sends
     /// nothing.
     world_handle: bool,
-    signals: Vec<LogoutSignal>,
 }
 
 impl LogoutState {
@@ -65,38 +85,38 @@ impl LogoutState {
         self.pending
     }
 
-    /// `SMSG_LOGOUT_RESPONSE`, the module doc's table; an instant logout signals nothing.
-    pub(crate) fn apply_response(&mut self, reason: u32, instant: bool) {
+    /// `SMSG_LOGOUT_RESPONSE` (`0x5aaef0`), the module doc's table: what it signals, nothing for
+    /// an instant logout.
+    fn apply_response(&mut self, reason: u32, instant: bool) -> Option<LogoutSignal> {
         // Logged: the server's inputs (combat, resting, account level) are invisible from here.
         info!("logout: server answered reason={reason} instant={instant}");
         if reason != 0 {
             // `0x5aaf21`: the error line, and the pending flag clears so the player can retry.
             self.pending = false;
-            self.signals.push(LogoutSignal::Refused);
-            return;
+            return Some(LogoutSignal::Refused);
         }
         if instant {
-            return;
+            return None;
         }
-        self.signals.push(if self.quitting {
+        Some(if self.quitting {
             LogoutSignal::Quiting
         } else {
             LogoutSignal::Camping
-        });
+        })
     }
 
     /// `SMSG_LOGOUT_CANCEL_ACK` (`0x5b4680`, then `0x5aaf60`). `CancelLogout` clears the pending
-    /// byte as it sends (`0x5aafc2`), so the ack of the player's own cancel fires nothing.
-    pub(crate) fn apply_cancelled(&mut self) {
-        self.call_off();
+    /// byte as it sends (`0x5aafc2`), so the ack of the player's own cancel signals nothing.
+    fn apply_cancelled(&mut self) -> Option<LogoutSignal> {
+        self.call_off()
     }
 
     /// The world left, `0x5aae70(0)`: by a world load (`0x401bd4`), by the logout's completion
     /// (`0x5aaeb3` → `0x5aaf4f`, ahead of the teardown at `0x5aaeca`), and by a refused login
-    /// (`0x5aad76` → `0x5aaf4f`). A completed logout that was not forced fires `LOGOUT_CANCEL`.
-    pub(crate) fn apply_left_world(&mut self) {
+    /// (`0x5aad76` → `0x5aaf4f`). A completed logout that was not forced signals `LOGOUT_CANCEL`.
+    fn apply_left_world(&mut self) -> Option<LogoutSignal> {
         self.world_handle = false;
-        self.call_off();
+        self.call_off()
     }
 
     /// The world handle seated, as a test of the verbs in the world needs it.
@@ -107,39 +127,9 @@ impl LogoutState {
 
     /// `LOGOUT_CANCEL` only while a request is pending (`0x5aaf63`-`0x5aaf6b`,
     /// `0x5aae88`-`0x5aae90`), then the byte clears (`0x5aaf77`, `0x5aae9c`).
-    fn call_off(&mut self) {
-        if std::mem::take(&mut self.pending) {
-            self.signals.push(LogoutSignal::Cancelled);
-        }
+    fn call_off(&mut self) -> Option<LogoutSignal> {
+        std::mem::take(&mut self.pending).then_some(LogoutSignal::Cancelled)
     }
-}
-
-/// Fire the signals in wire order: the events the stock CAMP and QUIT dialogs hang off, and the
-/// refusal line.
-fn feed_logout(
-    mut vm: crate::script_calls::VmWith<ResMut<'static, LogoutState>>,
-    mut sink: crate::ui_action::MessageSink,
-) {
-    let signals = std::mem::take(&mut vm.own().signals);
-    if signals.is_empty() {
-        return;
-    }
-    vm.run(|script| {
-        let Some(script) = script else {
-            return;
-        };
-        for signal in signals {
-            match signal {
-                LogoutSignal::Camping => script.fire_event("PLAYER_CAMPING", Vec::new()),
-                LogoutSignal::Quiting => script.fire_event("PLAYER_QUITING", Vec::new()),
-                LogoutSignal::Cancelled => script.fire_event("LOGOUT_CANCEL", Vec::new()),
-                LogoutSignal::Refused => {
-                    let line = crate::ui_action::keyed_line(script, LOGOUT_FAILED_KEY);
-                    crate::ui_action::show_messages(script, &mut sink, "ui_logout", line);
-                }
-            }
-        }
-    })
 }
 
 /// What a session verb posts past its call, which nothing the script reads waits on: the process's
@@ -313,31 +303,55 @@ impl Plugin for UiLogoutPlugin {
             .init_resource::<SessionPosts>()
             .add_systems(
                 Update,
-                (
-                    // Ahead of a worldport's sweep: the world load marks the connection out of
-                    // the world (`0x401bd4`), firing `LOGOUT_CANCEL`, before it destroys the old
-                    // world, whose player destructor runs the sweep's `PLAYER_LEAVING_WORLD`.
-                    feed_logout
-                        .in_set(UiFeed)
-                        .before(crate::ui_script::sweep_on_worldport),
-                    // After the unit feed, which fires the arrival's world-enter cascade: the
-                    // handle is seated after it (`0x5deb60`, then `0x5deb73`).
-                    seat_world_handle
-                        .in_set(UiFeed)
-                        .after(crate::ui_unit::UnitFeed),
-                    exit_on_logout_complete.in_set(crate::ui_script::UiDrain),
-                ),
+                exit_on_logout_complete.in_set(crate::ui_script::UiDrain),
+            )
+            .add_systems(
+                PreUpdate,
+                // The world load's first call, ahead of its teardown and the sweep.
+                leave_world
+                    .in_set(crate::net::WorldportTimer::Connection)
+                    .run_if(|pending: Option<Res<crate::net::PendingWorldports>>| {
+                        pending.is_some_and(|p| p.is_posted())
+                    }),
             );
     }
 }
 
-/// The active player's arrival (`0x5dea50`) seats the world handle (`0x5deb73`).
-fn seat_world_handle(
-    mut arrivals: MessageReader<crate::net::WorldEnterCascadeMessage>,
-    mut logout: ResMut<LogoutState>,
+/// `SetInWorld(1)` (`0x5aae70`), our player's arrival's last call into the connection (`0x5deb73`),
+/// after its world-enter cascade: the world handle seated (`0x5aae82`), then `LOGOUT_CANCEL` in
+/// place when a logout request was pending (`0x5aae88`-`0x5aae9c`), its byte cleared.
+pub(crate) fn set_in_world(
+    mut vm: crate::script_calls::VmWith<Option<ResMut<'static, LogoutState>>>,
 ) {
-    if arrivals.read().count() > 0 {
+    let called_off = vm.own().is_some_and(|mut logout| {
         logout.world_handle = true;
+        std::mem::take(&mut logout.pending)
+    });
+    if called_off {
+        vm.run(|script| {
+            if let Some(script) = script {
+                script.fire_event("LOGOUT_CANCEL", Vec::new());
+            }
+        });
+    }
+}
+
+/// `SetInWorld(0)` (`0x5aae70`) as the world load's first call (`0x401bd4`): the world handle
+/// zeroed and `LOGOUT_CANCEL` in place when a logout request was pending (`0x5aae88`-`0x5aae9c`),
+/// its byte cleared, ahead of the load's teardown. Runs only with a load posted.
+pub(crate) fn leave_world(
+    mut vm: crate::script_calls::VmWith<Option<ResMut<'static, LogoutState>>>,
+) {
+    let called_off = vm.own().is_some_and(|mut logout| {
+        logout.world_handle = false;
+        std::mem::take(&mut logout.pending)
+    });
+    if called_off {
+        vm.run(|script| {
+            if let Some(script) = script {
+                script.fire_event("LOGOUT_CANCEL", Vec::new());
+            }
+        });
     }
 }
 
@@ -358,19 +372,31 @@ mod net {
             .net_handler(K::CharacterLoginFailed, on_narration);
     }
 
-    fn on_narration(In(ev): In<SessionEvent>, mut logout: ResMut<LogoutState>) {
-        match ev {
+    /// Each reply's signal goes on the notice lane at its packet's place, as the reference's
+    /// handlers signal in place (`0x5aaf17`, `0x5aaf26`, `0x5aaf72`, `0x5aae96`).
+    fn on_narration(
+        In(ev): In<SessionEvent>,
+        mut logout: ResMut<LogoutState>,
+        mut lane: ResMut<crate::field_watch::NoticeLane>,
+    ) {
+        let signal = match ev {
             SessionEvent::LogoutResponse { reason, instant } => {
                 logout.apply_response(reason, instant)
             }
             SessionEvent::LogoutCancelled => logout.apply_cancelled(),
-            // `SMSG_NEW_WORLD`, and `SMSG_LOGIN_VERIFY_WORLD` for another map (`0x401ea4`): both
-            // run the world load `0x401bc0`. `SMSG_LOGOUT_COMPLETE` (`0x5aaeb0`) and
+            // `SMSG_LOGIN_VERIFY_WORLD` for another map (`0x401ea4`) runs the world load
+            // `0x401bc0` in place; `SMSG_NEW_WORLD` posts it as a timer, whose run leaves the
+            // world ([`super::leave_world`]). `SMSG_LOGOUT_COMPLETE` (`0x5aaeb0`) and
             // `SMSG_CHARACTER_LOGIN_FAILED` (`0x5aad70`) leave the world first.
-            SessionEvent::Worldport { .. }
+            SessionEvent::Worldport {
+                needs_ack: false, ..
+            }
             | SessionEvent::LoggedOut
             | SessionEvent::CharacterLoginFailed { .. } => logout.apply_left_world(),
-            _ => {}
+            _ => None,
+        };
+        if let Some(signal) = signal {
+            lane.write(signal.notice());
         }
     }
 }
@@ -386,31 +412,32 @@ mod tests {
     #[test]
     fn the_response_decides_which_dialog_if_any() {
         let mut s = LogoutState::default();
-        s.apply_response(0, true);
-        assert!(s.signals.is_empty(), "an instant logout shows no dialog");
-
-        s.apply_response(0, false);
-        assert_eq!(s.signals, vec![LogoutSignal::Camping]);
+        assert_eq!(
+            s.apply_response(0, true),
+            None,
+            "an instant logout shows no dialog"
+        );
+        assert_eq!(s.apply_response(0, false), Some(LogoutSignal::Camping));
 
         let mut s = LogoutState {
             quitting: true,
             pending: true,
-            signals: Vec::new(),
             ..LogoutState::default()
         };
-        s.apply_response(0, false);
-        assert_eq!(s.signals, vec![LogoutSignal::Quiting], "a quit says so");
+        assert_eq!(
+            s.apply_response(0, false),
+            Some(LogoutSignal::Quiting),
+            "a quit says so"
+        );
 
         // In combat: the error line (`0x5aaf21`) and the pending byte cleared (`0x5aaf2e`); the
         // quit byte stays, as only a request writes it (`0x5ab053`).
         let mut s = LogoutState {
             quitting: true,
             pending: true,
-            signals: Vec::new(),
             ..LogoutState::default()
         };
-        s.apply_response(1, false);
-        assert_eq!(s.signals, vec![LogoutSignal::Refused]);
+        assert_eq!(s.apply_response(1, false), Some(LogoutSignal::Refused));
         assert!(s.quitting, "the refusal leaves the quit byte");
         assert!(
             !s.pending,
@@ -430,6 +457,14 @@ mod tests {
             .seat_world_handle_for_test();
         app.insert_non_send_resource(UiScript::new().unwrap());
         (app, rx)
+    }
+
+    /// What the logout replies' handlers put on the notice lane, taken.
+    fn notices(app: &mut App) -> Vec<crate::field_watch::FieldNotice> {
+        app.world_mut()
+            .resource_mut::<crate::field_watch::NoticeLane>()
+            .drain()
+            .collect()
     }
 
     /// Run `chunk` with the host lent; what it sent of the logout's and the roll's packets.
@@ -511,16 +546,12 @@ mod tests {
         let mut s = LogoutState {
             quitting: true,
             pending: true,
-            signals: Vec::new(),
             ..LogoutState::default()
         };
-        s.apply_cancelled();
-        assert_eq!(s.signals, vec![LogoutSignal::Cancelled]);
+        assert_eq!(s.apply_cancelled(), Some(LogoutSignal::Cancelled));
         assert!(!s.pending);
         assert!(s.quitting, "the ack leaves the quit byte");
-        s.signals.clear();
-        s.apply_cancelled();
-        assert!(s.signals.is_empty(), "nothing pending, nothing fired");
+        assert_eq!(s.apply_cancelled(), None, "nothing pending, nothing fired");
     }
 
     /// The ack of the player's own cancel fires nothing: `CancelLogout` (`0x5aaf80`) clears the
@@ -536,15 +567,25 @@ mod tests {
             app.world_mut(),
             vec![SessionEvent::LogoutCancelled, SessionEvent::LogoutCancelled],
         );
-        assert!(app.world().resource::<LogoutState>().signals.is_empty());
+        assert!(notices(&mut app).is_empty());
     }
 
     /// A world load leaves the world first (`0x401bd4` → `0x5aae70(0)`), which fires
-    /// `LOGOUT_CANCEL` while a request is pending (`0x5aae88`-`0x5aae97`) and clears the byte
-    /// (`0x5aae9c`), so the next `Logout()` is heard; with nothing pending it fires nothing.
+    /// `LOGOUT_CANCEL` in place while a request is pending (`0x5aae88`-`0x5aae97`) and clears the
+    /// byte (`0x5aae9c`), so the next `Logout()` is heard. `SMSG_NEW_WORLD` only posts the load
+    /// (`0x401ba5`), so the request stands until the timer runs.
     #[test]
     fn a_world_load_calls_off_a_pending_logout() {
         let (mut app, rx) = client();
+        app.world_mut()
+            .non_send_resource::<UiScript>()
+            .run(
+                "Cancelled = 0 local f = CreateFrame('Frame') f:RegisterEvent('LOGOUT_CANCEL') \
+                 f:SetScript('OnEvent', function() Cancelled = Cancelled + 1 end)",
+            )
+            .expect("spy");
+        let cancelled =
+            |app: &App| -> i64 { crate::script_calls::eval_in_vm(app.world(), "return Cancelled") };
         let port = || SessionEvent::Worldport {
             map_id: 1,
             position: [0.0; 3],
@@ -554,14 +595,20 @@ mod tests {
         assert_eq!(sent_by(&mut app, &rx, "Logout()"), ["logout"]);
         crate::net::handlers::dispatch(app.world_mut(), vec![port()]);
         let logout = app.world().resource::<LogoutState>();
-        assert!(!logout.pending, "the load clears the pending byte");
-        assert_eq!(logout.signals, [LogoutSignal::Cancelled]);
+        assert!(logout.pending, "the packet only posts the load");
+        assert!(notices(&mut app).is_empty());
+        assert_eq!(cancelled(&app), 0);
         app.world_mut()
-            .resource_mut::<LogoutState>()
-            .signals
-            .clear();
+            .run_system_cached(leave_world)
+            .expect("the load");
+        let logout = app.world().resource::<LogoutState>();
+        assert!(!logout.pending, "the load clears the pending byte");
+        assert_eq!(cancelled(&app), 1, "and signals it in place");
         crate::net::handlers::dispatch(app.world_mut(), vec![port()]);
-        assert!(app.world().resource::<LogoutState>().signals.is_empty());
+        app.world_mut()
+            .run_system_cached(leave_world)
+            .expect("the load");
+        assert_eq!(cancelled(&app), 1, "with nothing pending it fires nothing");
         app.world_mut()
             .resource_mut::<LogoutState>()
             .seat_world_handle_for_test();
@@ -577,14 +624,13 @@ mod tests {
         let (mut app, rx) = client();
         assert_eq!(sent_by(&mut app, &rx, "Logout()"), ["logout"]);
         crate::net::handlers::dispatch(app.world_mut(), vec![SessionEvent::LoggedOut]);
-        let logout = app.world().resource::<LogoutState>();
-        assert!(!logout.pending);
-        assert_eq!(logout.signals, [LogoutSignal::Cancelled]);
+        assert!(!app.world().resource::<LogoutState>().pending);
+        assert_eq!(notices(&mut app), [LogoutSignal::Cancelled.notice()]);
 
         let (mut app, rx) = client();
         assert_eq!(sent_by(&mut app, &rx, "ForceLogout()"), ["force"]);
         crate::net::handlers::dispatch(app.world_mut(), vec![SessionEvent::LoggedOut]);
-        assert!(app.world().resource::<LogoutState>().signals.is_empty());
+        assert!(notices(&mut app).is_empty());
     }
 
     /// `SMSG_CHARACTER_LOGIN_FAILED` (`0x5b45f0` → `0x5aad70`) leaves the world first
@@ -597,46 +643,8 @@ mod tests {
             app.world_mut(),
             vec![SessionEvent::CharacterLoginFailed { result: 1 }],
         );
-        let logout = app.world().resource::<LogoutState>();
-        assert!(!logout.pending);
-        assert_eq!(logout.signals, [LogoutSignal::Cancelled]);
-    }
-
-    /// A worldport's `LOGOUT_CANCEL` fires ahead of its sweep's `PLAYER_LEAVING_WORLD`: the
-    /// world load marks the connection out of the world (`0x401bd4`) before it destroys the old
-    /// world, whose player destructor runs the sweep (`0x5dd543`).
-    #[test]
-    fn a_worldports_cancel_fires_ahead_of_its_sweep() {
-        use crate::game_plugins::schedule_tests::{census, type_names_available, SyncPoints};
-        let mut app = crate::game_plugins::schedule_tests::headless_client();
-        let update = census(&mut app, Update, SyncPoints::Declared);
-        if !type_names_available(&update) {
-            return;
-        }
-        let one = |suffix: &str| {
-            let mut hits = update
-                .systems
-                .iter()
-                .filter(|(_, s)| s.name.ends_with(suffix));
-            match (hits.next(), hits.next()) {
-                (Some((key, _)), None) => *key,
-                _ => panic!("exactly one `…{suffix}`"),
-            }
-        };
-        let (feed, sweep) = (one("ui_logout::feed_logout"), one("::sweep_on_worldport"));
-        let mut seen = std::collections::HashSet::new();
-        let mut stack = vec![feed];
-        while let Some(n) = stack.pop() {
-            for (a, b) in &update.dependencies {
-                if *a == n && seen.insert(*b) {
-                    stack.push(*b);
-                }
-            }
-        }
-        assert!(
-            seen.contains(&sweep),
-            "the feed is declared ahead of the sweep"
-        );
+        assert!(!app.world().resource::<LogoutState>().pending);
+        assert_eq!(notices(&mut app), [LogoutSignal::Cancelled.notice()]);
     }
 
     /// A world load zeroes the world handle (`0x401bd4` → `0x5aae70(0)`, stored at `0x5aae82`)
@@ -652,13 +660,14 @@ mod tests {
             needs_ack: true,
         };
         crate::net::handlers::dispatch(app.world_mut(), vec![port]);
+        app.world_mut()
+            .run_system_cached(leave_world)
+            .expect("the load");
         assert_eq!(sent_by(&mut app, &rx, "Quit()"), Vec::<String>::new());
         let logout = app.world().resource::<LogoutState>();
         assert!(!logout.pending && !logout.quitting, "nothing stored");
         app.world_mut()
-            .write_message(crate::net::WorldEnterCascadeMessage);
-        app.world_mut()
-            .run_system_once(seat_world_handle)
+            .run_system_cached(set_in_world)
             .expect("the arrival");
         assert_eq!(sent_by(&mut app, &rx, "Logout()"), ["logout"]);
     }

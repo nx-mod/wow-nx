@@ -68,9 +68,7 @@ impl super::UiScript {
     fn bags_enter_world(&mut self) {
         let held: Vec<i64> = {
             let model = self.model_ref();
-            (1..=10)
-                .filter(|n| model.containers.contains_key(n))
-                .collect()
+            super::held::held_bags(&self.lua, &model)
         };
         for n in held {
             self.fire_event("BAG_UPDATE", vec![super::ScriptValue::Int(n)]);
@@ -90,7 +88,8 @@ impl super::UiScript {
     /// (272, `0x49096a`) every time, then the minimap's zoom reseed
     /// ([`Self::minimap_enter_world`]), the action bar's usable refresh and its
     /// `ACTIONBAR_UPDATE_USABLE` when the caller says a pair changed, the bonus bar's offset,
-    /// `bonus_bar_offset`, from the player's form and its `UPDATE_BONUS_ACTIONBAR`, the bags'
+    /// `bonus_bar_offset`, from the player's form and its `UPDATE_BONUS_ACTIONBAR`, the buff
+    /// cache's setup and its `PLAYER_AURAS_CHANGED` (`0x490983`, the app's), the bags'
     /// `BAG_UPDATE`s ([`Self::bags_enter_world`]), the quest log's rebuild and its `QUEST_LOG_UPDATE`
     /// ([`Self::quest_log_enter_world`]), the pet bar's reset ([`Self::drop_pet_bar`],
     /// [`Self::fire_pet_bar_dropped`]), the reputation list's rebuild and its `UPDATE_FACTION`
@@ -99,51 +98,100 @@ impl super::UiScript {
     /// the world, so its caller seats `"player"` first, and inside its own sound-suppression
     /// bracket (`0x4908d5` to `0x490a56`), so a handler's `PlaySound` is dropped.
     ///
-    /// The pet bar here is the VM's own: a caller that holds the bar's guid runs the cascade in
-    /// its three parts, [`Self::fire_world_enter_head`], the reset on both sides, then
+    /// The pet bar here is the VM's own, and the buff cache's setup (`0x490983`), which the app
+    /// holds, is left out: a caller that holds the bar's guid and the cache runs the cascade in its
+    /// parts, [`Self::fire_world_enter_head`], the cache's setup,
+    /// [`Self::fire_world_enter_watchers`], the reset on both sides, then
     /// [`Self::fire_world_enter_tail`].
     pub fn fire_world_enter_with(&mut self, bonus_bar_offset: u8) {
         self.fire_world_enter_head(bonus_bar_offset, false);
+        self.fire_world_enter_watchers();
         let dropped = self.drop_pet_bar();
         self.fire_pet_bar_dropped(dropped);
         self.fire_world_enter_tail();
     }
 
-    /// The cascade up to the pet bar's reset (`0x4909c9`): the bracket opened, the collection,
-    /// `PLAYER_LOGIN` if armed, `PLAYER_ENTERING_WORLD` and the calls after it through the quest
-    /// log's (`0x4909a1`). `usable_changed` is whether the action bar's refresh found a slot's pair
-    /// changed, which the caller's slots decide. [`Self::fire_world_enter_tail`] closes it.
+    /// The cascade up to the buff cache's setup (`0x490983`): its events
+    /// ([`Self::fire_world_enter_events`]), then the action bar's ([`Self::fire_world_enter_action_bar`]).
+    /// [`Self::fire_world_enter_tail`] closes it.
     pub fn fire_world_enter_head(&mut self, bonus_bar_offset: u8, usable_changed: bool) {
+        self.open_world_enter();
+        self.fire_world_enter_events();
+        self.fire_world_enter_action_bar(bonus_bar_offset, usable_changed);
+    }
+
+    /// The cascade's sound bracket opened (`0x4908d5` → `0x458f50`), ahead of its
+    /// `SelectTarget(0)` (`0x490927`), the caller's, so the target's handlers play nothing.
+    /// [`Self::close_world_enter`] closes it.
+    pub fn open_world_enter(&mut self) {
+        self.push_sound_suppression();
+    }
+
+    /// The cascade past its `SelectTarget(0)`: the collection, `PLAYER_LOGIN` if armed,
+    /// `PLAYER_ENTERING_WORLD`, then the first call after the signal, the minimap initializer
+    /// (`0x49096f`), inside the bracket [`Self::open_world_enter`] opened. The chat release follows
+    /// it (`0x490974`), the caller's.
+    pub fn fire_world_enter_events(&mut self) {
         self.seat_reputation();
         let armed = std::mem::take(&mut self.model_mut().player_login_armed);
-        self.push_sound_suppression();
         // `0x703bc0` with 1: the threshold set to 0 (`0x703bd6`), so the collection runs now.
         self.lua.set_gc_threshold_kb(0);
         if armed {
             self.fire_event("PLAYER_LOGIN", Vec::new());
         }
         self.fire_event("PLAYER_ENTERING_WORLD", Vec::new());
-        // The calls after the signal, inside the bracket: the minimap initializer first
-        // (`0x49096f`), then among the rest the action bar's refresh (`0x490979` → `0x4e4f90`):
-        // the usable refresh `0x4e5c00`, signalling `ACTIONBAR_UPDATE_USABLE` on a changed pair
-        // (`0x4e5c53`), then the bonus bar (`0x4e4f95` → `0x4e4fc0`), which sets the offset and
-        // signals whether or not it moved (`0x4e5018`); then the bag watchers' set-up
-        // (`0x49098d`) and the quest log's (`0x4909a1`).
         self.minimap_enter_world();
+    }
+
+    /// The action bar's call (`0x490979` → `0x4e4f90`): the usable refresh `0x4e5c00`, signalling
+    /// `ACTIONBAR_UPDATE_USABLE` on a changed pair (`0x4e5c53`), which `usable_changed` says the
+    /// caller's slots found, then the bonus bar (`0x4e4f95` → `0x4e4fc0`), which sets the offset
+    /// and signals whether or not it moved (`0x4e5018`).
+    pub fn fire_world_enter_action_bar(&mut self, bonus_bar_offset: u8, usable_changed: bool) {
         if usable_changed {
             self.fire_event("ACTIONBAR_UPDATE_USABLE", Vec::new());
         }
         self.set_bonus_bar_offset(bonus_bar_offset);
         self.fire_event("UPDATE_BONUS_ACTIONBAR", Vec::new());
+    }
+
+    /// The cascade after the buff cache's setup up to the pet bar's reset (`0x4909c9`): the bag
+    /// watchers' set-up (`0x49098d`) and the quest log's (`0x4909a1`).
+    pub fn fire_world_enter_watchers(&mut self) {
+        self.fire_world_enter_bags();
+        self.fire_world_enter_quest_log();
+    }
+
+    /// The bag watchers' set-up (`0x49098d`, [`Self::bags_enter_world`]).
+    pub fn fire_world_enter_bags(&mut self) {
         self.bags_enter_world();
+    }
+
+    /// The quest log's init (`0x4909a1`): its rebuild and `QUEST_LOG_UPDATE`.
+    pub fn fire_world_enter_quest_log(&mut self) {
         self.quest_log_enter_world();
     }
 
-    /// The cascade after the pet bar's reset: the reputation rebuild (`0x4909d3`) and the skill
-    /// list's (`0x4909f1` → `0x4d2c90`), then the bracket closed (`0x490a56`).
+    /// The cascade after the pet bar's reset: its rebuilds ([`Self::fire_world_enter_rebuilds`]),
+    /// then the bracket closed ([`Self::close_world_enter`]).
     pub fn fire_world_enter_tail(&mut self) {
+        self.fire_world_enter_rebuilds();
+        self.close_world_enter();
+    }
+
+    /// The reputation rebuild (`0x4909d3`), the looking-for-group lists' (`0x4909e7` → `0x4e7f00`)
+    /// and the skill list's (`0x4909f1` → `0x4d2c90`). The lists' call is the type recount, which
+    /// signals `UPDATE_LFG_TYPES` (`0x4e89c0`, `0x4e8b0e`), then the quest list's rebuild, which
+    /// signals it again (`0x4e8be0`, `0x4e8c70`).
+    pub fn fire_world_enter_rebuilds(&mut self) {
         self.reputation_enter_world();
+        self.fire_event("UPDATE_LFG_TYPES", Vec::new());
+        self.fire_event("UPDATE_LFG_TYPES", Vec::new());
         self.rebuild_skills();
+    }
+
+    /// The cascade's bracket closed (`0x490a56`), after its last call.
+    pub fn close_world_enter(&mut self) {
         self.pop_sound_suppression();
     }
 }

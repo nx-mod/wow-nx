@@ -7,7 +7,9 @@
 use mlua::{Lua, MultiValue, Value};
 
 use super::binding_abi;
+use super::live::{ask, LiveQuery};
 use super::Model;
+use super::TooltipText;
 
 /// A service's state byte `[+0x30]` (the wire's `TrainerSpellState`): green learnable, red gated,
 /// gray known, and the state the re-evaluator writes at a mount trainer for a rank the player has
@@ -67,8 +69,8 @@ fn filter_bit_named(name: &str) -> Option<u32> {
 /// The state mask `"all"` sets (`0x4da2a9`): the three states a filter can name.
 const TRAINER_FILTER_ALL: u32 = 7;
 
-/// A service's skill requirement (`GetTrainerServiceSkillReq`). The wire has no per-gate bit, so
-/// `met` comes from the service's `category`.
+/// A service's skill requirement (`GetTrainerServiceSkillReq`). `met` is the snapshot's answer to
+/// the player's skill; the getter reads it again at the call ([`TrainerServiceLive::skill_met`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TrainerSkillReq {
     pub name: String,
@@ -180,6 +182,10 @@ pub struct TrainerService {
     /// `GetTrainerSkillLines` (`0x4da660`) lists per header; `None` for a key with no row, the
     /// known-talents group's -1 and a tradeskill trainer's 1 and 2 included.
     pub line_name: Option<String>,
+    /// `GetTrainerServiceSkillLine`'s name (`0x4d91dc`): the `SkillLine` of the ability row of the
+    /// spell the row teaches, else of the sent spell, which differs from the group's name at a
+    /// tradeskill trainer; `None` answers nil.
+    pub skill_line: Option<String>,
 }
 
 /// One header and its services, built by [`UiScript::set_trainer`].
@@ -206,6 +212,35 @@ pub struct TrainerState {
     pub trainer_type: u32,
     /// Built by [`UiScript::set_trainer`], not pushed by the app.
     pub groups: Vec<TrainerGroup>,
+    /// Which `SMSG_TRAINER_LIST` the rows came from: a live read answers only for the same list.
+    pub list: u64,
+}
+
+/// What a service's getters read at the call, for the service at `service` in
+/// [`TrainerState::services`] of list `list`: the icon's and the description's product lookups
+/// (`0x4d9096`, `0x4d9d07`), the description's tokens against the caster now, and each required
+/// ability against the book now (`0x4d97c8` → `0x60c740`).
+pub struct TrainerServiceQuery {
+    pub list: u64,
+    pub service: usize,
+}
+
+impl LiveQuery for TrainerServiceQuery {
+    type Answer = TrainerServiceLive;
+}
+
+/// The host's answer to a [`TrainerServiceQuery`].
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TrainerServiceLive {
+    pub texture: Option<String>,
+    pub icon_wait: Option<ProductWait>,
+    /// Each template it names read from the VM's strings at the getter.
+    pub description: Option<TooltipText>,
+    pub description_wait: Option<ProductWait>,
+    pub ability_reqs: Vec<TrainerAbilityReq>,
+    /// `GetTrainerServiceSkillReq`'s third value as the call finds it (`0x4d9570`): the player's
+    /// skill reaches the required value, 1 whenever nothing asks it.
+    pub skill_met: bool,
 }
 
 impl super::UiScript {
@@ -269,6 +304,25 @@ impl super::UiScript {
                 }
             }
         }
+    }
+
+    /// The world-enter cascade's trainer reset (`0x4909ab` → `0x4d73e0`): the guid, the selection
+    /// and the total zeroed (`0x4d73e2`-`0x4d73f1`), so no row reads; the group headers, the
+    /// visible count, the filters and the expanded mask (`0xb73a14`-`0xb73a24`) are not its, and
+    /// stay for the next list to reset.
+    pub fn reset_trainer_world_state(&mut self) {
+        let mut model = self.model_mut();
+        model.trainer = None;
+        model.trainer_selection = None;
+        model.trainer_rows.clear();
+    }
+
+    /// The collapsed skill lines, for a test of what keeps them.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn trainer_collapsed_for_test(&self) -> Vec<u32> {
+        let mut lines: Vec<u32> = self.model_mut().trainer_collapsed.iter().copied().collect();
+        lines.sort_unstable();
+        lines
     }
 
     /// Reset what each `SMSG_TRAINER_LIST` resets in the reference (`0x4d7560`): the filter to mask
@@ -634,6 +688,31 @@ pub(super) fn service(model: &Model, index: usize) -> Option<&TrainerService> {
     }
 }
 
+/// The per-call reads of the service at a 1-based row index through the lent host; without one,
+/// or for another list than the rows', the snapshot's.
+fn live(lua: &Lua, model: &Model, index: usize) -> Option<TrainerServiceLive> {
+    let n = index.checked_sub(1)?;
+    let Row::Service(si) = *rows(model).0.get(n)? else {
+        return None;
+    };
+    let t = model.trainer.as_ref()?;
+    let query = TrainerServiceQuery {
+        list: t.list,
+        service: si,
+    };
+    ask(lua, &query).or_else(|| {
+        let s = t.services.get(si)?;
+        Some(TrainerServiceLive {
+            texture: s.texture.clone(),
+            icon_wait: s.icon_wait,
+            description: s.description.clone().map(TooltipText::from),
+            description_wait: s.description_wait,
+            ability_reqs: s.ability_reqs.clone(),
+            skill_met: s.skill_req.as_ref().is_none_or(|r| r.met),
+        })
+    })
+}
+
 /// `GetNumTrainerServices` (`0x4d8d90`): the visible count `ds:0xb73a18`, not the array's length.
 fn num_services(model: &Model) -> usize {
     rows(model).1
@@ -667,19 +746,18 @@ fn raise_trainer_update(model: &mut Model) {
     model.raise("TRAINER_UPDATE", Vec::new());
 }
 
-fn set_collapsed(model: &mut Model, id: usize, collapse: bool) {
-    if id == 0 && !collapse {
-        model.trainer_collapsed.clear();
-        return;
-    }
-    let targets: Vec<u32> = if id == 0 {
-        model
+/// The fold verbs' write on the row `n - 1` signed (`0x4da6f4`, `0x4da774`): below 0 every group
+/// at once (`0x4da6f5`, `0x4da775`), else the row must be a header of the array (`0x4d8be0` answers
+/// -1 for a service or a row past the total) whose group's bit is set or cleared. `false` is the
+/// bad skill line, which raises with nothing touched and no `TRAINER_UPDATE` (`0x4d8cd0`).
+fn set_collapsed(model: &mut Model, n: i32, collapse: bool) -> bool {
+    let targets: Vec<u32> = match usize::try_from(n.wrapping_sub(1)) {
+        Err(_) => model
             .trainer
             .as_ref()
             .map(|t| t.groups.iter().map(|g| g.key).collect())
-            .unwrap_or_default()
-    } else {
-        match rows(model).0.get(id - 1) {
+            .unwrap_or_default(),
+        Ok(row) => match rows(model).0.get(row) {
             Some(Row::Header(gi)) => model
                 .trainer
                 .as_ref()
@@ -687,8 +765,8 @@ fn set_collapsed(model: &mut Model, id: usize, collapse: bool) {
                 .map(|g| g.key)
                 .into_iter()
                 .collect(),
-            _ => Vec::new(),
-        }
+            _ => return false,
+        },
     };
     for sl in targets {
         if collapse {
@@ -697,6 +775,21 @@ fn set_collapsed(model: &mut Model, id: usize, collapse: bool) {
             model.trainer_collapsed.remove(&sl);
         }
     }
+    true
+}
+
+/// A fold verb past its usage check: the write, then `TRAINER_UPDATE`, or the `bad` line raised.
+fn fold(lua: &Lua, n: i32, collapse: bool, bad: &'static str) -> mlua::Result<()> {
+    let folded = super::tick::verb(lua, |model| {
+        let ok = set_collapsed(model, n, collapse);
+        if ok {
+            raise_trainer_update(model);
+        }
+        ok
+    });
+    folded
+        .then_some(())
+        .ok_or_else(|| mlua::Error::RuntimeError(bad.into()))
 }
 
 fn opt_str(lua: &Lua, s: Option<&String>) -> mlua::Result<Value> {
@@ -764,8 +857,9 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         })?,
     )?;
 
-    // GetTrainerServiceSkillLine(index): the group name, nil for a header. The reference's return
-    // (`0x4d9160`) is untraced; the stock `CONFIRM_PROFESSION` dialog shows it as the profession.
+    // GetTrainerServiceSkillLine(index) (`0x4d9160`): the name of the skill line of the row's
+    // ability (see [`TrainerService::skill_line`]), nil for a header; the stock `CONFIRM_PROFESSION`
+    // dialog shows it as the profession.
     g.set(
         "GetTrainerServiceSkillLine",
         lua.create_function(|lua, index: Value| {
@@ -773,19 +867,10 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             let index =
                 binding_abi::index_arg(lua, index, "Usage: GetTrainerServiceSkillLine(index)")?;
             let model = lua.app_data_ref::<Model>().expect("model app_data");
-            let Some(n) = index.checked_sub(1) else {
-                return Ok(Value::Nil);
-            };
-            let Some(Row::Service(si)) = rows(&model).0.get(n).copied() else {
-                return Ok(Value::Nil);
-            };
-            let t = model
-                .trainer
-                .as_ref()
-                .expect("a resolved row ⇒ an open trainer");
-            Ok(Value::String(
-                lua.create_string(&t.services[si].group_name)?,
-            ))
+            opt_str(
+                lua,
+                service(&model, index).and_then(|s| s.skill_line.as_ref()),
+            )
         })?,
     )?;
 
@@ -796,8 +881,8 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             let index = binding_abi::index_arg(lua, index, "Usage: GetTrainerServiceIcon(index)")?;
             let (texture, wait) = {
                 let model = lua.app_data_ref::<Model>().expect("model app_data");
-                service(&model, index)
-                    .map(|s| (s.texture.clone(), s.icon_wait))
+                live(lua, &model, index)
+                    .map(|s| (s.texture, s.icon_wait))
                     .unwrap_or_default()
             };
             // The miss asks and keeps its callback inside the call (`0x4d907e`), and pushes nil
@@ -818,10 +903,11 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                 binding_abi::index_arg(lua, index, "Usage: GetTrainerServiceDescription(index)")?;
             let (description, wait) = {
                 let model = lua.app_data_ref::<Model>().expect("model app_data");
-                service(&model, index)
-                    .map(|s| (s.description.clone(), s.description_wait))
+                live(lua, &model, index)
+                    .map(|s| (s.description, s.description_wait))
                     .unwrap_or_default()
             };
+            let description = description.map(|t| t.text(crate::strings::Strings::Vm(lua)));
             // The miss asks and keeps its callback inside the call (`0x4d9cef`).
             if let Some(wait) = wait {
                 ask_item(lua, wait)?;
@@ -871,10 +957,16 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             let Some(req) = service(&model, index).and_then(|s| s.skill_req.as_ref()) else {
                 return Ok(binding_abi::tuple(&[None, Some(0), Some(1)]));
             };
+            // The flag compares the player's skill at the call, not the row's colour (`0x4d9570`).
+            let met = live(lua, &model, index).map_or(req.met, |l| l.skill_met);
+            // An empty name answers `nil, 0` and the flag (`0x4d9589`-`0x4d9599`).
+            if req.name.is_empty() {
+                return Ok(binding_abi::tuple(&[None, Some(0), met.then_some(1)]));
+            }
             Ok(MultiValue::from_vec(vec![
                 Value::String(lua.create_string(&req.name)?),
                 Value::Integer(i64::from(req.rank)),
-                binding_abi::flag(req.met),
+                binding_abi::flag(met),
             ]))
         })?,
     )?;
@@ -903,9 +995,10 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             let i = binding_abi::index_arg(lua, i, "Usage: GetTrainerServiceAbilityReq(index)")?;
             let model = lua.app_data_ref::<Model>().expect("model app_data");
             // The slot `i - 1` read in place, bounded by the three (`0x4d979c`), not by the count.
-            let Some(req) = service(&model, index)
-                .and_then(|s| i.checked_sub(1).and_then(|n| s.ability_reqs.get(n)))
-            else {
+            let Some(req) = live(lua, &model, index).and_then(|s| {
+                i.checked_sub(1)
+                    .and_then(|n| s.ability_reqs.into_iter().nth(n))
+            }) else {
                 // `0x4d98b5`: nil, 1.
                 return Ok(binding_abi::tuple(&[None, Some(1)]));
             };
@@ -1193,30 +1286,23 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         })?,
     )?;
 
-    // Collapse/ExpandTrainerSkillLine(id): fold the group headed by row `id`, or all at 0. `id`
-    // spans the whole row array like the getters' gate (`0x4d89b0`); their own bound is untraced.
+    // Collapse/ExpandTrainerSkillLine(n): fold the group headed by row `n`, or every group for
+    // `n - 1` below 0; a row that is no header raises (`0x4da6c0`, `0x4da740`). `n` spans the
+    // whole row array like the getters' gate (`0x4d89b0`).
     g.set(
         "CollapseTrainerSkillLine",
-        lua.create_function(|lua, id: Value| {
+        lua.create_function(|lua, n: Value| {
             // `is-number` else `Usage: CollapseTrainerSkillLine(index)` (`0x84ad24`, `0x4da6d1`).
-            let id = binding_abi::index_arg(lua, id, "Usage: CollapseTrainerSkillLine(index)")?;
-            super::tick::verb(lua, |model| {
-                set_collapsed(model, id, true);
-                raise_trainer_update(model);
-            });
-            Ok(())
+            let n = binding_abi::number_arg(lua, n, "Usage: CollapseTrainerSkillLine(index)")?;
+            fold(lua, n, true, "Bad skill line in CollapseTrainerSkillLine")
         })?,
     )?;
     g.set(
         "ExpandTrainerSkillLine",
-        lua.create_function(|lua, id: Value| {
+        lua.create_function(|lua, n: Value| {
             // `is-number` else `Usage: ExpandTrainerSkillLine(index)` (`0x84ad78`, `0x4da751`).
-            let id = binding_abi::index_arg(lua, id, "Usage: ExpandTrainerSkillLine(index)")?;
-            super::tick::verb(lua, |model| {
-                set_collapsed(model, id, false);
-                raise_trainer_update(model);
-            });
-            Ok(())
+            let n = binding_abi::number_arg(lua, n, "Usage: ExpandTrainerSkillLine(index)")?;
+            fold(lua, n, false, "Bad skill line in ExpandTrainerSkillLine")
         })?,
     )?;
 

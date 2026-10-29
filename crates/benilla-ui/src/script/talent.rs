@@ -21,6 +21,7 @@
 use mlua::{Lua, MultiValue, Table, Value};
 
 use super::binding_abi::{self, flag};
+use super::live::{ask, LiveQuery};
 use super::tooltip_spell::{spell_view_of, TalentLines};
 use super::Model;
 
@@ -91,11 +92,11 @@ pub enum TalentReq {
 impl TalentReq {
     /// The line as `0x52b390` writes it now, `None` for a missing or empty template.
     fn line(&self, lua: &Lua) -> Option<String> {
-        use crate::strings::{fill, global, plural, Arg};
+        use crate::strings::{fill, global, plural, Arg, Strings};
         let get = |key: &str| global(lua, key);
         Some(match self {
             Self::Prereq { rank, name } => fill(
-                &plural("TOOLTIP_TALENT_PREREQ", Some(*rank), &get)?,
+                &plural("TOOLTIP_TALENT_PREREQ", Some(*rank), Strings::Vm(lua))?,
                 &[Arg::D(i64::from(*rank)), Arg::S(name)],
             ),
             Self::Tier { points, tab } => fill(
@@ -153,13 +154,67 @@ pub enum TalentCall {
     ConfirmWipe,
 }
 
-/// One talent by its 1-based (tab, index).
-fn talent_at(model: &Model, tab: usize, index: usize) -> Option<&TalentView> {
-    model
-        .talents
-        .talents
-        .get(tab.checked_sub(1)?)
-        .and_then(|t| t.get(index.checked_sub(1)?))
+/// The player's talent tabs as they stand, `GetTalentTabInfo`'s rows: the tab list `0xbdcd28`
+/// with each tab's points spent off the known spells (`+4`); declined without a player held.
+#[derive(Clone, Copy, Debug)]
+pub struct TalentTabs;
+
+impl LiveQuery for TalentTabs {
+    type Answer = Vec<TalentTabView>;
+}
+
+/// A tab's talent count (`+8`, `0x4f3160`), by its 0-based tab; 0 past the tabs.
+#[derive(Clone, Copy, Debug)]
+pub struct TalentCount(pub usize);
+
+impl LiveQuery for TalentCount {
+    type Answer = usize;
+}
+
+/// One talent by its 0-based (tab, index), as `GetTalentInfo` reads it off the row and the known
+/// spells at the call (`0x4f3200`); `None` past the tab or its talents.
+#[derive(Clone, Copy, Debug)]
+pub struct TalentAt(pub usize, pub usize);
+
+impl LiveQuery for TalentAt {
+    type Answer = Option<TalentView>;
+}
+
+/// The active player's two point counters, `+0xe48` and `+0xe4c` of its player block
+/// (`0x519463`): unspent talent points and free primary professions; `(0, 0)` with none held.
+#[derive(Clone, Copy, Debug)]
+pub struct CharacterPoints;
+
+impl LiveQuery for CharacterPoints {
+    type Answer = (u32, u32);
+}
+
+/// Whether a trainer's respec question is latched and its trainer in range at the call
+/// (`0x48d194` → `0x5dfb10`).
+#[derive(Clone, Copy, Debug)]
+pub struct TalentMasterPending;
+
+impl LiveQuery for TalentMasterPending {
+    type Answer = bool;
+}
+
+/// The tabs now: the host's, else the VM's copy.
+fn tabs(lua: &Lua, model: &Model) -> Vec<TalentTabView> {
+    ask(lua, &TalentTabs).unwrap_or_else(|| model.talents.tabs.clone())
+}
+
+/// One talent by its 1-based (tab, index), now: the host's, else the VM's copy.
+fn talent_at(lua: &Lua, model: &Model, tab: usize, index: usize) -> Option<TalentView> {
+    let (tab, index) = (tab.checked_sub(1)?, index.checked_sub(1)?);
+    match ask(lua, &TalentAt(tab, index)) {
+        Some(live) => live,
+        None => model.talents.talents.get(tab)?.get(index).cloned(),
+    }
+}
+
+/// The two point counters now: the host's, else the VM's copy.
+pub(super) fn character_points(lua: &Lua, model: &Model) -> (u32, u32) {
+    ask(lua, &CharacterPoints).unwrap_or(model.talents.points)
 }
 
 /// Register the talent globals.
@@ -170,7 +225,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         "GetNumTalentTabs",
         lua.create_function(|lua, ()| {
             let model = lua.app_data_ref::<Model>().expect("model app_data");
-            Ok(model.talents.tabs.len() as i64)
+            Ok(tabs(lua, &model).len() as i64)
         })?,
     )?;
 
@@ -182,7 +237,8 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             // `is-number` else `Usage: GetTalentTabInfo(index)` (`0x84cdd4`, `0x4f3059`).
             let i = binding_abi::index_arg(lua, i, "Usage: GetTalentTabInfo(index)")?;
             let model = lua.app_data_ref::<Model>().expect("model app_data");
-            let Some(tab) = i.checked_sub(1).and_then(|n| model.talents.tabs.get(n)) else {
+            let tabs = tabs(lua, &model);
+            let Some(tab) = i.checked_sub(1).and_then(|n| tabs.get(n)) else {
                 return Ok(super::binding_abi::tuple(&[None, None, Some(0), None]));
             };
             Ok(MultiValue::from_vec(vec![
@@ -203,10 +259,10 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             // `is-number` else `Usage: GetNumTalents(tabIndex)` (`0x84cdf4`, `0x4f3177`).
             let tab = binding_abi::index_arg(lua, tab, "Usage: GetNumTalents(tabIndex)")?;
             let model = lua.app_data_ref::<Model>().expect("model app_data");
-            let n = tab
-                .checked_sub(1)
-                .and_then(|t| model.talents.talents.get(t))
-                .map_or(0, Vec::len);
+            let n = tab.checked_sub(1).map_or(0, |t| {
+                ask(lua, &TalentCount(t))
+                    .unwrap_or_else(|| model.talents.talents.get(t).map_or(0, Vec::len))
+            });
             Ok(n as i64)
         })?,
     )?;
@@ -220,7 +276,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                 binding_abi::index_arg(lua, tab, "Usage: GetTalentInfo(tabIndex, talentIndex)")?;
             let i = binding_abi::index_arg(lua, i, "Usage: GetTalentInfo(tabIndex, talentIndex)")?;
             let model = lua.app_data_ref::<Model>().expect("model app_data");
-            let Some(t) = talent_at(&model, tab, i) else {
+            let Some(t) = talent_at(lua, &model, tab, i) else {
                 // `0x4f3454`: nil, nil, 1, 1, 0, 0, nil, nil.
                 return Ok(super::binding_abi::tuple(&[
                     None,
@@ -262,7 +318,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                 binding_abi::index_arg(lua, i, "Usage: GetTalentPrereqs(tabIndex, talentIndex)")?;
             let model = lua.app_data_ref::<Model>().expect("model app_data");
             let mut out = Vec::new();
-            if let Some(t) = talent_at(&model, tab, i) {
+            if let Some(t) = talent_at(lua, &model, tab, i) {
                 for p in &t.prereqs {
                     out.push(Value::Integer(i64::from(p.tier)));
                     out.push(Value::Integer(i64::from(p.column)));
@@ -286,7 +342,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             let i = binding_abi::index_arg(lua, i, "Usage: LearnTalent(tabIndex, talentIndex)")?;
             let learn = {
                 let model = lua.app_data_ref::<Model>().expect("model app_data");
-                talent_at(&model, tab, i)
+                talent_at(lua, &model, tab, i)
                     .filter(|t| t.rank < t.max_rank)
                     .map(|t| TalentCall::Learn {
                         talent_id: t.talent_id,
@@ -310,13 +366,15 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     )?;
 
     // CheckTalentMasterDist(): polled by that dialog's OnUpdate, nil hides it. The reference
-    // re-runs its interact-range test on the latched trainer (`0x5df980`, `d² <= [0xc4c28c]`);
-    // no packet either way.
+    // runs its interact-range test on the latched trainer at the call (`0x48d170` → `0x5dfb10`,
+    // `d² <= [0xc4c28c]`); no packet either way.
     g.set(
         "CheckTalentMasterDist",
         lua.create_function(|lua, ()| {
             let model = lua.app_data_ref::<Model>().expect("model app_data");
-            Ok(flag(model.talent_master_pending))
+            Ok(flag(
+                ask(lua, &TalentMasterPending).unwrap_or(model.talent_master_pending),
+            ))
         })?,
     )?;
 
@@ -332,7 +390,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             super::unit::check_unit_token(&Some(unit.clone()))?;
             let model = lua.app_data_ref::<Model>().expect("model app_data");
             let (cp1, cp2) = if super::unit::names_self(lua, &model, &unit) {
-                model.talents.points
+                character_points(lua, &model)
             } else {
                 (0, 0)
             };
@@ -354,18 +412,9 @@ pub(super) fn install_tooltip_method(lua: &Lua, m: &Table) -> mlua::Result<()> {
             let i = binding_abi::index_arg(lua, i, "Usage: SetTalent(tabIndex, talentIndex)")?;
             let (display, ranks, reqs, mut lines) = {
                 let model = lua.app_data_ref::<Model>().expect("model app_data");
-                let Some(t) = talent_at(&model, tab, i) else {
+                let Some(t) = talent_at(lua, &model, tab, i) else {
                     return Ok(());
                 };
-                // From the ask-once spell store; a miss shows on the next hover.
-                let next_desc = (t.next_spell != 0)
-                    .then(|| {
-                        model
-                            .spell_tooltips
-                            .get(&t.next_spell)
-                            .map(|v| v.description.clone())
-                    })
-                    .flatten();
                 (
                     t.display_spell,
                     (t.rank, t.max_rank),
@@ -375,11 +424,15 @@ pub(super) fn install_tooltip_method(lua: &Lua, m: &Table) -> mlua::Result<()> {
                         rank_line: None,
                         reqs: Vec::new(),
                         next_spell: t.next_spell,
-                        next_desc,
+                        next_desc: None,
                         learn: t.learnable,
                     },
                 )
             };
+            // The next rank's description, built at the call through the lent host, else off the
+            // store, where a miss shows on the next hover.
+            lines.next_desc = super::tooltip_spell::spell_view_peek(lua, lines.next_spell, false)
+                .map(|v| v.description);
             // `TOOLTIP_TALENT_RANK`, "Rank %d/%d" (`0x854a2c`, pushed at `0x52b213`); an
             // install without it shows no rank line. A GlobalStrings read runs an `_G` `__index`
             // (`0x703bf0`), which may call any verb, so it is made once the Model is released.

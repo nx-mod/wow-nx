@@ -55,6 +55,7 @@ mod dev;
 mod devtools;
 mod doodad_events;
 mod entities;
+mod field_callbacks;
 mod field_watch;
 mod fishing_line;
 mod footprints;
@@ -137,7 +138,6 @@ mod ui_craft;
 mod ui_dialog_verbs;
 mod ui_dressup;
 mod ui_duel;
-mod ui_follow;
 mod ui_gamma;
 mod ui_gm_ticket;
 mod ui_gossip;
@@ -187,6 +187,7 @@ mod ui_trade;
 mod ui_tradeskill;
 mod ui_trainer;
 mod ui_unit;
+mod ui_world_enter;
 mod ui_world_map;
 mod video;
 mod vm_pass;
@@ -336,6 +337,8 @@ fn launch(build: BuildId, extend: Option<Extension<'_>>) -> AppExit {
     // From here a panic leaves `benilla-config/Diagnostics/crash-<unix>.txt`; armed before the
     // `App` exists, so a panic while plugins build is reported too.
     crash::install(build);
+    // The zone is read once per process; reading it now spares the first `date` the wait.
+    benilla_ui::civil::warm();
 
     // Fonts, art and the stock interface all come from the install, so without one the client
     // ends here, before any window or plugin exists (`no_install`).

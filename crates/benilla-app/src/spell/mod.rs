@@ -8,20 +8,21 @@
 use bevy::prelude::*;
 
 use crate::ui_script::UiFeed;
-use crate::ui_unit::UnitFeed;
 
 mod bind_gates;
 mod cast_send;
 pub(crate) mod cast_target;
 pub(crate) mod cooldowns;
+#[cfg(test)]
+mod drop_hold_tests;
 pub(crate) mod group_relation;
 mod inflight;
 pub(crate) mod known;
+pub(crate) mod level;
 mod mods;
 pub(crate) mod net;
 pub(crate) mod range_check;
 mod range_units;
-pub(crate) mod reads;
 mod report;
 pub(crate) mod targeting;
 pub(crate) mod usable;
@@ -30,31 +31,29 @@ pub(crate) mod validator;
 // The one cast path: every caster takes [`CastLadder`] and commits through [`CastCommit`];
 // `send_spell_cast` is private to `cast_send`, so no second send path can exist.
 pub(crate) use cast_send::{
-    CastCommit, CastLadder, HeldCast, HeldForPick, PetGcdsOwed, ScriptCastPermit, TargetedBind,
-    UnitAttackOwed, UnitPress,
+    CastCommit, CastLadder, HeldCast, HeldForPick, ScriptCastPermit, TargetedBind, UnitAttackOwed,
+    UnitPress,
 };
 pub(crate) use cast_target::AutoSelfCast;
 pub(crate) use cooldowns::{CooldownLive, Cooldowns, Signal};
 pub(crate) use inflight::{
-    ActiveChannel, AutoRepeatActive, CastState, LocalMoveStart, PendingCast, QueuedMeleeSpell,
-    SelfCancel, SPELL_INTERRUPT_MOVEMENT,
+    drop_hold, ActiveChannel, AutoRepeatActive, CastState, LocalMoveStart, PendingCast,
+    QueuedMeleeSpell, SelfCancel, SPELL_INTERRUPT_MOVEMENT,
 };
 // The command press's harness runs the self-cancel between its two systems.
 #[cfg(test)]
 pub(crate) use inflight::local_self_cancel;
-pub(crate) use mods::{
-    CategoryPad, ModsDiff, SpellModifiers, OP_CAST_TIME, OP_COST, OP_GCD, OP_RADIUS,
-};
+pub(crate) use level::SpellLevel;
+pub(crate) use mods::{CategoryPad, SpellModifiers, OP_CAST_TIME, OP_COST, OP_GCD, OP_RADIUS};
 #[cfg(test)]
 pub(crate) use mods::{OP_COOLDOWN, OP_RANGE};
 pub(crate) use range_units::{with_ranged_slot, RangeUnits, DEFAULT_REACH};
-pub(crate) use reads::{SpellLevel, SpellReads, UnitField, Unrecorded};
 pub(crate) use report::{
     CastCore, CastSlots, CursorCancel, Held, REASON_ERROR, REASON_TARGETS_DEAD,
 };
 // `TargetingWants` is exported for the ground reticle, which draws for the location word alone.
 pub(crate) use targeting::{
-    ground_cast_radius, CorpsePick, CursorPicks, PicksSelf, ScriptCursor, SpellTargeting,
+    ground_cast_radius, CorpsePick, CursorPicks, PickBind, PicksSelf, ScriptCursor, SpellTargeting,
     TargetingWants,
 };
 
@@ -85,7 +84,6 @@ impl Plugin for SpellPlugin {
             .init_resource::<AutoSelfCast>()
             .init_resource::<SpellTargeting>()
             .init_resource::<HeldForPick>()
-            .init_resource::<PetGcdsOwed>()
             .init_resource::<UnitAttackOwed>()
             .init_resource::<ScriptCastPermit>()
             .init_resource::<CursorPicks>()
@@ -95,7 +93,6 @@ impl Plugin for SpellPlugin {
             .init_resource::<targeting::UnitPick>()
             .init_resource::<targeting::GoPick>()
             .init_resource::<group_relation::GroupRoster>()
-            .add_observer(cast_target::on_cvar)
             .add_systems(
                 Update,
                 (
@@ -103,21 +100,11 @@ impl Plugin for SpellPlugin {
                     inflight::local_self_cancel
                         .in_set(LocalCancel)
                         .run_if(crate::ui_script::ingame_ui_up),
-                    mods::track_class_family
-                        .in_set(crate::ui_script::UiFeed)
-                        .before(UnitFeed),
                     // The state push ahead of the input records, whose `ToggleGameMenu` reads
                     // the word and whose `SpellStopTargeting` applies inside its call.
                     targeting::feed_targeting_to_input
                         .in_set(crate::ui_script::UiInputViews)
                         .run_if(crate::ui_script::ingame_ui_up),
-                    // And after the packets and the clicks, for the handlers and the tick. After
-                    // the aura feed, whose resolver inputs list the units the hover verdict is
-                    // asked for.
-                    targeting::feed_targeting_to_vm
-                        .in_set(UnitFeed)
-                        .after(LocalCancel)
-                        .after(crate::ui_aura::AuraEvents),
                     // Readers of the word, which the local cancel can clear.
                     (
                         targeting::publish_picks_self,
@@ -127,11 +114,6 @@ impl Plugin for SpellPlugin {
                     )
                         .in_set(UiFeed)
                         .after(LocalCancel),
-                    // The party slots and raid roster the party and raid words read, before
-                    // the feed's targeting push asks them.
-                    group_relation::publish_group_roster
-                        .in_set(UiFeed)
-                        .before(UnitFeed),
                 ),
             );
         net::register(app);
@@ -152,9 +134,6 @@ pub(crate) struct PlayerSkills<'a> {
 /// The equipment slots of the three hands `GetVirtualItem 0x5ec240` reads: main hand, off hand,
 /// ranged (`0x5ec2db`, `0x5ec2aa`, `0x5ec25e`).
 const HAND_SLOTS: [u8; 3] = [15, 16, 17];
-
-/// The three hands as a [`SpellReads::item_search`] slot mask.
-const HAND_SLOT_MASK: u32 = 1 << 15 | 1 << 16 | 1 << 17;
 
 /// `Targets & 0x10` (`[rec+0x34]`), an item-targeted spell, which keeps its own skill
 /// (`0x5ea600`).
@@ -204,12 +183,11 @@ fn virtual_weapon(
 /// of the first hand, main, off then ranged, whose weapon is class 2 of a subclass the mask holds
 /// and the weapon-skill table names (`0x5ea62f`-`0x5ea680`); every other spell, and one no hand
 /// fits, is itself. An item-targeted spell (`Targets & 0x10`), one that ignores weapon skill and a
-/// weapon-skill spell keep their own. `reads` hears the hands when the hands are read.
+/// weapon-skill spell keep their own.
 pub(crate) fn skill_spell(
     me: &benilla_protocol::ObjectFields,
     skills: PlayerSkills,
     d: &benilla_formats::SpellDisplay,
-    reads: &mut dyn SpellReads,
 ) -> u32 {
     if d.targets & TARGETS_ITEM != 0
         || d.attributes_ex2 & ATTR_EX2_IGNORE_WEAPON_SKILL != 0
@@ -219,7 +197,6 @@ pub(crate) fn skill_spell(
     {
         return d.id;
     }
-    reads.item_search(HAND_SLOT_MASK);
     (0..HAND_SLOTS.len())
         .find_map(|hand| {
             let (class, subclass) = virtual_weapon(me, skills.items, hand, false)?;
@@ -236,15 +213,14 @@ pub(crate) fn skill_spell(
 /// 5 (`0x6e3195`). The skill read is the total (`0x5ea520`) of the `SkillLineAbility` line of the
 /// spell [`skill_spell`] names (`0x5ea69b`-`0x5ea6d7`), capped at five times that spell's
 /// `maxLevel` when it has one (`0x5ea6dc`-`0x5ea6ea`); no player, no record or no line is 0
-/// (`0x5ea6f0`). `reads` hears the line and the hands.
+/// (`0x5ea6f0`).
 pub(crate) fn player_spell_level(
     me: Option<&crate::net::ObjectStore>,
     skills: PlayerSkills,
     d: &benilla_formats::SpellDisplay,
-    reads: &mut dyn SpellReads,
 ) -> u32 {
     let Some(store) = me else { return 0 };
-    let id = skill_spell(&store.0, skills, d, reads);
+    let id = skill_spell(&store.0, skills, d);
     let record = if id == d.id {
         Some(d)
     } else {
@@ -255,7 +231,6 @@ pub(crate) fn player_spell_level(
     let Some(line) = skills.lines.and_then(|c| c.spell_to_line(id, race, class)) else {
         return 0;
     };
-    reads.skill_line(line);
     record.skill_level(skill_line_value(me, line))
 }
 
@@ -282,6 +257,71 @@ pub(crate) fn pet_skill_value(pet: Option<&benilla_protocol::ObjectFields>) -> u
     pet.and_then(|p| p.unit_level())
         .unwrap_or(0)
         .saturating_mul(5)
+}
+
+/// The `$`-token contexts of the player and of its pet, which the expander's pet flag picks
+/// between ([`with_token_contexts`]).
+pub(crate) type TokenContexts<'c, 'a> = (
+    &'c benilla_formats::TokenContext<'a>,
+    &'c benilla_formats::TokenContext<'a>,
+);
+
+/// `f` over the `$`-token contexts a description expands over (`0x5075f0`, as the spell tooltip's
+/// call `0x52f717` makes it): the player `me`'s and its pet `pet`'s, the two casters the
+/// expander's pet flag picks between for its level and its `$c` and `$p` terms (`0x6e3130`,
+/// `0x6e31b0`, `0x6e3300`), with `home_area` the bind point's area `$z` names. No template is
+/// read here: each is left to the reader of the VM's strings.
+pub(crate) fn with_token_contexts<R>(
+    spells: &crate::ui_action::Spells,
+    skills: PlayerSkills<'_>,
+    mods: &SpellModifiers,
+    (me, pet): (
+        Option<&crate::net::ObjectStore>,
+        Option<&crate::net::ObjectStore>,
+    ),
+    home_area: Option<&str>,
+    f: impl FnOnce(TokenContexts<'_, '_>) -> R,
+) -> R {
+    let gender = me.and_then(|s| s.0.unit_gender()).unwrap_or(0);
+    let player_level = |d: &benilla_formats::SpellDisplay| player_spell_level(me, skills, d);
+    let pet_skill_level =
+        |d: &benilla_formats::SpellDisplay| d.skill_level(pet_skill_value(pet.map(|p| &p.0)));
+    // `$c` and `$p` (`0x6e31b0`, `0x6e3300`) at the same caster's level and fields.
+    let player_cost = |d: &benilla_formats::SpellDisplay| {
+        me.map_or(-1, |s| usable::power_cost(d, s, skills, mods))
+    };
+    let player_per_second = |d: &benilla_formats::SpellDisplay| {
+        usable::per_second_cost(d, SpellLevel::Player { me, skills })
+    };
+    let pet_level = |d: &benilla_formats::SpellDisplay| SpellLevel::Known(pet_skill_level(d));
+    let pet_cost = |d: &benilla_formats::SpellDisplay| {
+        pet.map_or(-1, |p| usable::power_cost_at(d, &p.0, pet_level(d), mods))
+    };
+    let pet_per_second =
+        |d: &benilla_formats::SpellDisplay| usable::per_second_cost(d, pet_level(d));
+    let player_ctx = benilla_formats::TokenContext {
+        durations: &spells.durations,
+        radii: &spells.radii,
+        ranges: Some(&spells.ranges),
+        level: &player_level,
+        lookup: &|id| spells.catalog.get(id),
+        mods: Some(mods),
+        power_cost: &player_cost,
+        power_per_second: &player_per_second,
+        unmodified_points: false,
+        gender: &|| gender,
+        home_area: &|| home_area,
+        // Never read: the parts leave each template to the reader of the VM's strings.
+        global: &|_| None,
+        printf: &crate::ui_script::token_printf,
+    };
+    let pet_ctx = benilla_formats::TokenContext {
+        level: &pet_skill_level,
+        power_cost: &pet_cost,
+        power_per_second: &pet_per_second,
+        ..player_ctx
+    };
+    f((&player_ctx, &pet_ctx))
 }
 
 /// The player's skill in `line`, [`spell_skill_value`]'s second half: 0 without a player or a
@@ -332,28 +372,6 @@ pub(crate) fn skill_snapshot(me: Option<&crate::net::ObjectStore>) -> SkillSnaps
     })
 }
 
-/// The skill lines whose value differs between two snapshots: a line with no slot reads 0
-/// ([`skill_line_value`]), and the first slot of a line is the one read.
-pub(crate) fn changed_skill_lines(prev: &SkillSnapshot, now: &SkillSnapshot) -> Vec<u32> {
-    let by_line = |snapshot: &SkillSnapshot| {
-        let mut lines = std::collections::HashMap::new();
-        for &(line, value) in snapshot.iter().filter(|(line, _)| *line != 0) {
-            lines.entry(u32::from(line)).or_insert(value);
-        }
-        lines
-    };
-    let (prev, now) = (by_line(prev), by_line(now));
-    let value =
-        |lines: &std::collections::HashMap<u32, u32>, line| lines.get(&line).copied().unwrap_or(0);
-    prev.keys()
-        .chain(now.keys())
-        .copied()
-        .filter(|&line| value(&prev, line) != value(&now, line))
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -368,37 +386,6 @@ mod tests {
             temp_bonus,
             perm_bonus,
         }
-    }
-
-    /// A line's change is its value's, wherever its slot sits: a moved slot is no change, a line
-    /// gained or lost is one, and a slot at 0 is a line at 0.
-    #[test]
-    fn the_changed_lines_are_those_whose_value_moved() {
-        let snapshot = |slots: &[(u16, u32)]| -> SkillSnapshot {
-            let mut s = [(0, 0); benilla_protocol::messages::PLAYER_SKILL_SLOTS as usize];
-            s[..slots.len()].copy_from_slice(slots);
-            s
-        };
-        let base = snapshot(&[(43, 100), (44, 50), (54, 0)]);
-        assert!(changed_skill_lines(&base, &base).is_empty());
-        assert!(
-            changed_skill_lines(&base, &snapshot(&[(54, 0), (44, 50), (43, 100)])).is_empty(),
-            "a reordered slot table changes no line"
-        );
-        assert_eq!(
-            changed_skill_lines(&base, &snapshot(&[(43, 101), (44, 50)])),
-            [43]
-        );
-        assert_eq!(
-            changed_skill_lines(&base, &snapshot(&[(43, 100), (44, 50), (95, 1)])),
-            [95],
-            "a gained line, and the slot at 0 that went away is no change"
-        );
-        assert_eq!(
-            changed_skill_lines(&base, &snapshot(&[(43, 100)])),
-            [44],
-            "a lost line reads 0"
-        );
     }
 
     /// The high bonus half counts only over a positive value, and unsigned; the low half is
@@ -453,7 +440,7 @@ mod tests {
                 lines: Some(&lines),
                 ..Default::default()
             };
-            player_spell_level(Some(&store), skills, &d, &mut Unrecorded)
+            player_spell_level(Some(&store), skills, &d)
         };
         assert_eq!(level(1), 10, "a human reads its own row's line, 50");
         assert_eq!(level(2), 20, "an orc reads its own, 100");
@@ -522,7 +509,7 @@ mod tests {
                 spells: Some(&catalog),
                 items: Some(&items),
             };
-            player_spell_level(Some(&store), skills, d, &mut Unrecorded)
+            player_spell_level(Some(&store), skills, d)
         };
         assert_eq!(
             level(1001, 0, 0, &strike()),

@@ -8,7 +8,10 @@
 //! side (`0x4e89c0`) and sorted so the rows that fit the level come first (`0x4e8b20`); the quest
 //! list (type 3) is the quest log's ids, cached titles first (`0x4e8be0`, `0x4e8c80`). A type's
 //! entries are the first `count` of its sorted list, so a row of the wrong side can show where a
-//! right one is cut, as in the reference.
+//! right one is cut, as in the reference. Each recount and rebuild signals `UPDATE_LFG_TYPES`
+//! (`0x4e8b0e`, `0x4e8c70`): the app fires it at a level change and at each quest slot that moved
+//! (`field_watch` in benilla-app), and the world-enter cascade twice
+//! ([`super::UiScript::fire_world_enter_rebuilds`]).
 
 use mlua::{Lua, MultiValue, Value};
 
@@ -65,8 +68,8 @@ fn type_list(lua: &Lua, model: &Model, kind: usize) -> (usize, Vec<String>) {
         });
         return (count, titles.into_iter().map(str::to_string).collect());
     }
-    // The recount needs the active player (`0x4e89cc`).
-    let Some(player) = model.snapshot_unit("player").filter(|p| p.level > 0) else {
+    // The recount needs the active player (`0x4e89cc`), read as the call runs.
+    let Some(player) = super::unit::view(lua, model, "player").filter(|p| p.level > 0) else {
         return (0, Vec::new());
     };
     let level = player.level;

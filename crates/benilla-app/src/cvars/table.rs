@@ -680,7 +680,7 @@ pub(crate) const REGISTERED: &[Registered] = &[
     ),
     // Not one of `hwDetect`'s sixteen (`[0x639a60, 0x639b80)` never reads `0xc7f2e4`), so the
     // registered "1", off, stands.
-    same("anisotropic", "1"),
+    same("anisotropic", "1").checked(benilla_ui::script::check_anisotropic),
     // The four video CVars the stock window's verbs read and write (`benilla_ui` `video_pairs`);
     // benilla has no mechanism behind any of them. `shadowLevel` (`0x6885bc`, "1", flags 1,
     // callback `0x688c10`, record `[0xc7f350]`) is behind `Get/SetTerrainMip` as `1 − level`: the
@@ -697,8 +697,9 @@ pub(crate) const REGISTERED: &[Registered] = &[
     same("texLodBias", "0.0").checked(benilla_ui::script::check_tex_lod_bias),
     // `baseMip` (`0x6887aa`, "0", flags 1, callback `0x689090`, record `[0xc7f2f0]`), behind
     // `Get/SetBaseMip` as `1 − level`: the callback refuses outside [0, 1] ("BaseMip must be 0 or
-    // 1") and sets the device's first uploaded mip level (`0x589bf0`, read at `0x59f6ce`). benilla
-    // uploads every level; the write is kept and has no effect. `hwDetect` leaves it at 0.
+    // 1") and sets the device's first uploaded mip level (`0x589bf0`, read at `0x59f6d1`, on
+    // Direct3D `0x5a08fc`). benilla uploads every level; the write is kept and has no effect.
+    // `hwDetect` leaves it at 0.
     same("baseMip", "0").checked(benilla_ui::script::check_base_mip),
     // `spellEffectLevel` (`0x688900`: name `0x869324`, default `0x843068` "2", flags 1, callback
     // `0x689510`, record `[0xc7f2a4]`), the Spell Detail slider (`OptionsFrame.lua:32`). The
@@ -721,7 +722,8 @@ pub(crate) const REGISTERED: &[Registered] = &[
          `SET weatherDensity \"3\"` (K = 1.0) — so 3 is the value a benilla-vs-reference \
          side-by-side is correct at, and the registered 2 would thin every rate to 0.66 against \
          the only client we compare with. The slider is how a player takes it back down",
-    ),
+    )
+    .checked(benilla_ui::script::check_weather_density),
     // `gamma` (`0x402d70`: name `0x82e924` "Gamma", default `0x82e92c` "1.0", flags 0, callback
     // `0x4034d0`). The reference uploads `pow(i/255, gamma)` (`0x591680`) through
     // `SetDeviceGammaRamp`, except when windowed (`byte[dev+0x20b]`). Deviation: benilla, which

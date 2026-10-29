@@ -51,7 +51,7 @@ fn target_unit() -> UnitState {
     }
 }
 
-/// A slot view as the inspect feed builds one: entry, icon, name and quality, with nothing an item
+/// A slot view as the inspect read builds one: entry, icon, name and quality, with nothing an item
 /// object would add (no stack count, durability or lock).
 fn foreign_slot(entry: u32, icon: &str, name: &str) -> InvSlotView {
     InvSlotView {
@@ -125,6 +125,14 @@ fn armed() -> UiScript {
     // `InspectFrame_LoadUI` (`UIParent.lua:170`), which `InspectUnit` calls (`UIParent.lua:223`).
     super::test_ui::seat_chain_addon(&mut s, "Blizzard_InspectUI");
     s.run("InspectFrame_LoadUI()").unwrap();
+    // `NotifyInspect` sends only with a player object (`0x48a35a`).
+    s.set_unit(
+        "player",
+        Some(UnitState {
+            exists: true,
+            ..Default::default()
+        }),
+    );
     s.set_unit("target", Some(target_unit()));
     s.set_unit_guids(&target_guids());
     s.set_visible_equipment(TARGET, Some(inspect_slots()));
@@ -422,7 +430,7 @@ fn shipped_inspect_frame_drives_end_to_end() {
         "each rotate click plays the kit"
     );
 
-    // Closing plays its sound and calls `ClearInspectPlayer`, which stops the app's inspect feed.
+    // Closing plays its sound and calls `ClearInspectPlayer`, which clears the inspect target.
     assert!(
         !s.take_inspect_clear(),
         "ClearInspectPlayer not called while open"

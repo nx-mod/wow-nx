@@ -990,7 +990,7 @@ fn world(
             // again ([`query`]).
             logon.close();
             // No `CMSG_SET_ACTIVE_MOVER` here: it waits for our own player's create, as the
-            // reference's does (`super::enter_world_on_self_create`); a server may drop it before then.
+            // reference's does (the arrival, `0x5deb5b`); a server may drop it before then.
             session.player_login(refuse_once(guid))?;
 
             let billing = session.billing();
@@ -1467,6 +1467,7 @@ pub(super) fn writer_loop(
                         target,
                     } => w.use_item(bag_index, slot, spell_index, target),
                     ClientCommand::OpenItem { bag_index, slot } => w.open_item(bag_index, slot),
+                    ClientCommand::ReadItem { bag, slot } => w.read_item(bag, slot),
                     ClientCommand::WrapItem {
                         gift_bag,
                         gift_slot,

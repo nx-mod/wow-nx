@@ -70,9 +70,6 @@ pub(crate) struct NameCache {
     /// Bumped by every landed answer, a refusal that took a record away and the pet-rename
     /// eviction, never by an ask: the gated feeds re-run when it moves.
     generation: u64,
-    /// The creature entries in the order their records landed, for a reader that keeps its own
-    /// place ([`Self::creatures_landed_since`]); a `u32` a landing, never trimmed.
-    creature_landings: Vec<u32>,
 }
 
 /// One cached creature template head.
@@ -353,7 +350,6 @@ impl NameCache {
         let moved = match record {
             Some(record) => {
                 self.creatures.insert(entry, record);
-                self.creature_landings.push(entry);
                 true
             }
             None => self.creatures.refuse(entry) == Refused::Record,
@@ -363,26 +359,10 @@ impl NameCache {
         }
     }
 
-    /// The creature entries that landed after a reader's place `seen`, and its new place.
-    pub(crate) fn creatures_landed_since(&self, seen: usize) -> (&[u32], usize) {
-        let landed = self.creature_landings.get(seen..).unwrap_or_default();
-        (landed, self.creature_landings.len())
-    }
-
-    /// Every cached creature's entry and name.
-    pub(crate) fn creature_names(&self) -> impl Iterator<Item = (u32, &str)> {
-        self.creatures.iter().map(|(&e, r)| (e, r.name.as_str()))
-    }
-
     /// Whether the server refused the player's name, an empty name answered for the guid, and
     /// nothing has asked for it since.
     pub(crate) fn player_answered_unknown(&self, guid: u64) -> bool {
         self.players.answered_unknown(guid)
-    }
-
-    /// Whether the server refused `entry` and nothing has asked for it since.
-    pub(crate) fn creature_answered_unknown(&self, entry: u32) -> bool {
-        self.creatures.answered_unknown(entry)
     }
 
     /// The cached subname, the title line under a creature's name.
@@ -403,18 +383,12 @@ impl NameCache {
         Some(self.creatures.get(entry)?.creature_type)
     }
 
-    /// Forget the in-flight asks a disconnect may have dropped; player and creature names stay,
-    /// pet names go with the spawns they named.
+    /// Forget the in-flight player-name asks a disconnect may have dropped; player names stay, pet
+    /// names go with the spawns they named. The creature store is saved, so [`crate::wdb`] clears
+    /// its asks.
     pub(crate) fn clear_pending(&mut self) {
         self.players.clear_pending();
-        self.creatures.clear_pending();
         self.pets.clear();
-    }
-}
-
-impl crate::query_cache::AskOnce for NameCache {
-    fn clear_pending(&mut self) {
-        NameCache::clear_pending(self);
     }
 }
 
@@ -484,8 +458,9 @@ pub(crate) mod net {
 
     /// The name callback `0x5fb840` of a unit the answer names: for a found name (`0x5fb84b`) of a
     /// held unit (`0x5fb86a`), `UNIT_NAME_UPDATE` through `0x491a00`; and the chat's `0x49ccc0`,
-    /// which shows the lines that waited on the name. The callbacks are the lookups that missed,
-    /// so an answer for a name the cache already holds runs none.
+    /// which shows the lines that waited on the name, and the trade initiate's `0x5d4080`. The
+    /// callbacks are the lookups that missed, so an answer for a name the cache already holds runs
+    /// none.
     fn on_player_name(
         In(ev): In<SessionEvent>,
         mut names: ResMut<NameCache>,
@@ -494,6 +469,12 @@ pub(crate) mod net {
         chat: Option<Res<crate::ui_chat::ChatLog>>,
         // The auction lists whose getters missed a name (`0x4cf167`, `0x4cf1c8`).
         house: Option<ResMut<crate::ui_auction::HouseLane>>,
+        // The battleground's callbacks, which run for a refusal too.
+        mut battlefield: crate::ui_battlefield::BattlefieldNameAnswers,
+        // The meeting stone's member lines and the duel's held challenge, refusals too.
+        mut dialogs: crate::ui_dialog_verbs::DialogNameAnswers,
+        // The trade initiates' lines, which a refusal spends silently (`0x5d4080`).
+        mut trade: crate::ui_trade::TradeNameAnswers,
     ) {
         if let SessionEvent::PlayerName {
             guid,
@@ -504,8 +485,14 @@ pub(crate) mod net {
         } = ev
         {
             // A guid already cached has no lookup waiting, so no callback runs.
-            let found = !name.is_empty() && names.players.get(guid).is_none();
+            let waited = names.players.get(guid).is_none();
+            let found = !name.is_empty() && waited;
             player_name(guid, name, race, class, gender, &mut names);
+            if waited {
+                battlefield.answered(guid, &names);
+                dialogs.answered(guid, &names);
+                trade.answered(guid, &names);
+            }
             if found {
                 if let Some(chat) = &chat {
                     chat.answer_landed(crate::ui_chat::Answer::Player(guid));
@@ -1167,16 +1154,16 @@ mod tests {
     fn clear_pending_allows_a_reconnect_reask() {
         let (cmds, rx) = commands();
         let mut cache = NameCache::default();
-        let g = compose(guid::HIGH_UNIT, 100, 1);
+        let g = compose(guid::HIGH_PLAYER, 100, 1);
 
-        assert_eq!(cache.resolve_unit(g, None, Ask::New(&cmds)), None);
+        assert_eq!(cache.resolve_player(g, Ask::New(&cmds)), None);
         let _ = rx.try_recv();
         // A disconnect dropped the answer.
         cache.clear_pending();
-        assert_eq!(cache.resolve_unit(g, None, Ask::New(&cmds)), None);
+        assert_eq!(cache.resolve_player(g, Ask::New(&cmds)), None);
         assert!(matches!(
             rx.try_recv(),
-            Ok(ClientCommand::CreatureQuery { entry: 100, .. })
+            Ok(ClientCommand::NameQuery { guid }) if guid == g
         ));
     }
 

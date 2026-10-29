@@ -4,7 +4,7 @@
 //! on a miss (`0x488be7`, `0x488c53`, `0x488d37`). So every such record the reference registers is
 //! registered here with its registered default, or an addon that sets one stops with an error.
 //!
-//! A row is inert: no observer reads it, `GetCVar` answers what was written, and it persists like
+//! A row is inert: no change callback reads it, `GetCVar` answers what was written, and it persists like
 //! any row, as a `[cvars]` entry in `benilla-config/config.toml` only while off its default. The
 //! flag bit1 rows are latched, as in the reference (a write is kept until a restart that never
 //! comes for the sound block, and `RestartGx` commits the `gx*` pair). A row whose callback
@@ -211,8 +211,8 @@ pub(super) const INERT: &[Registered] = &[
     same("DistCull", "500").checked(benilla_ui::script::check_dist_cull), // 0x688570
     same("EnableGroupSpeech", "1"),         // 0x457859
     same("ErrorFilter", "all").checked(benilla_ui::script::check_error_filter), // 0x402d2a
-    same("ErrorLevelMax", "3"),             // 0x402d07
-    same("ErrorLevelMin", "1"),             // 0x402ce4
+    same("ErrorLevelMax", "3").checked(benilla_ui::script::check_error_level_max), // 0x402d07
+    same("ErrorLevelMin", "1").checked(benilla_ui::script::check_error_level_min), // 0x402ce4
     same("Errors", "0"),                    // 0x402c9e
     same("ffxRectangle", "1").checked(benilla_ui::script::check_ffx_echo), // 0x6cd007
     same("footstepBias", "0.125").checked(benilla_ui::script::check_footstep_bias), // 0x6888b4

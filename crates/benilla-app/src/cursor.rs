@@ -33,9 +33,10 @@ fn payload_icon(script: &benilla_ui::script::UiScript, covered: bool) -> Option<
         CursorPayload::Money(m) => {
             Some(benilla_ui::script::coin_icon(i64::from(m.copper)).to_string())
         }
-        // Mode 5: the vendor row's icon, which the reference resolves from its `ItemDisplayInfo`
-        // id (`0xb4d8ec`).
+        // Modes 5 and 9: the vendor row's or the ammo's icon, which the reference resolves from
+        // its `ItemDisplayInfo` id (`0xb4d8ec`).
         CursorPayload::Merchant(m) => m.texture,
+        CursorPayload::Ammo(a) => a.texture,
     }
 }
 
@@ -334,7 +335,12 @@ impl Plugin for CursorPlugin {
         app.add_systems(Startup, macos::setup.after(AssetSet::Open))
             .add_systems(
                 Update,
-                (read_glue_pointer, drive_displayed_cursor, macos::drive)
+                (
+                    read_glue_pointer,
+                    drive_displayed_cursor,
+                    // After every call, which may move the camera's rig whose look it shows.
+                    macos::drive.after(crate::vm_pass::VmPass::End),
+                )
                     .chain()
                     // After the tick: a FrameXML `SetCursor` made this frame is read here; and
                     // after the target chain, whose clicks, calls and selects end or raise the

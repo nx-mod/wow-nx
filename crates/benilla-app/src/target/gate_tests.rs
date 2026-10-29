@@ -8,15 +8,15 @@ use benilla_protocol::field::{
     FIELD_UNIT_NPC_FLAGS,
 };
 use benilla_protocol::ObjectFields;
-use benilla_ui::script::{ContainerSlot, ContainerState, MerchantItem, MerchantState, UiScript};
-use benilla_world::interact::WorldRightClick;
+use benilla_ui::script::{
+    ClickMode, ContainerSlot, ContainerState, MerchantItem, MerchantState, UiScript,
+};
 use bevy::ecs::system::RunSystemOnce;
 use bevy::prelude::*;
 
 use super::front_tests::{fix, Fix, ME, MOB, OLD};
-use super::{by_name, click, cursor_mode, Hovered, PickOcclusion, PressPick};
+use super::{click, cursor_mode, Hovered, PickOcclusion, PressPick};
 use crate::net::{ClientCommand, GuidIndex, ObjectStore};
-use crate::target::TargetByNameRequest;
 use crate::ui_action::UiErrorKeys;
 use crate::vplates::PlateClicks;
 
@@ -115,14 +115,9 @@ impl Fix {
 
     /// The world's right-click on what `press_on` latched.
     fn right_click(&mut self) {
-        self.app
-            .world_mut()
-            .resource_mut::<Messages<WorldRightClick>>()
-            .write(WorldRightClick);
-        self.app
-            .world_mut()
-            .run_system_once(click::act_on_right_click)
-            .expect("the right-click runs");
+        let world = self.app.world_mut();
+        super::record_error_lines(world);
+        super::release_click(world, ClickMode::Action);
     }
 
     /// A right-click on `unit`'s nameplate, begun on what the press latched, through the systems
@@ -151,14 +146,18 @@ impl Fix {
         self.rx.try_iter().collect()
     }
 
+    /// The refusals shown inside a call ([`super::error_lines`]), then those queued outside one.
     fn errors(&self) -> Vec<&'static str> {
-        self.app
-            .world()
-            .resource::<UiErrorKeys>()
-            .snapshot()
-            .iter()
-            .map(|e| e.key)
-            .collect()
+        let world = self.app.world();
+        let mut keys = super::error_lines(world);
+        keys.extend(
+            world
+                .resource::<UiErrorKeys>()
+                .snapshot()
+                .iter()
+                .map(|e| e.key),
+        );
+        keys
     }
 
     /// The player's control, `[0xb4b3e4]`.
@@ -530,12 +529,16 @@ fn the_skin_leg_measures_its_own_reach_not_the_spell_cursors() {
         );
         f.press_under_spell(body, CORPSE, false, spell_unable);
         f.right_click();
-        let cast = !f
-            .app
-            .world()
-            .resource::<crate::ui_action::ClickCasts>()
-            .0
-            .is_empty();
+        // The click's cast goes through the ladder inside the click's call.
+        let cast = f.sent().iter().any(|c| {
+            matches!(
+                c,
+                ClientCommand::CastSpell {
+                    spell_id: SKINNING,
+                    ..
+                }
+            )
+        });
         let walking = f.app.world().resource::<crate::player::Approach>().active();
         assert_eq!(
             (cast, walking),
@@ -578,14 +581,7 @@ fn the_router_legs_clear_the_payload_as_the_reference_does() {
             },
         };
         f.app.world_mut().resource_mut::<PressPick>().hovered = hovered;
-        f.app
-            .world_mut()
-            .resource_mut::<Messages<WorldRightClick>>()
-            .write(WorldRightClick);
-        f.app
-            .world_mut()
-            .run_system_once(click::world_right_click_payload)
-            .expect("the payload leg runs");
+        super::release_click(f.app.world_mut(), ClickMode::Action);
         assert_eq!(
             !f.held(),
             cleared,
@@ -640,45 +636,6 @@ fn a_right_press_with_a_payload_is_consumed_before_the_world_sees_it() {
             assert!(f.held(), "{what}: the payload stays");
         }
     }
-}
-
-/// `TargetByName` (`0x489d60`) leaves the target alone on a miss and shows message `0x127`
-/// (`ERR_UNIT_NOT_FOUND`) for a name given (`0x489dbd`, tested on the raw string's first byte, so
-/// blanks count) or `0xb8` (`ERR_GENERIC_NO_TARGET`) for an empty one (`0x489dcf`); the chat
-/// layer's `/target` request is the binding's body. A hit shows nothing. The Lua binding's miss is
-/// pinned in `script_calls`, whose call host fires the lines inside the call.
-#[test]
-fn a_target_name_that_finds_nobody_shows_the_references_line() {
-    let request = |f: &mut Fix, name: &str| {
-        f.app
-            .world_mut()
-            .resource_mut::<Messages<TargetByNameRequest>>()
-            .write(TargetByNameRequest { name: name.into() });
-        f.app
-            .world_mut()
-            .run_system_once(by_name::target_by_name_requests)
-            .expect("the drain runs");
-    };
-    for (name, line) in [
-        ("Nobody", "ERR_UNIT_NOT_FOUND"),
-        ("   ", "ERR_UNIT_NOT_FOUND"),
-        ("", "ERR_GENERIC_NO_TARGET"),
-    ] {
-        let mut f = fix(false);
-        request(&mut f, name);
-        assert_eq!(f.errors(), [line], "{name:?}");
-        assert_eq!(f.selected(), Some(OLD), "{name:?}: the target stays");
-        assert!(f.sent().is_empty(), "{name:?}");
-    }
-
-    let mut f = fix(false);
-    f.app
-        .world_mut()
-        .resource_mut::<crate::names::NameCache>()
-        .insert_player(MOB, "Mob".into(), None);
-    request(&mut f, "Mob");
-    assert!(f.errors().is_empty(), "{:?}", f.errors());
-    assert_eq!(f.selected(), Some(MOB));
 }
 
 /// Talking to an NPC in reach whose dialog status is 1, unavailable, triggers Unavailable Quest

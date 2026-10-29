@@ -40,6 +40,17 @@ pub(crate) struct PetSend {
     pet_guid: u64,
     packed: u32,
     target_guid: u64,
+    /// The press wrote the state word, which signals `PET_BAR_UPDATE` ahead of the send
+    /// (`0x4bc956`, `0x4bc979`).
+    signals: bool,
+}
+
+impl PetSend {
+    /// Whether the press wrote the state word ([`latch_press`]), so its listeners run before the
+    /// packet.
+    pub(crate) fn signals(&self) -> bool {
+        self.signals
+    }
 }
 
 /// A spell press the bar hands to the attempt with its unit as the caster, sending no
@@ -218,6 +229,7 @@ impl PetPress<'_, '_> {
             pet_guid: attack.pet_guid,
             packed: attack.entry.packed,
             target_guid,
+            signals: false,
         };
         Some((send, possessing))
     }
@@ -338,7 +350,7 @@ impl PetPress<'_, '_> {
                 pet_guid,
             }));
         }
-        latch_press(bar, seam.pet_latch.as_deref_mut(), entry, possessing);
+        let signals = latch_press(bar, seam.pet_latch.as_deref_mut(), entry, possessing);
         if let Some(spell) = spell {
             arm_pet_gcd(bar, entry.action(), spell, spell_mods, Instant::now());
         }
@@ -351,6 +363,7 @@ impl PetPress<'_, '_> {
             pet_guid,
             packed: entry.packed,
             target_guid,
+            signals,
         }))
     }
 }
@@ -365,10 +378,9 @@ impl PetPress<'_, '_> {
 /// to the pet's guid inserts the same pair for every entry whose spell lacks `Attributes` bit 25
 /// (`0x6e9553`-`0x6e9598`, `Cooldowns::apply_wire_cooldown`). The attempt's send starts it too
 /// (`0x6e58fb`), with the list picked by the caster's charmed-by, else summoned-by, guid
-/// (`0x6e58c2`-`0x6e58f3`), for the presses [`cast_pet_press`] takes; it owes them to the bar
-/// ([`crate::spell::PetGcdsOwed`], [`arm_owed_pet_gcds`]). The `SMSG_SPELL_GO` pet leg inserts the
-/// spell's own timers and no GCD (`0x6e85f7`).
-pub(super) fn arm_pet_gcd(
+/// (`0x6e58c2`-`0x6e58f3`), for the presses [`cast_pet_press`] takes: inside the send, through this
+/// arm. The `SMSG_SPELL_GO` pet leg inserts the spell's own timers and no GCD (`0x6e85f7`).
+pub(crate) fn arm_pet_gcd(
     bar: &mut PetBar,
     spell_id: u32,
     spell: &benilla_formats::SpellDisplay,
@@ -376,25 +388,6 @@ pub(super) fn arm_pet_gcd(
     now: Instant,
 ) {
     bar.cooldowns.start_gcd(spell_id, spell, now, mods);
-}
-
-/// The GCDs the attempt's sends owe the pet's list (`0x6e58fb`), each at its send's instant, put
-/// in before the bar's feed reads the list. A world with no spell plugin owes none.
-pub(crate) fn arm_owed_pet_gcds(
-    owed: Option<ResMut<crate::spell::PetGcdsOwed>>,
-    mut bar: ResMut<PetBar>,
-    spells: Option<Res<Spells>>,
-    mods: Option<Res<crate::spell::SpellModifiers>>,
-) {
-    let (Some(mut owed), Some(mods)) = (owed, mods) else {
-        return;
-    };
-    for (spell_id, at) in owed.take() {
-        let Some(d) = spells.as_ref().and_then(|s| s.catalog.get(spell_id)) else {
-            continue;
-        };
-        arm_pet_gcd(&mut bar, spell_id, d, &mods, at);
-    }
 }
 
 /// `TogglePetAutocast`'s local half (`0x4bcbb0`): flip bit 30 in place and return the whole word
@@ -499,25 +492,26 @@ pub(super) fn commit_press(
     true
 }
 
-/// Latch a press's state, the half the server never confirms, with the client's masks. A
-/// reaction writes byte 0 (`0x4bc94c`). Stay and Follow, the only commands to reach the write
-/// (`action <= 1` at `0x4bd3b1`), set bits 8-15 and keep byte 0 and bit 27, which only the server
-/// writes (`0x4bc96f`). Both are the VM's latch mirrored: the verb wrote the word and signalled
-/// `PET_BAR_UPDATE` in place (`0x4bc956`, `0x4bc979`). Attack raises a possessed unit's attack
-/// latch instead (`0x4bd42e`), behind the validator only this side runs; the call host signals it
-/// (`0x4bd438`) before the send.
+/// Latch a press's state, the half the server never confirms, with the client's masks, and
+/// whether it wrote the state word. A reaction writes byte 0 (`0x4bc94c`). Stay and Follow, the
+/// only commands to reach the write (`action <= 1` at `0x4bd3b1`), set bits 8-15 and keep byte 0
+/// and bit 27, which only the server writes (`0x4bc96f`). Each write signals `PET_BAR_UPDATE`
+/// (`0x4bc956`, `0x4bc979`), which the call host fires ahead of the send. Attack raises a
+/// possessed unit's attack latch instead (`0x4bd42e`), behind the validator only this side runs;
+/// the call host signals it (`0x4bd438`) before the send.
 pub(super) fn latch_press(
     bar: &mut PetBar,
     latch: Option<&mut PetAttackLatch>,
     entry: PetActionEntry,
     possessing: bool,
-) {
+) -> bool {
     let action = entry.action();
     match entry.kind() {
         benilla_protocol::messages::PET_ACT_COMMAND
             if action == PET_COMMAND_STAY || action == PET_COMMAND_FOLLOW =>
         {
             bar.spells.state = (bar.spells.state & 0x0800_00FF) | (action << 8);
+            true
         }
         benilla_protocol::messages::PET_ACT_COMMAND
             if action == PET_COMMAND_ATTACK && possessing =>
@@ -526,12 +520,14 @@ pub(super) fn latch_press(
             if let Some(latch) = latch {
                 latch.0 = Some(bar.spells.pet_guid);
             }
+            false
         }
         benilla_protocol::messages::PET_ACT_REACTION => {
             bar.spells.state = (bar.spells.state & 0xFFFF_FF00) | action;
+            true
         }
         // Dismiss, spells and unknown types reach the send (`0x4bd444`) without a signal.
-        _ => {}
+        _ => false,
     }
 }
 

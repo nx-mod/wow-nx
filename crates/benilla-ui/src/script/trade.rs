@@ -1,15 +1,20 @@
-//! The trade bindings: the app pushes both sides of the trade ([`UiScript::set_trade`]), and the
-//! trade verbs act inside their calls through the host ([`TradeCall`]); `CloseTrade` alone leaves
-//! its close to the interaction latch, which runs the window's close core. Slots are 1-based, 1..=7, the seventh the non-traded
-//! enchant slot; an empty or out-of-range slot answers nil. The partner rides the `"npc"` unit,
-//! which the app points at them. The getters test no open state: both offers stay as the last
-//! trade left them until the next open clears them ([`UiScript::open_trade_window`]).
+//! The trade bindings: the getters read both offers, the partner cell and the money offers
+//! through the lent host at the call ([`TradeSlotQuery`], [`TradeMoneyQuery`]), as the reference's
+//! read the window's records, the item objects and the trade state as they run (`0x4c00f0`,
+//! `0x4c0470`, `0x4c0700`, `0x4c0750`); the VM's own copy ([`UiScript::set_trade`]) answers only
+//! with no host, which only a test sets. The trade verbs act inside their calls through the host
+//! ([`TradeCall`]); `CloseTrade` alone leaves its close to the interaction latch, which runs the
+//! window's close core. Slots are 1-based, 1..=7, the seventh the non-traded enchant slot; an empty
+//! or out-of-range slot answers nil. The partner rides the `"npc"` unit, which the app points at
+//! them. The getters test no open state: both offers stay as the last trade left them until the
+//! next open clears them (`0x4bf549`-`0x4bf5ef`).
 
 use mlua::{Lua, MultiValue, Value};
 
 use super::binding_abi::{self, flag};
 use super::cursor::{self, CursorPayload};
 use super::item_read::read_item;
+use super::live::{ask, LiveQuery};
 use super::{ItemKey, Model};
 
 /// Slots per side, six traded and the non-traded enchant slot: vmangos `TRADE_SLOT_COUNT`
@@ -146,8 +151,8 @@ pub struct TradeSideState {
     pub gold: u32,
 }
 
-/// The open trade, pushed whole by the app. The accept highlight is not here: it rides the
-/// `TRADE_ACCEPT_UPDATE` event (`TradeFrame.lua:35`).
+/// Both offers as the VM's copy holds them, which the getters read only with no host to ask. The
+/// accept highlight is not here: it rides the `TRADE_ACCEPT_UPDATE` event (`TradeFrame.lua:35`).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TradeState {
     /// Our offer.
@@ -156,8 +161,66 @@ pub struct TradeState {
     pub target: TradeSideState,
 }
 
+/// One slot as a getter reads it at the call, `None` for an empty one: our column (`player`), its
+/// item object and the spell the partner cast on our slot 7 (`0x4c04b3`, `0x5d3fa0(1)` at
+/// `0x4c05d1`), or the partner's records as the window's last compare kept them (`0x4bf37e`) and
+/// the spell we cast on their slot 7 (`0x5d3fa0(0)`, `0x4c02b7`). `slot` is 0-based, below
+/// [`TRADE_SLOTS`].
+pub struct TradeSlotQuery {
+    pub player: bool,
+    pub slot: usize,
+}
+
+impl LiveQuery for TradeSlotQuery {
+    type Answer = Option<TradeSlotItem>;
+}
+
+/// The partner cell `[0xb71728]` and both money offers `[0xc4be70]`, as the money getters and
+/// senders read them at the call (`0x4c0706`, `0x5d4760`, `0x5d4770`, `0x5d4520`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TradeMoney {
+    /// The partner's guid while the window is open, 0 once it is shut.
+    pub partner: u64,
+    /// Our offer, in copper.
+    pub player: u32,
+    /// The partner's offer, in copper.
+    pub target: u32,
+}
+
+/// The question: [`TradeMoney`] now.
+pub struct TradeMoneyQuery;
+
+impl LiveQuery for TradeMoneyQuery {
+    type Answer = TradeMoney;
+}
+
+/// The 1-based slot `index` on our side (`player`) or the partner's now: the host's answer, else
+/// the VM's copy. An index outside the seven is empty.
+pub(crate) fn slot_now(
+    lua: &Lua,
+    model: &Model,
+    index: usize,
+    player: bool,
+) -> Option<TradeSlotItem> {
+    let slot = index.checked_sub(1).filter(|&i| i < TRADE_SLOTS)?;
+    match ask(lua, &TradeSlotQuery { player, slot }) {
+        Some(row) => row,
+        None => slot_at(model, index, |t| if player { &t.player } else { &t.target }),
+    }
+}
+
+/// The partner cell and both money offers now: the host's answer, else the VM's copy.
+pub(crate) fn money_now(lua: &Lua, model: &Model) -> TradeMoney {
+    ask(lua, &TradeMoneyQuery).unwrap_or_else(|| TradeMoney {
+        partner: model.trade_partner,
+        player: gold(model, |t| &t.player),
+        target: gold(model, |t| &t.target),
+    })
+}
+
 impl super::UiScript {
-    /// Push (or clear, with `None`) the trade's two offers.
+    /// Set (or clear, with `None`) the VM's copy of the two offers, which the getters read with no
+    /// host to ask.
     pub fn set_trade(&mut self, state: Option<TradeState>) {
         self.model_mut().trade = state;
     }
@@ -173,6 +236,16 @@ impl super::UiScript {
         model.trade_partner = partner;
         // The open zeroes the done flag `[0xb71748]` (`0x4bf5e4`).
         model.trade_done = false;
+    }
+
+    /// The world-enter cascade's trade reset (`0x4909b5` → `0x4bf0e0`): both offers' tables, our
+    /// item table and the partner cell zeroed, with no unlock and no signal; the done flag
+    /// `[0xb71748]` is kept (`0x4bf20e`).
+    pub fn reset_trade_tables(&mut self) {
+        let mut model = self.model_mut();
+        model.trade = None;
+        model.trade_offered = Default::default();
+        model.trade_partner = 0;
     }
 
     /// The close core's store of its `done` argument (`[0xb71748]`, `0x4bf4fd`), made only with a
@@ -233,13 +306,13 @@ impl super::UiScript {
     }
 
     /// `SetTradePartner`'s open leg for a trade we started by dropping coins (`0x4bf5fe`-
-    /// `0x4bf61c`): the offer becomes offer plus the held coins through `0x5d4500` when the purse
-    /// covers it. The new offer, for the app's send, the coins still held for
+    /// `0x4bf61c`): the offer becomes offer plus the held coins through `0x5d4500` when `purse`,
+    /// the coinage the app reads at the handler, covers it. The new offer, for the app's send, the coins still held for
     /// [`Self::trade_open_money_clear`]; `None` with no coins held or a purse short of the total,
     /// which leaves the cursor as it is.
-    pub fn trade_open_money(&mut self) -> Option<u32> {
+    pub fn trade_open_money(&mut self, purse: u64) -> Option<u32> {
         super::tick::verb(&self.lua, |model| {
-            let total = cursor::money::trade_money_total(model)?;
+            let total = cursor::money::trade_money_total(&self.lua, model, purse)?;
             cursor::money::set_own_offer(model, total);
             Some(total)
         })
@@ -264,10 +337,14 @@ impl super::UiScript {
             };
             // `GetCursorItemInfo`'s guid and source container, both nonzero (`0x4bf667`,
             // `0x4bf674`).
-            if item.guid == 0 || !source_container(model, &item) {
+            if item.guid == 0 || !source_container(&self.lua, model, &item) {
                 return None;
             }
-            let slot = if held_bound(model, &item) { 6 } else { 0 };
+            let slot = if held_bound(&self.lua, model, &item) {
+                6
+            } else {
+                0
+            };
             Some(TradeOpenItem {
                 slot: slot as u8,
                 guid: item.guid,
@@ -289,7 +366,7 @@ impl super::UiScript {
                 return;
             }
             let slot = usize::from(held.slot);
-            let row = trade_slot_item(model, &item);
+            let row = trade_slot_item(&self.lua, model, &item);
             cursor::clear(model, cursor::Clear::KEEP_LOCK);
             model.trade_offered[slot] = Some(cursor::CursorItem {
                 count: None,
@@ -314,7 +391,7 @@ impl super::UiScript {
             if item.guid == 0 {
                 return Ok(());
             }
-            let slot = if held_bound(&model, &item) {
+            let slot = if held_bound(&self.lua, &model, &item) {
                 model.trade_offered[6].is_none().then_some(6)
             } else if model.trade_offered[..6]
                 .iter()
@@ -339,7 +416,7 @@ impl super::UiScript {
     pub fn cursor_item_from_container(&self) -> bool {
         let model = self.model_ref();
         matches!(&model.cursor, Some(CursorPayload::Item(item))
-            if item.guid != 0 && source_container(&model, item))
+            if item.guid != 0 && source_container(&self.lua, &model, item))
     }
 
     /// The world click's refusal of the held item before its trade leg (`0x4926bc`-`0x49271f`): a
@@ -351,7 +428,7 @@ impl super::UiScript {
         let Some(CursorPayload::Item(item)) = model.cursor.as_ref() else {
             return None;
         };
-        let (_, _, seats) = held_record(&model, item)?;
+        let (_, _, seats) = held_record(&self.lua, &model, item)?;
         bag_refusal(item, seats)
     }
 
@@ -369,15 +446,6 @@ impl super::UiScript {
     /// `TRADE_CLOSED`'s handlers too (`0x4bf522`).
     pub fn close_trade_window(&mut self) {
         self.model_mut().trade_partner = 0;
-    }
-
-    /// Our column as the VM holds it, `ClickTradeButton`'s writes included: what the slots'
-    /// `TRADE_PLAYER_ITEM_CHANGED` handlers last read. `None` before any trade has opened.
-    pub fn trade_player_slots(&self) -> Option<[Option<TradeSlotItem>; TRADE_SLOTS]> {
-        self.model_ref()
-            .trade
-            .as_ref()
-            .map(|t| t.player.slots.clone())
     }
 
     /// `UnlockTradeItems` (`0x4bfcf0`), which the `CANCELED`, `COMPLETE` and `CLOSE_WINDOW` status
@@ -536,7 +604,7 @@ fn ask_record(lua: &Lua, entry: u32, partners: bool) -> mlua::Result<()> {
     let owner = {
         let model = lua.app_data_ref::<Model>().expect("model app_data");
         if partners {
-            model.trade_partner
+            money_now(lua, &model).partner
         } else {
             model.unit_guids.player
         }
@@ -599,7 +667,7 @@ fn click_trade_button(lua: &Lua, id: i32) -> mlua::Result<()> {
         let refusal = {
             let model = lua.app_data_ref::<Model>().expect("model app_data");
             match &model.cursor {
-                Some(CursorPayload::Item(item)) => trade_refusal(&model, item),
+                Some(CursorPayload::Item(item)) => trade_refusal(lua, &model, item),
                 _ => None,
             }
         };
@@ -628,7 +696,9 @@ fn click_trade_button(lua: &Lua, id: i32) -> mlua::Result<()> {
     match index {
         Some(i) => place(lua, i, held, AfterPlace::Click { old }),
         None => {
-            cursor::set_cursor(lua, true, |_| old.map(CursorPayload::Item));
+            cursor::set_cursor(lua, true, cursor::Setter::Item, |_| {
+                old.map(CursorPayload::Item)
+            });
             Ok(())
         }
     }
@@ -715,7 +785,7 @@ fn finish_placement(lua: &Lua, place: u64, sent: bool) {
     let wrote = sent || held.is_none();
     if wrote {
         super::tick::verb(lua, |model| {
-            let placed = held.as_ref().map(|item| trade_slot_item(model, item));
+            let placed = held.as_ref().map(|item| trade_slot_item(lua, model, item));
             model.trade_offered[slot] = held.map(|item| cursor::CursorItem {
                 count: None,
                 ..item
@@ -725,7 +795,9 @@ fn finish_placement(lua: &Lua, place: u64, sent: bool) {
     }
     match then {
         AfterPlace::Click { old } => {
-            cursor::set_cursor(lua, !wrote, |_| old.map(CursorPayload::Item));
+            cursor::set_cursor(lua, !wrote, cursor::Setter::Item, |_| {
+                old.map(CursorPayload::Item)
+            });
         }
         AfterPlace::Offer if wrote => {
             super::tick::verb(lua, |model| cursor::clear(model, cursor::Clear::KEEP_LOCK));
@@ -743,18 +815,17 @@ fn set_accept(lua: &Lua, flag: bool) -> mlua::Result<()> {
 
 /// The bag record behind a held item, as the reference reads its object: `(bound, bonding,
 /// filled seats)`; none when the record is gone or holds another item.
-fn held_record(model: &Model, item: &cursor::CursorItem) -> Option<(bool, u32, Option<u32>)> {
+fn held_record(
+    lua: &Lua,
+    model: &Model,
+    item: &cursor::CursorItem,
+) -> Option<(bool, u32, Option<u32>)> {
     if item.bag == cursor::EQUIPMENT_BAG {
-        let s = model
-            .player_slot_object(item.slot as usize)
+        let s = crate::script::char_stats::player_slot_object(lua, model, item.slot as usize)
             .filter(|s| s.guid == item.guid)?;
         Some((s.already_bound, s.bonding, s.occupied_seats))
     } else {
-        let s = model
-            .containers
-            .get(&item.bag)?
-            .slots
-            .get(&item.slot)
+        let s = super::held::held_slot(lua, model, item.bag, item.slot)
             .filter(|s| s.guid == item.guid)?;
         Some((s.already_bound, s.bonding, s.occupied_seats))
     }
@@ -763,7 +834,7 @@ fn held_record(model: &Model, item: &cursor::CursorItem) -> Option<(bool, u32, O
 /// Whether the held item's source container (`[0xb4b3c8]`) has a guid: the active player's own
 /// object for the backpack, the paper doll, the vault and the keyring; the bag item in the
 /// container's inventory slot (`ContainerIDToInventoryID`'s two bands) for a bag.
-fn source_container(model: &Model, item: &cursor::CursorItem) -> bool {
+fn source_container(lua: &Lua, model: &Model, item: &cursor::CursorItem) -> bool {
     /// The vault's and the keyring's container ids.
     const BANK: i64 = -1;
     const KEYRING: i64 = -2;
@@ -771,8 +842,7 @@ fn source_container(model: &Model, item: &cursor::CursorItem) -> bool {
         0 | BANK | KEYRING | cursor::EQUIPMENT_BAG => model.unit_guids.player != 0,
         bag @ 1..=10 => {
             let slot = if bag <= 4 { bag + 19 } else { bag + 59 };
-            model
-                .player_slot_object(slot as usize)
+            crate::script::char_stats::player_slot_object(lua, model, slot as usize)
                 .is_some_and(|s| s.guid != 0)
         }
         _ => false,
@@ -781,8 +851,8 @@ fn source_container(model: &Model, item: &cursor::CursorItem) -> bool {
 
 /// `CGItem_C::IsBound` (`0x5da2c0`) on the held item; an item with no record reads unbound, as the
 /// open leg's lookup that finds no object leaves slot 1 (`0x4bf697`).
-fn held_bound(model: &Model, item: &cursor::CursorItem) -> bool {
-    held_record(model, item).is_some_and(|(bound, _, _)| bound)
+fn held_bound(lua: &Lua, model: &Model, item: &cursor::CursorItem) -> bool {
+    held_record(lua, model, item).is_some_and(|(bound, _, _)| bound)
 }
 
 /// The error `ClickTradeButton` refuses a held item for slots 1 to 6 with (`0x4bfeb5`-`0x4bffae`),
@@ -792,8 +862,8 @@ fn held_bound(model: &Model, item: &cursor::CursorItem) -> bool {
 /// `ERR_TRADE_BOUND_ITEM` otherwise, a missing record included (`0x4bfee7`); a container with an
 /// item in any seat is `ERR_TRADE_BAG` (`0x4bff50`-`0x4bff62`); an empty one worn in a bag slot,
 /// player slots 19-22, is `ERR_TRADE_EQUIPPED_BAG` (`0x6225d0`, `0x4bffa4`-`0x4bffae`).
-fn trade_refusal(model: &Model, item: &cursor::CursorItem) -> Option<&'static str> {
-    let (bound, bonding, seats) = held_record(model, item)?;
+fn trade_refusal(lua: &Lua, model: &Model, item: &cursor::CursorItem) -> Option<&'static str> {
+    let (bound, bonding, seats) = held_record(lua, model, item)?;
     /// `BIND_QUEST_ITEM` and `BIND_QUEST_ITEM1`.
     const QUEST_BONDING: [u32; 2] = [4, 5];
     if bound {
@@ -817,14 +887,13 @@ fn bag_refusal(item: &cursor::CursorItem, seats: Option<u32>) -> Option<&'static
         .then_some("ERR_TRADE_EQUIPPED_BAG")
 }
 
-/// `0x4bfa70`'s local half: our 0-based slot shows `item` and signals
-/// `TRADE_PLAYER_ITEM_CHANGED` with its 1-based index (`0x4bfaef`). The reference writes only
-/// past a successful send (`0x4bfab1`); with no window there is no slot to write.
+/// `0x4bfa70`'s local half: our 0-based slot shows `item` in the VM's copy, if it holds one, and
+/// signals `TRADE_PLAYER_ITEM_CHANGED` with its 1-based index (`0x4bfaef`), which tests no open
+/// trade. The reference writes only past a successful send (`0x4bfab1`).
 fn write_player_slot(model: &mut Model, i: usize, item: Option<TradeSlotItem>) {
-    let Some(trade) = model.trade.as_mut() else {
-        return;
-    };
-    trade.player.slots[i] = item;
+    if let Some(trade) = model.trade.as_mut() {
+        trade.player.slots[i] = item;
+    }
     model.raise(
         "TRADE_PLAYER_ITEM_CHANGED",
         vec![super::ScriptValue::Int(i as i64 + 1)],
@@ -832,12 +901,9 @@ fn write_player_slot(model: &mut Model, i: usize, item: Option<TradeSlotItem>) {
 }
 
 /// What our slot shows for a held item: the bag record the app fed, else what the cursor carries.
-fn trade_slot_item(model: &Model, item: &cursor::CursorItem) -> TradeSlotItem {
+fn trade_slot_item(lua: &Lua, model: &Model, item: &cursor::CursorItem) -> TradeSlotItem {
     let name = |link: Option<&str>| link.map(|l| cursor::item_link_name(Some(l)));
-    model
-        .containers
-        .get(&item.bag)
-        .and_then(|c| c.slots.get(&item.slot))
+    super::held::held_slot(lua, model, item.bag, item.slot)
         .filter(|s| s.item_id == item.item_id)
         .map(|s| TradeSlotItem {
             item_id: s.item_id,
@@ -863,7 +929,7 @@ fn trade_slot_item(model: &Model, item: &cursor::CursorItem) -> TradeSlotItem {
             item_id: item.item_id,
             name: name(item.link.as_deref()),
             texture: item.texture.clone(),
-            count: cursor::held_count(model, item),
+            count: cursor::held_count(lua, model, item),
             quality: item.quality,
             link: item.link.clone(),
             ..Default::default()
@@ -886,7 +952,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             let id = binding_abi::index_arg(lua, id, "Usage: GetTradePlayerItemInfo(index)")?;
             let (slot, key) = {
                 let model = lua.app_data_ref::<Model>().expect("model app_data");
-                (slot_at(&model, id, |t| &t.player), own_key(&model, id))
+                (slot_now(lua, &model, id, true), own_key(&model, id))
             };
             let Some(s) = slot else {
                 return Ok(super::binding_abi::tuple(&[
@@ -952,9 +1018,9 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                 let (slot, key) = {
                     let model = lua.app_data_ref::<Model>().expect("model app_data");
                     if side {
-                        (slot_at(&model, id, |t| &t.player), own_key(&model, id))
+                        (slot_now(lua, &model, id, true), own_key(&model, id))
                     } else {
-                        let slot = slot_at(&model, id, |t| &t.target);
+                        let slot = slot_now(lua, &model, id, false);
                         let key = slot.as_ref().map(record_key);
                         (slot, key)
                     }
@@ -988,10 +1054,10 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             let id = binding_abi::index_arg(lua, id, "Usage: GetTradeTargetItemInfo(index)")?;
             let (slot, usable) = {
                 let model = lua.app_data_ref::<Model>().expect("model app_data");
-                let slot = slot_at(&model, id, |t| &t.target);
+                let slot = slot_now(lua, &model, id, false);
                 let usable = slot
                     .as_ref()
-                    .is_none_or(|s| super::item_stats::item_usable_by_id(&model, s.item_id));
+                    .is_none_or(|s| super::item_stats::item_usable_by_id(lua, &model, s.item_id));
                 (slot, usable)
             };
             // The record off the item cache as the call runs (`0x4c017f`); a miss asks for it.
@@ -1043,9 +1109,11 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         "GetPlayerTradeMoney",
         lua.create_function(|lua, ()| {
             let model = lua.app_data_ref::<Model>().expect("model app_data");
-            // Gated on the partner cell (`0x4c0706`-`0x4c0714`); the target's is not (`0x4c0759`).
-            Ok(if model.trade_partner != 0 {
-                i64::from(gold(&model, |t| &t.player))
+            // Gated on the partner cell (`0x4c0706`-`0x4c0714`), then `0x5d4760`; the target's is
+            // not (`0x4c0759`).
+            let money = money_now(lua, &model);
+            Ok(if money.partner != 0 {
+                i64::from(money.player)
             } else {
                 0
             })
@@ -1055,7 +1123,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         "GetTargetTradeMoney",
         lua.create_function(|lua, ()| {
             let model = lua.app_data_ref::<Model>().expect("model app_data");
-            Ok(i64::from(gold(&model, |t| &t.target)))
+            Ok(i64::from(money_now(lua, &model).target))
         })?,
     )?;
 
@@ -1129,7 +1197,11 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                 copper,
                 "Usage: SetTradeMoney(amount)",
             )? as u32;
-            if u64::from(n) > lua.app_data_ref::<Model>().expect("model app_data").money {
+            let money = {
+                let model = lua.app_data_ref::<Model>().expect("model app_data");
+                crate::script::stat_read::purse(lua, &model)
+            };
+            if u64::from(n) > money {
                 return Ok(());
             }
             submit(lua, TradeCall::Gold(n))?;

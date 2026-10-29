@@ -226,8 +226,8 @@ pub enum ScriptCall {
     Death(super::DeathAction),
     /// A duel verb ([`super::DuelRequest`]): its packet or the duel spell's cast inside the call.
     Duel(super::DuelRequest),
-    /// A group loot vote ([`super::LootRollCall`]): its packet and the engine's close inside the
-    /// call, ahead of `CANCEL_LOOT_ROLL`.
+    /// A group loot vote ([`super::LootRollCall`]): its packet inside the call, ahead of
+    /// `CANCEL_LOOT_ROLL`, and the engine's close after it.
     LootRoll(super::LootRollCall),
     /// The innkeeper's Accept ([`super::BinderCall`]): its packet inside the call.
     Binder(super::BinderCall),
@@ -240,11 +240,11 @@ pub enum ScriptCall {
     Instance(super::InstanceCall),
     /// The PvP flag's toggle ([`super::PvpCall`]): its packet inside the call.
     Pvp(super::PvpCall),
-    /// `ShowHelm` or `ShowCloak` past the belief's test ([`super::WornDisplay`]): the flip's packet
-    /// inside the call (`0x5ee6e3`).
-    WornDisplay(super::WornDisplay),
-    /// An action bar verb's packet ([`super::ActionBarCall`]): the toggles' send, or a slot write
-    /// stored and sent ahead of its signal (`0x4e58e0`).
+    /// `ShowHelm` or `ShowCloak` ([`super::WornDisplaySet`]): the model's piece and the toggle
+    /// the live bit owes, inside the call (`0x5ee660`-`0x5ee8d0`).
+    WornDisplay(super::WornDisplaySet),
+    /// An action bar verb's step ([`super::ActionBarCall`]): the toggles' send, a slot write
+    /// stored and sent ahead of its signal (`0x4e58e0`), or the usable cache's refresh.
     ActionBar(super::ActionBarCall),
     /// A GM ticket verb's packet, or `Stuck`'s cast ([`super::GmTicketCall`]), inside the call.
     GmTicket(super::GmTicketCall),
@@ -268,6 +268,24 @@ pub enum ScriptCall {
     /// A `ConsoleExec` line that is no CVar write: `ConsoleCommandExecute` (`0x63ce00`) inside the
     /// call (`0x515f43`), a registered command, a CVar's print or `Unknown command`.
     Console(String),
+    /// A CVar write a verb made in the VM's mirror (`SetCVar`, `ConsoleExec`'s `set` and resets):
+    /// `CVar::Set` (`0x63df50`) runs the row's change callback inside the write (`0x63df7d`), so
+    /// the host takes the queued writes into its registry and runs their callbacks before the verb
+    /// goes on ([`super::cvars::written`]).
+    CvarWritten,
+    /// A camera-view verb ([`super::CameraViewRequest`]): `SetView`, `SaveView`, `ResetView`,
+    /// `NextView`, `PrevView` or `FlipCameraYaw`, seated on the camera inside the call, its CVar
+    /// writes with it (`0x512f17`, `0x50fa09`).
+    CameraView(super::CameraViewRequest),
+    /// `gxRestart`'s handler (`0x639f60`), run inside `RestartGx`, `SetScreenResolution` and
+    /// `SetMultisampleFormat` (through `0x63ce00`, which calls it synchronously) and
+    /// `RestoreVideoDefaults` (directly, `0x639a51`): the host commits the latched display rows
+    /// (`0x639ec0`) and runs their callbacks before the verb goes on.
+    RestartGx,
+    /// A dressing-room verb ([`super::DressUpIntent`]): `Dress`, `Undress`, `TryOn`, or `SetUnit`
+    /// and `RefreshUnit` on a `DressUpModel`, applied to the room inside the call; a cached
+    /// record's try-on goes on, or refuses with `ERR_NOT_EQUIPPABLE`, there (`0x504540`).
+    DressUp(super::DressUpIntent),
     /// `FollowUnit` or `FollowByName` ([`super::FollowRequest`]): the start gate, its refusal's
     /// line or the follow armed and `AUTOFOLLOW_BEGIN` signalled, inside the call (`0x60fed0`).
     Follow(super::FollowRequest),
@@ -277,6 +295,18 @@ pub enum ScriptCall {
     /// `ConfirmPetUnlearn()` (`0x48dca0` → `0x5dfba0(0, 0)`): `CMSG_PET_UNLEARN` to the
     /// remembered trainer, or the money refusal's line, inside the call.
     ConfirmPetUnlearn,
+    /// A step of the world click a mouse command takes ([`super::ClickCall`]): the arm's pick at
+    /// the press (`ArmClick 0x514810` → `0x481f00`), or the last primary's release and its
+    /// dispatch (`ReleaseCommands 0x514b70` → `DispatchWorldClick 0x481f60`), inside the call.
+    WorldClick(super::ClickCall),
+    /// A movement or camera binding function's call ([`super::BindingInput`]) on the engine's
+    /// input state, inside the call: a command bit pressed or released through `SetCommands`
+    /// (`0x515090`) with the cast cancel a new direction makes (`0x5150ce`-`0x515193`), a
+    /// one-shot, or a camera axis.
+    Input(super::BindingInput),
+    /// `DropItemOnUnit(unit)` (`0x48d960`) on the token: the trade leg, then the pet leg's feed
+    /// on the unit it names, inside the call.
+    DropItemOnUnit(String),
 }
 
 /// A getter's lookup with a callback, which the host makes inside the getter's call: the cache
@@ -315,16 +345,74 @@ pub enum RecordAsk {
         owner: u64,
         callback: ItemCallback,
     },
-    /// The quest log's leaderboard on a creature objective whose name the mirror lacks: the
-    /// creature cache, with the callback `0x4e07d0`, whose wait the VM keeps (`0x4e044c`).
+    /// The quest log's leaderboard on a creature objective whose name the cache lacks: the
+    /// creature cache, with the callback `0x4e07d0`, which signals `QUEST_LOG_UPDATE` when the
+    /// record lands (`0x4e044c`, `0x4e07ea`); the host keeps the wait.
     QuestCreature(u32),
+    /// The quest log's rebuild on a slot whose quest record the mirror lacks: the quest cache,
+    /// with the callback `0x4de8b0` (`0x4de65f`-`0x4de679`), whose wait the VM keeps.
+    QuestRecord(u32),
+    /// The expiry latch's quest-giver refresh (`0x4df531` → `0x5eb070`): every giver's status
+    /// asked again.
+    QuestGiverStatuses,
+    /// The quest log's leaderboard on a GameObject objective with no text whose template the
+    /// cache lacks: the object cache by the id less its top bit, with the callback `0x4e0800`,
+    /// which signals `QUEST_LOG_UPDATE` when the record lands (`0x4e0387`-`0x4e039c`, `0x4e081a`).
+    QuestObject(u32),
+    /// `GetStablePetInfo` or `GetStablePetFoodTypes` (`0x4cb2ce`, `0x4cbb05`), or with `paperdoll`
+    /// `SetPetStablePaperdoll` (`0x4cba13`), on a stable record whose creature the cache lacks: the
+    /// creature cache by the record's entry, owned by the active player (`0x468550`), with the
+    /// callback `0x4cb3b0` or `0x4cba50`, kept once per call (flag 0), which signals
+    /// `PET_STABLE_UPDATE` or `PET_STABLE_UPDATE_PAPERDOLL` when the record lands (`0x4cb3bf`,
+    /// `0x4cba5f`).
+    StableCreature { entry: u32, paperdoll: bool },
     /// `GetSummonConfirmSummoner` with no name: the player-name cache by the latched summoner
     /// (`0xb4e358`), with the callback `0x48b710`, which does nothing (`0x48b6bf`-`0x48b6e1`).
     Summoner,
+    /// The item build's creator (`0x52e1f4`) or giver (`0x52e28d`) the name cache misses, by guid,
+    /// asked with the tooltip as the answer's cookie (`0x52e530`) at every build, which the VM keeps
+    /// ([`super::tooltip_item`]'s waits).
+    ItemBuildName(u64),
+    /// A set block's member the item-name cache misses (`0x52df4b`), by entry, asked with the
+    /// tooltip as the answer's cookie at every build.
+    ItemName(u32),
+    /// The item build's charter, by its item object's guid, whose petition record (`0x52b93b`) or
+    /// owner's name (`0x52b9d2`) a cache misses, asked with the tooltip as the cookie at every
+    /// build: the record by the petition id in the object's enchantment slot 0 (`0x5ef337`).
+    Petition(u64),
     /// `GetAuctionItemInfo` on a row whose bidder (`0x4cf167`) or seller (`0x4cf1c8`) the name
     /// cache misses: the player-name cache by guid, with the list's callback (`0x4cf290`,
     /// `0x4cf2b0`, `0x4cf2d0`), kept once per name and list (`0x55f080`'s dedupe flag 1).
     AuctionName { guid: u64, list: usize },
+    /// `GetMasterLootCandidate` on a candidate the name cache misses: the player-name cache by
+    /// guid with the callback `0x4c2fb0`, kept once per call (dedupe flag 0, `0x4c2f61`), which
+    /// signals `UPDATE_MASTER_LOOT_LIST` when the name lands found (`0x4c2fb6`-`0x4c2fbf`).
+    MasterLootName(u64),
+    /// `ItemTextGetCreator` on a creator the name cache misses: the player-name cache by guid with
+    /// the callback `0x4e32b0` (`0x4e39b9`), kept once per call (dedupe flag 0), which opens the
+    /// reader again when the name lands found (`0x4e32b6`-`0x4e32d5`).
+    ItemTextCreator(u64),
+    /// `GetSendMailItem` on an attachment whose record the mirror lacks, by its object's guid:
+    /// for an object the engine holds (`0x468460`, `0x4ae5e1`), the item cache by the object's
+    /// entry (`[[obj+0x8]+0xc]`, `0x4ae5e7`-`0x4ae5f2`) with guid 0 (`0x4ae5ec`-`0x4ae5ef`) and the
+    /// callback `0x4ae710` (`0x4ae604`), kept once per call, which signals
+    /// `MAIL_SEND_INFO_UPDATE` for a found record (`0x4ae716`-`0x4ae71f`). A gone object asks
+    /// nothing.
+    SendMailItem(u64),
+    /// `CalculateAuctionDeposit` and `GetAuctionSellItemInfo` on a sell slot item whose record the
+    /// mirror lacks, by its object's guid: for an object the engine holds (`0x468460`, `0x4ce24e`,
+    /// `0x4ce5cf`), the item cache by the object's entry (`[[obj+0x8]+0xc]`) with the object's own
+    /// guid (`0x4ce263`, `0x4ce5e8`) and the callback `0x4ce2f0` (`0x4ce25e`, `0x4ce5e3`), kept once
+    /// per call, which signals `NEW_AUCTION_UPDATE` for a found record (`0x4ce2fa`-`0x4ce2ff`). A
+    /// gone object asks nothing.
+    AuctionSellItem(u64),
+    /// A mail getter's lookups on the row of `mail_id` that the mirror lacks a record for, each
+    /// with the callback that signals `MAIL_INBOX_UPDATE` for a found record, kept once per call
+    /// (dedupe flag 0): the session holds the keys ([`super::MailLookup`]).
+    Mail {
+        mail_id: u32,
+        lookup: super::MailLookup,
+    },
 }
 
 /// The owner id a profession or trainer getter's item lookup passes: `0xb0000000` over a spell id
@@ -353,6 +441,19 @@ pub enum ItemCallback {
     /// The quest log's leaderboard and reward getters (`0x4e0830`), whose callback the VM keeps
     /// and signals `QUEST_LOG_UPDATE` with at its flush (`0x4e083a`): the cache only asks.
     QuestLog,
+    /// `GetMerchantItemInfo` (`0x4faed0`), whose callback `0x4fada0` counts the window's waits down
+    /// and signals `MERCHANT_UPDATE` at the last with a vendor open (`0x4fb0f0`). Its query names
+    /// the vendor's cell at the call (`0x4faef6`-`0x4faf17`), which the host holds; the ask's
+    /// owner is unread.
+    Merchant,
+    /// `GetBuybackItemInfo` (`0x4fb40c`), whose callback `0x4fb570` signals `MERCHANT_UPDATE`; its
+    /// query's guid is 0 (`0x4fb3f0`-`0x4fb3f7`).
+    Buyback,
+    /// A tooltip build's miss, with the tooltip as the cookie: the item tooltip's `0x52e530`
+    /// (`0x52b722`, `0x52bf60`, `0x52dc27`, `0x535f53`, `0x5361ee`) or the spell tooltip's
+    /// reagent `0x52f820` (`0x52eda4`, `0x52f3f4`), whose answer rebuilds the tooltips the VM
+    /// keeps waiting on it.
+    Tooltip,
 }
 
 /// Make `ask` inside the getter's call. A getter never raises for its lookup: with no host lent,
@@ -646,6 +747,11 @@ pub(crate) fn submit(lua: &Lua, call: ScriptCall) -> mlua::Result<()> {
     if model.call_depth >= MAX_NESTING {
         return Err(mlua::Error::runtime(TOO_DEEP));
     }
+    if super::host::splitting(lua) {
+        drop(model);
+        apply_now(lua, call);
+        return Ok(());
+    }
     let seq = model.queue_call(call);
     model.call_raises.awaited.push(seq);
     drop(model);
@@ -687,8 +793,12 @@ fn file_raise(lua: &Lua, seq: u64, message: String) {
         // The reference never defers a call: its verb raises in its own body, so the lines after
         // it never run and a `pcall` around it catches the error. A call that waited for the host
         // had its verb return without an error, the script's later lines ran, and a `pcall` saw
-        // nothing; the error reaches the handler only now, after them.
-        model.record_lua_error(&mlua::Error::runtime(message));
+        // nothing; the error reaches the handler only now, after them, outside any script.
+        drop(model);
+        super::stdlib::call_error_function(lua, message.as_bytes());
+        lua.app_data_mut::<Model>()
+            .expect("model app_data")
+            .record_lua_error(&mlua::Error::runtime(message));
     }
 }
 
@@ -704,6 +814,10 @@ fn swap_raising(lua: &Lua, raise: Option<String>) -> Option<String> {
 /// next, as the host comes back and before its tail, ahead of the rest; the calls its tail makes
 /// apply inside the tail.
 pub(crate) fn drain(lua: &Lua) {
+    super::origin::within(super::origin::Origin::Script, || drain_within(lua));
+}
+
+fn drain_within(lua: &Lua) {
     if !super::host::free(lua) {
         return;
     }
@@ -768,6 +882,10 @@ pub(crate) fn drain(lua: &Lua) {
 /// level, so a call one makes is the call's own nested call, and a call made meanwhile one level
 /// in. The reference runs both inside the call.
 pub(super) fn settle(lua: &Lua, script: &mut UiScript) {
+    super::origin::within(super::origin::Origin::Script, || settle_within(lua, script));
+}
+
+fn settle_within(lua: &Lua, script: &mut UiScript) {
     let mut left = take_waiting(lua);
     while let Some(item) = left.pop_front() {
         if !super::host::free(lua) {
@@ -784,6 +902,73 @@ pub(super) fn settle(lua: &Lua, script: &mut UiScript) {
                 drain(lua);
             }
         }
+    }
+}
+
+/// A held segment's calls inside a split stretch ([`super::host::splitting`]), each applied at
+/// once through the lent host in its order: what the segment raised ahead of a call is held as
+/// its own segment first, so what the call's apply signals waits behind it; the rest is returned
+/// to be held.
+pub(crate) fn apply_split_calls(
+    lua: &Lua,
+    raised: Vec<super::tick::Raised>,
+) -> Vec<super::tick::Raised> {
+    use super::tick::Raised;
+    if !super::host::splitting(lua) || !raised.iter().any(|r| matches!(r, Raised::Call(_))) {
+        return raised;
+    }
+    let mut rest = Vec::with_capacity(raised.len());
+    // Cursor views open in `rest`: a segment is cut only where none is, so each view stays with
+    // its end.
+    let mut views = 0usize;
+    for r in raised {
+        match r {
+            Raised::Call(call) if super::host::splitting(lua) => {
+                if views == 0 {
+                    hold_segment(lua, std::mem::take(&mut rest));
+                }
+                apply_now(lua, *call);
+            }
+            other => {
+                match other {
+                    Raised::CursorView(_) => views += 1,
+                    Raised::EndCursorView => views = views.saturating_sub(1),
+                    _ => {}
+                }
+                rest.push(other);
+            }
+        }
+    }
+    rest
+}
+
+/// Hold `raised` for the host as one segment ([`Held::Segment`]) when it holds anything a
+/// listener or a later read sees: an event, a lock or cursor write, or a call.
+pub(crate) fn hold_segment(lua: &Lua, raised: Vec<super::tick::Raised>) {
+    use super::tick::Raised;
+    if raised.iter().any(|r| {
+        matches!(
+            r,
+            Raised::Event(..) | Raised::Lock { .. } | Raised::CursorWrite(_) | Raised::Call(_)
+        )
+    }) {
+        hold(lua, Held::Segment(raised));
+    }
+}
+
+/// Apply `call` through the lent host at once, with its tail, inside a split stretch: what it
+/// signals waits; what it raises is the script's error.
+fn apply_now(lua: &Lua, call: ScriptCall) {
+    let outer = swap_raising(lua, None);
+    let mut script = UiScript::reentrant(lua);
+    let tail = super::host::with_host(lua, |host| host.apply(&mut script, call)).flatten();
+    if let Some(tail) = tail {
+        tail(&mut script);
+    }
+    if let Some(message) = swap_raising(lua, outer) {
+        lua.app_data_mut::<Model>()
+            .expect("model app_data")
+            .record_lua_error(&mlua::Error::runtime(message));
     }
 }
 
@@ -806,6 +991,10 @@ impl super::Model {
 /// to lend, or a lend's once the outermost lend has ended): the held handlers run, with the calls
 /// they make waiting, and every call is dropped. The count of calls dropped.
 pub(crate) fn refuse_waiting(lua: &Lua) -> usize {
+    super::origin::within(super::origin::Origin::Script, || refuse_waiting_within(lua))
+}
+
+fn refuse_waiting_within(lua: &Lua) -> usize {
     super::host::open_unheld(lua, || {
         let mut dropped = 0;
         loop {
@@ -1188,7 +1377,6 @@ mod tests {
         s.hosted(&mut host, |s| s.run("TargetLastEnemy()"))
             .expect("the outer verb's own call raised nothing");
         assert_eq!(host.applied, vec![LAST_ENEMY, ScriptCall::ClearTarget]);
-        s.dispatch_script_errors_to_handler();
         let heard: Vec<String> = s.eval("return HEARD").expect("the handler's record");
         assert_eq!(heard.len(), 1, "{heard:?}");
         assert!(heard[0].contains("refused in the call"), "{heard:?}");
@@ -1586,7 +1774,9 @@ mod tests {
             .unwrap()
         };
         let pick_up = f(&lua, |lua, guid| {
-            cursor::set_cursor(lua, true, |_| Some(CursorPayload::Item(held_item(guid))));
+            cursor::set_cursor(lua, true, cursor::Setter::Item, |_| {
+                Some(CursorPayload::Item(held_item(guid)))
+            });
             super::super::tick::verb(lua, |model| cursor::lock_item(model, guid));
         });
         let put_down = f(&lua, |lua, _| {
@@ -1899,6 +2089,46 @@ mod tests {
         assert!(s.item_locked(LOCKED), "the lock made again");
         assert!(s.cursor_payload().is_none(), "the clear made again");
         assert_eq!(global::<String>(&s, "SEEN"), "nil");
+    }
+
+    /// A host whose every call signals `PLAYER_TARGET_CHANGED`.
+    struct Signalling(Vec<ScriptCall>);
+
+    impl CallHost for Signalling {
+        fn apply(&mut self, script: &mut UiScript, call: ScriptCall) -> Option<CallTail> {
+            self.0.push(call);
+            script.fire_event("PLAYER_TARGET_CHANGED", vec![]);
+            None
+        }
+    }
+
+    /// In a split stretch, a verb that signals and then makes a call applies the call at once,
+    /// and what was raised before it waits ahead of what its apply signals.
+    #[test]
+    fn a_split_stretch_keeps_a_signal_ahead_of_a_later_calls_signals() {
+        let mut s = UiScript::new().unwrap();
+        on(&s, "LOOT_OPENED", r#"ORDER = (ORDER or "") .. "opened ""#);
+        on(
+            &s,
+            "PLAYER_TARGET_CHANGED",
+            r#"ORDER = (ORDER or "") .. "applied ""#,
+        );
+        let mut host = Signalling(Vec::new());
+        let lua = s.lua().clone();
+        let mark = s.waiting_mark();
+        let deferring = s.defer_split();
+        s.hosted(&mut host, |_| {
+            super::super::tick::verb(&lua, |model| {
+                model.raise("LOOT_OPENED", vec![]);
+                model.call_in_verb(ScriptCall::ClearTarget);
+            })
+        });
+        assert_eq!(host.0, vec![ScriptCall::ClearTarget], "applied at once");
+        assert_eq!(global::<Option<String>>(&s, "ORDER"), None, "held");
+        let key = s.park_since(mark).expect("parked");
+        drop(deferring);
+        s.hosted(&mut host, |s| s.run_parked(key));
+        assert_eq!(global::<String>(&s, "ORDER"), "opened applied ");
     }
 
     /// The deferral's guard ends with a panic that unwinds through it: nothing is held after.

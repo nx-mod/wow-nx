@@ -239,7 +239,7 @@ pub(crate) fn enchant_lines(
 /// takes the gift arm (`0x52b789`, `0x52e1b9`), which reads `ITEM_FIELD_GIFTCREATOR` (`0x52e32a`)
 /// and asks the name cache (`0x52e29d`). A zero guid, an unwrapped item or a name not yet
 /// answered gives `None`. Only reads: the lookup is the tooltip build's, which asks it
-/// (`crate::ui_items::feed::ask_item_build_lookups`).
+/// in its call ([`benilla_ui::script::RecordAsk::ItemBuildName`]).
 pub(crate) fn gift_creator_name(
     fields: &ObjectFields,
     names: &crate::names::NameCache,
@@ -347,8 +347,9 @@ fn enchant_lines_quiet(
 #[derive(Resource)]
 pub(crate) struct RandomProperties {
     pub(crate) catalog: benilla_formats::RandomPropertyCatalog,
-    /// `ITEM_SUFFIX_TEMPLATE` as `FrameScript_GetText` reads it off the VM (`0x5d8b78` →
-    /// `0x703bf0`), the empty string for a missing key; `None` until a VM has been read.
+    /// `ITEM_SUFFIX_TEMPLATE` as `FrameScript_GetText` reads it off the VM (`0x5d8b7f` →
+    /// `0x703bf0`), the empty string for a missing key, copied as each frame's Lua ends
+    /// ([`crate::ui_items::feed::copy_suffix_template`]); `None` until a VM has been read.
     pub(crate) suffix_template: Option<String>,
 }
 
@@ -480,10 +481,13 @@ pub(crate) struct Items {
     /// [`Items::template_answered_unknown`] and asked again by the next event's lookup
     /// ([`QueryCache::refuse`]); it is never kept as a record.
     templates: QueryCache<u32, ItemInfo>,
-    /// Landed since the last [`Self::take_fresh`]; pushed to the UI unprompted.
-    fresh: Vec<u32>,
-    /// Records a refusal removed since the last [`Self::take_dropped`], which the UI's copy drops.
-    dropped: Vec<u32>,
+    /// Each entry's last record change: the change count it landed or went at, whether it is held
+    /// now, and whether the VM's copy took it at its answer ([`Self::vm_took`]). Read, never
+    /// drained, by whoever follows the records ([`Self::changed_since`]): the item-tooltip feed
+    /// pushes a landed record unprompted and drops a removed one.
+    changes: std::collections::HashMap<u32, (u64, bool, bool)>,
+    /// How many record changes [`Self::changes`] has seen.
+    change_count: u64,
     /// The reference's `PlayerPendingItemExpiration` list (`0x5ebd40`, at `CGPlayer_C + 0x1cc8`):
     /// `(guid, slot, seconds)` enchant updates for an item not yet held. `0x5ebde0` applies them
     /// when the item is set up (`0x5d8440`), counting seconds from then; they live as long as the
@@ -494,9 +498,46 @@ pub(crate) struct Items {
     /// dedupe for the dedupe flag 0, `dbcache/callbacks#callback-order`). A getter registers one
     /// from a lookup, so the list is locked like the in-flight asks and registering takes `&self`.
     callbacks: std::sync::Mutex<Vec<(u32, RecordCallback)>>,
-    /// The callbacks an answer ran that need the VM, `(entry, callback, found)` in the order
-    /// they ran: the equip replays ([`crate::ui_bind_confirm::replay_equip_records`]).
+    /// The equip callbacks a lookup ran on a record the cache held and the VM's copy lacked,
+    /// `(entry, callback, found)` in the order they ran
+    /// ([`crate::ui_bind_confirm::replay_equip_records`]).
     vm_callbacks: std::sync::Mutex<Vec<(u32, RecordCallback, bool)>>,
+    /// The refusals' walks: the one running now, and each of this drain's, whose signals the
+    /// drain fires under its marks ([`Self::walk_takes`]).
+    walks: std::sync::Mutex<RefusalWalks>,
+}
+
+/// [`Items::walks`].
+#[derive(Default)]
+struct RefusalWalks {
+    now: Option<RefusalWalk>,
+    done: Vec<RefusalWalk>,
+}
+
+/// A refused entry's callbacks run with status 0 (`0x55be91`-`0x55bead`), while its node stands
+/// with no record. A lookup in a callback links its own at the head (`0x55ba30`), and the walk
+/// goes from the tail toward the head, reading each link before the call (`0x55be9c`): it reaches
+/// one a callback adds unless the adder was at the head, whose link was read as the end. The
+/// node's destroy frees what is left uncalled (`0x55bed2`). Nothing is sent meanwhile: the lookup
+/// finds the node.
+struct RefusalWalk {
+    entry: u32,
+    /// The list as it stands, walked and to walk, for the dedupe scan (`0x55bbb3`).
+    list: Vec<RecordCallback>,
+    /// The next to run.
+    next: usize,
+    /// Whether the callback running now was the last when it began.
+    last: bool,
+    /// The marks around the walk, and the start of its last callback: a signal stamped between
+    /// `from` and `last_from` was raised by a callback with a next.
+    from: crate::lanes::Mark,
+    last_from: crate::lanes::Mark,
+    to: crate::lanes::Mark,
+    /// The callbacks a listener of the walk's signals added, which the walk reaches
+    /// ([`Items::take_walk_tail`]), and whether one came from a listener of a callback with a
+    /// next, so the last callback's next is no longer the end.
+    tail: Vec<RecordCallback>,
+    extended: bool,
 }
 
 /// A callback an item record's lookup registered, which the record's answer runs.
@@ -519,6 +560,63 @@ pub(crate) enum RecordCallback {
     Swap,
     /// An auto-equip waiting on its record (`0x5e1603` with `0x5e17a0`).
     AutoEquip,
+    /// A vendor row's, asked by `GetMerchantItemInfo` (`0x4faf1a` with `0x4fada0`), one per call.
+    Merchant,
+    /// A buy-back row's, asked by `GetBuybackItemInfo` (`0x4fb40c` with `0x4fb570`), one per call.
+    Buyback,
+    /// A trainer row's product, asked by `GetTrainerServiceIcon` and `GetTrainerServiceDescription`
+    /// (`0x4d907e` with `0x4d9140`, `0x4d9cef` with `0x4d9db0`), one per call.
+    Trainer,
+    /// A profession getter's, asked by `GetTradeSkillIcon`, `GetTradeSkillItemStats`,
+    /// `GetTradeSkillReagentInfo` and `GetTradeSkillTools` (`0x4fdb90`, `0x4fdf77`, `0x4ff6cd`,
+    /// `0x4ffac6` with `0x4fdc30`), one per call.
+    TradeSkill,
+    /// A profession list build's product (`0x4fcd4d` with `0x4fc8e0`), one per row that missed.
+    TradeSkillBuild,
+    /// A craft getter's, asked by `GetCraftReagentInfo` and `GetCraftSpellFocus` (`0x4f75dd`,
+    /// `0x4f79f2` with `0x4f7710`), one per call.
+    Craft,
+    /// A questgiver row's, asked by `GetQuestItemInfo` (`0x5017de` with `0x5018c0`), one per call.
+    Quest,
+    /// A turn-in's reward line whose item was not cached (`0x5dc647`, `0x5dc6a1` with
+    /// `0x5dc7b0`), one per line.
+    QuestReward,
+    /// A mail row's, asked by `GetInboxHeaderInfo` and `GetInboxItem` (`0x4aecc7`, `0x4aed63`,
+    /// `0x4af66f` with `0x4af0a0`), one per call, or an auction notice's at the list parse
+    /// (`0x4acf38` with `0x4ad010`), one per notice.
+    Mail,
+    /// An auction notice's line whose item was not cached (`0x4ccf6e`, `0x4cd3eb`, `0x4cd4ef` with
+    /// `0x4cd190`), one per line.
+    AuctionMessage,
+    /// The attachment's, asked by `GetSendMailItem` (`0x4ae604` with `0x4ae710`), one per call.
+    SendMail,
+    /// The sell slot item's, asked by `CalculateAuctionDeposit` and `GetAuctionSellItemInfo`
+    /// (`0x4ce25e`, `0x4ce5e3` with `0x4ce2f0`), one per call.
+    AuctionSellItem,
+    /// A paper's item the world-enter init missed (`0x4acbba` with `0x4acbf0`), one per row.
+    Stationery,
+    /// A spell go's item cooldown held for its record (`0x6e84c2` with `0x6e8830`), one per go.
+    ItemCooldown,
+    /// A cooldown query's miss, the action bar's, the bags' or the paper doll's (`0x6e2efb` with
+    /// `0x6e2f70`), deduped (`0x6e2ef4`).
+    CooldownQuery,
+    /// The quest log's leaderboard and reward getters (`0x4e05e0`, `0x4e0bb3`, `0x4e0da3` with
+    /// `0x4e0830`), one per entry as the VM keeps its waits.
+    QuestLog,
+    /// A tooltip build's miss (`0x52e530`, `0x52f820`), one per entry as the VM keeps each
+    /// tooltip's wait.
+    Tooltip,
+    /// A group loot roll's or one of its lines', by the wait's serial: a start's (`0x61b40e` with
+    /// `0x61b460`), an announcement's (`0x61c047` with `0x61c4b0`), a result's (`0x61b96a` with
+    /// `0x61bd50`) or an all-passed's (`0x61b5c0` with `0x61b7d0`).
+    LootRoll(u32),
+    /// The action bar's, asked by an item slot's icon, count and spell lookups (`0x4e6b10`,
+    /// `0x4e6d69`, `0x4e5b30` with `0x4e5b80`), deduped.
+    ActionSlots,
+    /// A refused cast's reagent or tool line whose item was not cached (`0x6e1ea4` with
+    /// `ShowItemCastFailure 0x6e29b0` and the reason), one per refusal; the spell picks the
+    /// line's message as its first pass would.
+    CastFailure { spell: u32, reason: u8 },
 }
 
 impl Items {
@@ -531,7 +629,21 @@ impl Items {
 
     /// A lookup of `entry` that missed registered `callback`.
     pub(crate) fn wait(&self, entry: u32, callback: RecordCallback) {
+        if self.walk_takes(entry, callback, false) {
+            return;
+        }
         self.callbacks.lock_recover().push((entry, callback));
+    }
+
+    /// [`Self::wait`] with the dedupe flag set (`0x55bbb3`): no second `callback` on `entry`.
+    pub(crate) fn wait_once(&self, entry: u32, callback: RecordCallback) {
+        if self.walk_takes(entry, callback, true) {
+            return;
+        }
+        let mut callbacks = self.callbacks.lock_recover();
+        if !callbacks.contains(&(entry, callback)) {
+            callbacks.push((entry, callback));
+        }
     }
 
     /// The answer for `entry` landed, or refused it: the callbacks waiting on it, in the order
@@ -549,7 +661,125 @@ impl Items {
         taken
     }
 
-    /// Run `callback` for the record of `entry`, answered (`found`) or refused, with the VM.
+    /// A refusal of `entry` begins walking `list` ([`RefusalWalk`]).
+    pub(crate) fn begin_refusal_walk(&self, entry: u32, list: Vec<RecordCallback>) {
+        let at = crate::lanes::mark();
+        self.walks.lock_recover().now = Some(RefusalWalk {
+            entry,
+            list,
+            next: 0,
+            last: false,
+            from: at,
+            last_from: at,
+            to: at,
+            tail: Vec::new(),
+            extended: false,
+        });
+    }
+
+    /// The walk's next callback, with what its callbacks added so far.
+    pub(crate) fn next_walk_step(&self) -> Option<RecordCallback> {
+        let mut walks = self.walks.lock_recover();
+        let walk = walks.now.as_mut()?;
+        let callback = *walk.list.get(walk.next)?;
+        walk.next += 1;
+        walk.last = walk.next == walk.list.len();
+        if walk.last {
+            walk.last_from = crate::lanes::mark();
+        }
+        Some(callback)
+    }
+
+    /// The walk ended and the node went (`0x55bed2`). Whether a signal a callback with a next
+    /// raised may still add to it, through a listener the drain runs later: then the walk goes on
+    /// behind its signals ([`Self::take_walk_tail`]).
+    pub(crate) fn end_refusal_walk(&self) -> bool {
+        let mut walks = self.walks.lock_recover();
+        let Some(mut walk) = walks.now.take() else {
+            return false;
+        };
+        walk.to = crate::lanes::mark();
+        let goes_on = walk.last_from != walk.from;
+        walks.done.push(walk);
+        goes_on
+    }
+
+    /// What the listeners of the walk of `entry` that began at `from` added, spent, to walk on with
+    /// after its signals: the reference's listeners run inside the callbacks.
+    pub(crate) fn take_walk_tail(
+        &self,
+        entry: u32,
+        from: crate::lanes::Mark,
+    ) -> Vec<RecordCallback> {
+        let mut walks = self.walks.lock_recover();
+        walks
+            .done
+            .iter_mut()
+            .find(|w| w.entry == entry && w.from == from)
+            .map(|w| std::mem::take(&mut w.tail))
+            .unwrap_or_default()
+    }
+
+    /// The mark the walk running now began at.
+    pub(crate) fn walk_began(&self) -> Option<crate::lanes::Mark> {
+        self.walks.lock_recover().now.as_ref().map(|w| w.from)
+    }
+
+    /// The drain fired what the walks raised. Locked, so the drain's end leaves the records'
+    /// change detection alone.
+    pub(crate) fn end_refusal_walks(&self) {
+        self.walks.lock_recover().done.clear();
+    }
+
+    /// Whether a lookup of `entry` now runs inside its refusal's walk: in a callback, or in a
+    /// listener of a signal one raised. Its lookup finds the dying node, so it sends nothing
+    /// (`0x556aa0`).
+    fn in_refusal_walk(&self, entry: u32) -> bool {
+        let walks = self.walks.lock_recover();
+        walks.now.as_ref().is_some_and(|w| w.entry == entry)
+            || walks
+                .done
+                .iter()
+                .any(|w| w.entry == entry && crate::lanes::firing_between(w.from, w.to))
+    }
+
+    /// A lookup inside a refusal's walk of `entry` registering `callback` (`once`: with the dedupe
+    /// flag): linked for the walk to reach, or dropped, as [`RefusalWalk`] says. Whether the walk
+    /// took it, so it is not kept as a wait.
+    fn walk_takes(&self, entry: u32, callback: RecordCallback, once: bool) -> bool {
+        let mut walks = self.walks.lock_recover();
+        let RefusalWalks { now, done } = &mut *walks;
+        if let Some(walk) = now.as_mut().filter(|w| w.entry == entry) {
+            if !walk.last && !(once && walk.list.contains(&callback)) {
+                walk.list.push(callback);
+            }
+            return true;
+        }
+        let Some(walk) = done
+            .iter_mut()
+            .rev()
+            .find(|w| w.entry == entry && crate::lanes::firing_between(w.from, w.to))
+        else {
+            return false;
+        };
+        let with_next = crate::lanes::firing_between(walk.from, walk.last_from);
+        let reached = with_next || walk.extended;
+        let seen = once && (walk.list.contains(&callback) || walk.tail.contains(&callback));
+        if reached && !seen {
+            walk.tail.push(callback);
+            walk.extended |= with_next;
+        }
+        true
+    }
+
+    /// Drop every waiting callback of `kind`, as a cancel by callback drops its registrations
+    /// (`0x55c0c0`).
+    pub(crate) fn cancel_waits(&self, kind: RecordCallback) {
+        self.callbacks.lock_recover().retain(|&(_, cb)| cb != kind);
+    }
+
+    /// Run `callback` for the record of `entry`, answered (`found`) or refused, with the VM, as
+    /// the frame's drain comes.
     pub(crate) fn run_with_vm(&self, entry: u32, callback: RecordCallback, found: bool) {
         self.vm_callbacks
             .lock_recover()
@@ -613,6 +843,9 @@ impl Items {
     /// The template for `entry` if known, read as `ask` says; an ask goes once while in flight
     /// (`guid` rides along, `0` for template-only). A refused entry is also `None`.
     pub(crate) fn template(&self, entry: u32, guid: u64, ask: Ask<'_>) -> Option<&ItemInfo> {
+        if !matches!(ask, Ask::Read) && self.in_refusal_walk(entry) {
+            return None;
+        }
         self.templates.read(entry, ask, |commands| {
             Self::send_template(entry, guid, commands)
         })
@@ -635,9 +868,8 @@ impl Items {
         self.templates.answered(entry)
     }
 
-    /// Whether the server refused `entry`, not still pending; the cast-fail redisplay then shows
-    /// the reference's `"UNKNOWN"` instead of waiting (`0x6e29b0` runs on the status-0 callback and
-    /// finds no record, `0x6e2a49`).
+    /// Whether the server refused `entry` and nothing has asked since, not still pending: the
+    /// status-0 answer its waiters were told.
     pub(crate) fn template_answered_unknown(&self, entry: u32) -> bool {
         self.templates.answered_unknown(entry)
     }
@@ -651,18 +883,44 @@ impl Items {
     pub(crate) fn insert_template(&mut self, entry: u32, info: Option<ItemInfo>) {
         match info {
             Some(info) => {
-                self.fresh.push(entry);
+                self.note_change(entry, true);
                 self.templates.insert(entry, info);
             }
             // A refusal moves the generation too: "still asking" to "unknown" is a display
-            // transition for the cast-fail redisplay.
+            // transition.
             None => {
                 if self.templates.refuse(entry) == crate::query_cache::Refused::Record {
-                    self.fresh.retain(|&id| id != entry);
-                    self.dropped.push(entry);
+                    self.note_change(entry, false);
                 }
             }
         }
+    }
+
+    /// `entry`'s record landed (`held`) or went.
+    fn note_change(&mut self, entry: u32, held: bool) {
+        self.change_count += 1;
+        self.changes.insert(entry, (self.change_count, held, false));
+    }
+
+    /// The VM's copy took `entry`'s last change at its answer, so the feed need not push it again.
+    pub(crate) fn vm_took(&mut self, entry: u32) {
+        if let Some(change) = self.changes.get_mut(&entry) {
+            change.2 = true;
+        }
+    }
+
+    /// How many record changes have been made: a reader's cursor for [`Self::changed_since`].
+    pub(crate) fn change_count(&self) -> u64 {
+        self.change_count
+    }
+
+    /// Each entry whose record landed or went after change `count` and that the VM's copy did not
+    /// take at its answer, with whether it is held now.
+    pub(crate) fn changed_since(&self, count: u64) -> impl Iterator<Item = (u32, bool)> + '_ {
+        self.changes
+            .iter()
+            .filter(move |(_, &(at, _, took))| at > count && !took)
+            .map(|(&entry, &(_, held, _))| (entry, held))
     }
 
     /// The template store, the one [`crate::wdb`] saves.
@@ -677,14 +935,14 @@ impl Items {
     /// Drops every template, which the interface's copy drops too: another realm's file replaces
     /// them.
     pub(crate) fn forget_templates(&mut self) {
-        self.dropped
-            .extend(self.templates.iter().map(|(&entry, _)| entry));
-        self.fresh.clear();
+        let held: Vec<u32> = self.templates.iter().map(|(&entry, _)| entry).collect();
+        for entry in held {
+            self.note_change(entry, false);
+        }
         self.templates.clear();
     }
 
-    /// Bumped by every landed answer, for consumers besides the drain; the stand-in for the
-    /// reference's `DBCACHECALLBACK` redisplay (`0x6e29b0`).
+    /// Bumped by every landed answer, for consumers besides the drain.
     pub(crate) fn template_epoch(&self) -> u64 {
         self.templates.generation()
     }
@@ -694,30 +952,9 @@ impl Items {
         self.templates.iter().map(|(&id, _)| id).collect()
     }
 
-    /// Whether a template landed, or a refusal removed a record, since the last drains.
-    pub(crate) fn any_fresh_or_dropped(&self) -> bool {
-        !self.fresh.is_empty() || !self.dropped.is_empty()
-    }
-
-    /// Drain the entries whose template landed since the last drain.
-    pub(crate) fn take_fresh(&mut self) -> Vec<u32> {
-        std::mem::take(&mut self.fresh)
-    }
-
-    /// Drain the entries whose record a refusal removed since the last drain.
-    pub(crate) fn take_dropped(&mut self) -> Vec<u32> {
-        std::mem::take(&mut self.dropped)
-    }
-
-    /// World enter: release the ask-once latch and keep what the cache learned. An ask is marked
-    /// pending before the send, and a send made while no writer is held is dropped silently.
-    pub(crate) fn clear_pending(&mut self) {
-        self.templates.clear_pending();
-    }
-
-    /// Disconnect: drop the in-flight asks, the callbacks waiting on them or on the VM, and the
-    /// queued enchant times, keep the templates. The item objects and their countdowns go with
-    /// the index's sweep.
+    /// Disconnect: drop the callbacks waiting on asks or on the VM, and the queued enchant times,
+    /// keep the templates; [`crate::wdb`] clears their in-flight asks. The item objects and their
+    /// countdowns go with the index's sweep.
     pub(crate) fn clear_session(&mut self) {
         self.pending_enchant_times.clear();
         self.callbacks
@@ -728,13 +965,6 @@ impl Items {
             .get_mut()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
-        self.templates.clear_pending();
-    }
-}
-
-impl crate::query_cache::AskOnce for Items {
-    fn clear_pending(&mut self) {
-        Items::clear_pending(self);
     }
 }
 
@@ -1031,13 +1261,29 @@ mod tests {
         assert!(c.enchant_deadline_ms(6).is_some_and(|ms| ms <= 30_000));
     }
 
+    /// A reader follows the records by its cursor, never draining them: a landed record shows
+    /// once past its cursor, a refusal of an unheld entry not at all, and a refusal of a held one
+    /// as gone.
     #[test]
-    fn landed_templates_drain_as_fresh_once() {
+    fn a_record_change_shows_past_a_readers_cursor() {
         let mut items = Items::default();
         items.insert_template(117, Some(info("Tough Jerky")));
         items.insert_template(9999, None);
-        assert_eq!(items.take_fresh(), vec![117]);
-        assert!(items.take_fresh().is_empty(), "a drain empties the queue");
+        let since = |items: &Items, at| {
+            let mut v: Vec<(u32, bool)> = items.changed_since(at).collect();
+            v.sort_unstable();
+            v
+        };
+        assert_eq!(since(&items, 0), [(117, true)]);
+        let cursor = items.change_count();
+        assert!(since(&items, cursor).is_empty(), "nothing past the cursor");
+        items.insert_template(117, None);
+        assert_eq!(since(&items, cursor), [(117, false)]);
+        assert_eq!(
+            since(&items, 0),
+            [(117, false)],
+            "a second reader reads it too"
+        );
     }
 
     /// The tooltip's open line waits for an unlocked instance; the click is the bare template bit,
@@ -1214,6 +1460,7 @@ mod tests {
         items.insert_template(117, Some(info("Tough Jerky")));
         assert!(items.template(118, 0, Ask::New(&cmds)).is_none()); // leaves 118 in flight
         items.clear_session();
+        items.template_store_mut().clear_pending(); // the saved stores' clear, in `wdb`
         assert!(items.take_enchant_times(0x43).is_empty());
         assert!(
             items.template(117, 0, Ask::New(&cmds)).is_some(),

@@ -3,6 +3,8 @@
 //! the bind-on-equip question, or parks the move on an uncached record, before it sends, and only
 //! the send clears the cursor (`0x5e0fe7`): a question or a wait leaves the item held.
 
+use mlua::Lua;
+
 use crate::script::container::ContainerMove;
 use crate::script::tick::verb;
 use crate::script::{ItemCall, Model};
@@ -52,13 +54,12 @@ enum OtherEnd {
 /// active player's own list for the player's slots, the backpack, the vault and the keyring, the
 /// bag item in the container's inventory slot (`ContainerIDToInventoryID`'s two bands) for bags
 /// 1-10.
-fn bag_object(model: &Model, bag: i64) -> bool {
+fn bag_object(lua: &Lua, model: &Model, bag: i64) -> bool {
     match bag {
         EQUIPMENT_BAG | -2..=0 => true,
         1..=10 => {
             let live = if bag <= 4 { bag + 19 } else { bag + 59 };
-            model
-                .player_slot_object(live as usize)
+            crate::script::char_stats::player_slot_object(lua, model, live as usize)
                 .is_some_and(|v| v.guid != 0)
         }
         _ => false,
@@ -66,7 +67,7 @@ fn bag_object(model: &Model, bag: i64) -> bool {
 }
 
 /// The move's other end when exactly one end is an equipment position (`0x5e0ce1`-`0x5e0d69`).
-fn other_end(model: &Model, mv: &ContainerMove) -> OtherEnd {
+fn other_end(lua: &Lua, model: &Model, mv: &ContainerMove) -> OtherEnd {
     let (bag, slot) = match (
         equip_position(mv.src_bag, mv.src_slot),
         equip_position(mv.dst_bag, mv.dst_slot),
@@ -75,64 +76,65 @@ fn other_end(model: &Model, mv: &ContainerMove) -> OtherEnd {
         (false, true) => (mv.src_bag, mv.src_slot),
         _ => return OtherEnd::Unasked,
     };
-    if !bag_object(model, bag) {
+    if !bag_object(lua, model, bag) {
         return OtherEnd::NoBag;
     }
-    model
-        .containers
-        .get(&bag)
-        .and_then(|c| c.slots.get(&slot))
+    crate::script::held::held_slot(lua, model, bag, slot)
         .filter(|s| s.item_id != 0 && s.guid != 0)
         .map_or(OtherEnd::Unasked, |s| {
-            OtherEnd::Item(EquipFacts::of_slot(s))
+            OtherEnd::Item(EquipFacts::of_slot(&s))
         })
 }
 
 /// `SwapItem(mv, confirm)` (`0x5e0c40`): the question on the item the move would equip, unless
-/// `confirm` (the accept's re-issue, `0x5e1c46`) skips it; else the send and its clear.
-pub(crate) fn swap_items(model: &mut Model, mv: ContainerMove, confirm: bool) -> Swap {
-    let question = match other_end(model, &mv) {
+/// `confirm` (the accept's re-issue, `0x5e1c46`) skips it; else the send (`0x5e0fdb`) and its
+/// clear (`0x5e0fe7`). The send, the question or the wait goes to the host in its place
+/// ([`Model::item_call`]), ahead of the clear's signals.
+pub(crate) fn swap_items(lua: &Lua, model: &mut Model, mv: ContainerMove, confirm: bool) -> Swap {
+    let question = match other_end(lua, model, &mv) {
         OtherEnd::NoBag => return Swap::NoBag(mv),
         OtherEnd::Unasked => Question::Send,
-        OtherEnd::Item(item) => equip_question(model, item, confirm),
+        OtherEnd::Item(item) => equip_question(lua, model, item, confirm),
     };
-    match question {
-        Question::Ask => Swap::Asked(mv),
-        Question::Wait(entry) => Swap::Waits { mv, entry },
-        Question::Send => {
-            clear(model, Clear::KEEP_LOCK);
-            Swap::Sent(mv)
-        }
+    let (swap, call) = match question {
+        Question::Ask => (Swap::Asked(mv.clone()), ItemCall::SwapAsk(mv)),
+        Question::Wait(entry) => (
+            Swap::Waits {
+                mv: mv.clone(),
+                entry,
+            },
+            ItemCall::SwapWait { mv, entry },
+        ),
+        Question::Send => (Swap::Sent(mv.clone()), ItemCall::Move(mv)),
+    };
+    model.item_call(call);
+    if let Swap::Sent(_) = swap {
+        clear(model, Clear::KEEP_LOCK);
     }
+    swap
 }
 
-/// [`swap_items`] with the question asked, filing what it did for the host: the send
-/// ([`ItemCall::Move`]), the question ([`ItemCall::SwapAsk`]) or the wait
-/// ([`ItemCall::SwapWait`]).
-pub(crate) fn swap_and_file(model: &mut Model, mv: ContainerMove) {
-    let call = match swap_items(model, mv, false) {
-        Swap::Sent(mv) => ItemCall::Move(mv),
-        Swap::Asked(mv) => ItemCall::SwapAsk(mv),
-        Swap::Waits { mv, entry } => ItemCall::SwapWait { mv, entry },
-        Swap::NoBag(_) => return,
-    };
-    model.item_calls.push(call);
+/// [`swap_items`] with the question asked, from a verb's segment: what it did goes to the host in
+/// its place, the send ([`ItemCall::Move`]) ahead of its clear's signals, or the question
+/// ([`ItemCall::SwapAsk`]) or the wait ([`ItemCall::SwapWait`]).
+pub(crate) fn swap_and_file(lua: &Lua, model: &mut Model, mv: ContainerMove) {
+    swap_items(lua, model, mv, false);
 }
 
 impl crate::script::UiScript {
     /// `SwapItem` from the host: the bind-confirm accept re-issues the parked move with `confirm`
-    /// set (`0x5e1c46`), so it sends and clears whatever the cursor holds then. The host sends
-    /// what comes back.
+    /// set (`0x5e1c46`), so it sends and clears whatever the cursor holds then, the send handed
+    /// over in place.
     pub fn swap_items(&mut self, mv: ContainerMove, confirm: bool) -> Swap {
-        verb(&self.lua, |model| swap_items(model, mv, confirm))
+        verb(&self.lua, |model| swap_items(&self.lua, model, mv, confirm))
     }
 
     /// The callback `0x5e1020` for a move parked on its record: with the record found
     /// (`0x5e1099`-`0x5e10a0`) `SwapItem` runs again unconfirmed (`0x5e10c2`), its send, question
     /// or wait applied through the host. The host frees the parked entry after.
     pub fn replay_swap(&mut self, mv: ContainerMove) -> mlua::Result<()> {
-        verb(&self.lua, |model| swap_and_file(model, mv));
-        crate::script::item_calls::submit_item_calls(&self.lua)
+        verb(&self.lua, |model| swap_and_file(&self.lua, model, mv));
+        Ok(())
     }
 }
 

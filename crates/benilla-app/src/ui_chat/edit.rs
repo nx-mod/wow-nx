@@ -114,6 +114,10 @@ pub(crate) struct ChannelState {
     /// gate. Only a confirm (`0x49bbbf`) and a free (`0x49bc41`) recompute it, so it holds
     /// through a rename, a suspend or a pending join.
     pub defense_channel: bool,
+    /// Each slot's instance number (`+0x98`), stored by the join notice's confirm (`0x49bb20`) and
+    /// written by no allocator, so a freed and reused slot keeps the last one; the session's end
+    /// frees the array.
+    pub instances: [u32; MAX_CHANNELS],
 }
 
 /// One slot, the reference's `[0xb4fe04] + n*0xa0` record, in the fields this client uses.
@@ -252,6 +256,7 @@ impl ChannelState {
             self.ended_custom = Some(self.live_custom_channels());
         }
         self.joined.clear();
+        self.instances = [0; MAX_CHANNELS];
     }
 
     /// Whether the mask carries `id`'s bit, the walk's live predicate `0x49a494`.
@@ -335,6 +340,16 @@ impl ChannelState {
         Some(i as u32 + 1)
     }
 
+    /// `0x49bb20`'s store of the join notice's instance (`+0x98`) on slot `number`.
+    pub(crate) fn store_instance(&mut self, number: u32, instance: u32) {
+        if let Some(cell) = (number as usize)
+            .checked_sub(1)
+            .and_then(|i| self.instances.get_mut(i))
+        {
+            *cell = instance;
+        }
+    }
+
     /// `0x49bd50`: whether a slot with a number (`0x49bd72`) in state 0 (`0x49bd7c`) has a
     /// `+0x94` id naming a row (`0x49bd83`-`0x49bd96`) with both `ZONE_DEP` and `DEFENSE`
     /// (`0x49bd9b`, `0x49bda2`), which is row 22 alone; a custom channel's id 0 names no row.
@@ -358,9 +373,9 @@ impl ChannelState {
         self.slot(name).map(|s| s.state)
     }
 
-    /// The slots for the VM's mirror, holes kept so `/N` addresses the right channel, each with
-    /// its id and whether it is in state 0, which the by-number lookups `0x49be50` and `0x49bf30`
-    /// and the lists require.
+    /// The slots as the lookups read them, holes kept so `/N` addresses the right channel, each
+    /// with its id and whether it is in state 0, which the by-number lookups `0x49be50` and
+    /// `0x49bf30` and the lists require.
     pub(crate) fn names(&self) -> Vec<Option<benilla_ui::script::JoinedChannel>> {
         self.joined
             .iter()
@@ -374,9 +389,10 @@ impl ChannelState {
             .collect()
     }
 
-    /// Push the slots into the VM's mirror, which `SendChatMessage`'s channel target and the
-    /// channel verbs read where the reference reads the slot array itself. Every step that writes
-    /// a slot's name or state ends with this, so the mirror never lags the slot it copies.
+    /// Push the slots into the VM's mirror, which the channel lookups read with no host to ask;
+    /// with one lent they read the slot array itself, as the reference does
+    /// ([`ChannelLive`]). Every step that writes a slot's name or state ends with this, so the
+    /// mirror never lags the slot it copies.
     pub(crate) fn mirror_into(&self, script: &mut benilla_ui::script::UiScript) {
         script.set_joined_channels(self.names());
     }
@@ -464,6 +480,7 @@ impl ChannelState {
         Some(ChannelStamp {
             number,
             id: self.joined[number as usize - 1].id(),
+            instance: self.instances[number as usize - 1],
         })
     }
 
@@ -481,16 +498,34 @@ impl ChannelState {
 pub(crate) struct ChannelStamp {
     number: u32,
     id: u32,
+    instance: u32,
 }
 
 impl ChannelStamp {
     /// Stamp `event`, whose `channel` is the record's name: arg4 becomes `"N. Name"` (`0x8445c8`,
     /// the hit leg `0x49aa48`), arg8 the number, arg9 the name with its zone tail and arg7 the
-    /// slot's id.
+    /// slot's id; arg10 is its instance.
     pub(crate) fn apply(self, event: &mut super::event::ChatEvent) {
         event.channel_base = event.channel.clone();
         event.zone_channel_id = self.id;
         event.channel_number = self.number;
+        event.instance = self.instance;
         event.channel = format!("{}. {}", self.number, event.channel_base);
+    }
+}
+
+/// The slot array as the channel lookups read it at the call (`0x49be50`, `0x49be90`,
+/// `0x49bf30`), so a listener reads the slots its packet's notice left. Absent in a harness without
+/// chat.
+#[derive(bevy::ecs::system::SystemParam)]
+pub(crate) struct ChannelLive<'w> {
+    channels: Option<Res<'w, ChannelState>>,
+}
+
+impl crate::script_calls::live::LiveFamily for ChannelLive<'_> {
+    fn answer(&mut self, ask: &mut benilla_ui::script::live::LiveAsk<'_>) -> bool {
+        ask.answer(|_: &benilla_ui::script::JoinedChannelsQuery| {
+            self.channels.as_deref().map(ChannelState::names)
+        })
     }
 }

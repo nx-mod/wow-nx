@@ -10,10 +10,9 @@
 //! cells, rebuilds the landmark list for the new map, then fires `WORLD_MAP_UPDATE` before it
 //! returns (`0x4a6ce4`), so `WorldMapFrame`'s OnShow repaints the map before its first draw.
 //!
-//! Deviation: the engine's own pushes (the world-enter sync, the explored areas, the landmark
-//! sources, the catalog) queue `WORLD_MAP_UPDATE` for the next frame's tick and fire only on a
-//! change, where the reference fires in place from the handler that moved the data: the app's
-//! feeds run after the frame's tick.
+//! Deviation: the engine's own push (the world-enter sync) queues `WORLD_MAP_UPDATE` for the next
+//! frame's tick and fires only on a change, where the reference fires in place from the handler
+//! that moved the data: the app's feeds run after the frame's tick.
 
 use mlua::{Lua, MultiValue, Value};
 
@@ -209,6 +208,56 @@ fn grid_area(state: &WorldMapState, u: f32, v: f32) -> Option<u16> {
         0 => None,
         zi => Some(zi),
     }
+}
+
+/// `GetMapInfo`'s second value (`0x4a6d50`): `ftol(H * 1002 / W)` of the displayed map's span, the
+/// `WorldMapContinent` tile counts for a continent, the loc rect for a zone; 0 for a span of zero
+/// width or height (`0x4a6e2e`-`0x4a6e3e`), the world sheet and an instance map, whose map id no
+/// `WorldMapContinent` row carries (`0x4a6dc2`-`0x4a6df2`).
+fn texture_height(wm: &WorldMapState) -> u32 {
+    let (c, z) = wm.selection;
+    let Some(cont) = wm
+        .direct_area
+        .is_none()
+        .then_some(c)
+        .and_then(|c| wm.continents.get(usize::try_from(c).ok()?.checked_sub(1)?))
+    else {
+        return 0;
+    };
+    let (w, h) = match z.checked_sub(1).and_then(|n| cont.zones.get(n as usize)) {
+        Some(zone) => {
+            let (left, right, top, bottom) = zone.loc_rect;
+            (
+                f64::from(left) - f64::from(right),
+                f64::from(top) - f64::from(bottom),
+            )
+        }
+        None => {
+            let Some(sheet) = cont.sheet else {
+                return 0;
+            };
+            let (left, right, top, bottom) = sheet.tiles;
+            let tiles =
+                |lo: u32, hi: u32| f64::from((hi as i32).wrapping_sub(lo as i32).wrapping_add(1));
+            (tiles(left, right), tiles(top, bottom))
+        }
+    };
+    if w == 0.0 || h == 0.0 {
+        return 0;
+    }
+    binding_abi::ftol(h * 1002.0 / w) as u32
+}
+
+/// `GetMapInfo`'s third value (`0x4a7e69`-`0x4a7e9a`): the height with its low byte rounded up
+/// to a power of two, the bytes above kept; a low byte of 0 or a power of two stays.
+fn pot_height(height: u32) -> u32 {
+    let low = height & 0xff;
+    let rounded = if low.is_power_of_two() || low == 0 {
+        low
+    } else {
+        low.next_power_of_two()
+    };
+    height - low + rounded
 }
 
 /// The client's power-of-two round-up (`0x4a833c`).
@@ -486,22 +535,16 @@ fn revealed_overlays(state: &WorldMapState) -> Vec<&WorldMapOverlayView> {
 }
 
 impl super::UiScript {
-    /// Pushes the catalog at startup, queueing `WORLD_MAP_UPDATE` so an open map repaints.
+    /// Pushes the catalog at the interface load, with no signal: the reference builds its lists
+    /// in `CGGameUI::InitializeGame` (`0x48f5d1` → `0x4a5d00`), which signals nothing.
     pub fn set_world_map_catalog(&mut self, continents: Vec<WorldMapContinentView>) {
-        let mut model = self.model_mut();
-        model.worldmap.continents = continents;
-        model
-            .pending_events
-            .push(("WORLD_MAP_UPDATE".to_string(), Vec::new()));
+        self.model_mut().worldmap.continents = continents;
     }
 
-    /// Pushes the orphan list beside the catalog, both filled in one walk (`0x4a5d00`).
+    /// Pushes the orphan list beside the catalog, both filled in one walk (`0x4a5d00`), with no
+    /// signal.
     pub fn set_world_map_direct_areas(&mut self, direct_areas: Vec<(u32, WorldMapZoneView)>) {
-        let mut model = self.model_mut();
-        model.worldmap.direct_areas = direct_areas;
-        model
-            .pending_events
-            .push(("WORLD_MAP_UPDATE".to_string(), Vec::new()));
+        self.model_mut().worldmap.direct_areas = direct_areas;
     }
 
     /// Pushes the resolver's orphan leg; the continent leg rides [`Self::set_world_map_feed`].
@@ -509,15 +552,42 @@ impl super::UiScript {
         self.model_mut().worldmap.player_direct_area = direct_area;
     }
 
-    /// Pushes the discovery bitset; a change queues `WORLD_MAP_UPDATE` so an open map fills in.
+    /// Pushes the discovery bitset from outside a session (a capture's fixture, a test); a change
+    /// queues `WORLD_MAP_UPDATE` so an open map fills in.
     pub fn set_world_map_explored(&mut self, explored: Vec<u32>) {
         let mut model = self.model_mut();
         if model.worldmap.explored != explored {
             model.worldmap.explored = explored;
-            model
-                .pending_events
-                .push(("WORLD_MAP_UPDATE".to_string(), Vec::new()));
+            model.queue_event("WORLD_MAP_UPDATE", Vec::new());
         }
+    }
+
+    /// Stores the discovery bitset without a signal: the world enter's read of the bytes the
+    /// watcher below has not run on. The reference reads them live whenever `0x4a67a0` builds
+    /// (`0x4a6bf4`), so a map first selected over a loaded player already sees them.
+    pub fn seed_world_map_explored(&mut self, explored: Vec<u32>) {
+        self.model_mut().worldmap.explored = explored;
+    }
+
+    /// The explored bytes' watcher (`0x4a6460` → `0x4a6477` → `0x4a67a0`, armed by `0x4a6430`) as
+    /// it runs in the update packet's notify pass. The setter re-selects the map it already shows:
+    /// the overlays follow the new bits, and the landmark list is rebuilt from `sources` when the
+    /// host has them, the bits gating its rows (`0x4a6890`-`0x4a68f3`). Then it signals
+    /// `WORLD_MAP_UPDATE` in place (`0x4a6ce4`), once, whether or not the shown art moved.
+    pub fn world_map_explored_changed(
+        &mut self,
+        explored: Vec<u32>,
+        sources: Option<Vec<WorldMapLandmarkSource>>,
+    ) {
+        {
+            let mut model = self.model_mut();
+            model.worldmap.explored = explored;
+            if let Some(sources) = sources {
+                model.worldmap.landmark_sources = sources;
+            }
+            model.worldmap.landmarks = build_landmarks(&model);
+        }
+        self.fire_event("WORLD_MAP_UPDATE", Vec::new());
     }
 
     /// Pushes the landmark sources and rebuilds the displayed map's list from them; a change to
@@ -529,6 +599,36 @@ impl super::UiScript {
         }
         model.worldmap.landmark_sources = sources;
         refresh_landmarks(&mut model);
+    }
+
+    /// The map setter `0x4a67a0` re-run over the map it shows by the gossip marker's set
+    /// (`0x6dac93`) and its clears in the minimap's update, at the deadline (`0x6d9411`) and on
+    /// arrival (`0x6d9a4c`): the landmark list is rebuilt from `sources` when the host has them,
+    /// then `WORLD_MAP_UPDATE` signals in place (`0x4a6ce4`), whether or not the list moved.
+    pub fn world_map_landmarks_changed(&mut self, sources: Option<Vec<WorldMapLandmarkSource>>) {
+        {
+            let mut model = self.model_mut();
+            if let Some(sources) = sources {
+                model.worldmap.landmark_sources = sources;
+            }
+            model.worldmap.landmarks = build_landmarks(&model);
+        }
+        self.fire_event("WORLD_MAP_UPDATE", Vec::new());
+    }
+
+    /// Stores the landmark sources with no rebuild and no signal, for an input the reference reads
+    /// only at the setter's next run (`0x4a67a0` reads the rows and the marker as it builds).
+    pub fn seed_world_map_landmark_sources(&mut self, sources: Vec<WorldMapLandmarkSource>) {
+        self.model_mut().worldmap.landmark_sources = sources;
+    }
+
+    /// [`Self::set_world_map_landmark_sources`] with nothing queued: the rebuild a world-state
+    /// packet makes, which signals `WORLD_MAP_UPDATE` itself at the packet's place (`0x48fa0d`
+    /// into `0x4a6cdf`), and a new VM's seed.
+    pub fn rebuild_world_map_landmarks(&mut self, sources: Vec<WorldMapLandmarkSource>) {
+        let mut model = self.model_mut();
+        model.worldmap.landmark_sources = sources;
+        model.worldmap.landmarks = build_landmarks(&model);
     }
 
     /// Pushes the per-frame feed: the player's zone, the projected positions and the facing.
@@ -579,9 +679,7 @@ impl super::UiScript {
     ) {
         let mut model = self.model_mut();
         select_resolved(&mut model, continent, zone, direct_area);
-        model
-            .pending_events
-            .push(("WORLD_MAP_UPDATE".to_string(), Vec::new()));
+        model.queue_event("WORLD_MAP_UPDATE", Vec::new());
     }
 
     /// The map UV at UI point `(x, y)`, or `None` off the art, normalized over `WorldMapButton`
@@ -644,9 +742,7 @@ fn refresh_landmarks(model: &mut Model) {
     let landmarks = build_landmarks(model);
     if model.worldmap.landmarks != landmarks {
         model.worldmap.landmarks = landmarks;
-        model
-            .pending_events
-            .push(("WORLD_MAP_UPDATE".to_string(), Vec::new()));
+        model.queue_event("WORLD_MAP_UPDATE", Vec::new());
     }
 }
 
@@ -790,8 +886,9 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         })?,
     )?;
 
-    // GetMapInfo() → mapFileName and two texture dimensions (`0x4a7e30`, `mov eax,3`): nil, 0, 0
-    // at world level. The name is the unlocalized art folder (`0x4a6cf0` reads `[row+0xc]`).
+    // GetMapInfo() → mapFileName, textureHeight and its power-of-two round (`0x4a7e30`, `mov
+    // eax,3`): nil, 0, 0 at world level. The name is the unlocalized art folder (`0x4a6cf0` reads
+    // `[row+0xc]`).
     g.set(
         "GetMapInfo",
         lua.create_function(|lua, ()| {
@@ -811,13 +908,12 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                         .unwrap_or_else(|| cont.map_file.clone()),
                 }),
             };
-            // No caller reads the dimensions, 0 here on every map; the reference computes them
-            // from `WorldMapContinent.dbc` (`0x4a6d50`), which lacks an instance map's mapID.
             let file = match file {
                 Some(f) => Value::String(lua.create_string(&f)?),
                 None => Value::Nil,
             };
-            Ok((file, 0i64, 0i64))
+            let height = texture_height(wm);
+            Ok((file, i64::from(height), i64::from(pot_height(height))))
         })?,
     )?;
 
@@ -861,23 +957,31 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         })?,
     )?;
 
-    // GetPlayerMapPosition(unit) → map UV, or (0, 0) off the map; `player`, `party1`..`party4`
-    // and `raid1`..`raid40` resolve, anything else is (0, 0).
+    // GetPlayerMapPosition(unit) → map UV, or (0, 0) off the map (`0x4a8610`): a string or number
+    // else the usage line (`0x4a861e`, `0x4a8627`), the token's guid through `GetGUIDFromName`
+    // (`0x4a8658` → `0x515970`: any case, the `target` hops, "Unknown unit name" raised), and the
+    // position by guid only for the player (`0x4a8668`), a party member (`0x4a8675`) or a raid
+    // member (`0x4a8681`); anyone else leaves (0, 0).
     g.set(
         "GetPlayerMapPosition",
-        lua.create_function(|lua, unit: String| {
+        lua.create_function(|lua, unit: Value| {
+            let token =
+                binding_abi::string_arg(lua, unit, r#"Usage: GetPlayerMapPosition("player")"#)?;
             let model = lua.app_data_ref::<Model>().expect("model app_data");
-            let slot = |prefix: &str, list: &[Option<(f32, f32)>]| {
-                unit.strip_prefix(prefix)
-                    .and_then(|n| n.parse::<usize>().ok())
-                    .filter(|n| *n >= 1)
-                    .and_then(|n| list.get(n - 1).copied().flatten())
+            let guid = crate::script::unit::guid_of(lua, &model, &token)?.unwrap_or(0);
+            let (guids, wm) = (&model.unit_guids, &model.worldmap);
+            let at = |members: &[u64], uv: &[Option<(f32, f32)>]| {
+                members
+                    .iter()
+                    .position(|g| *g == guid)
+                    .and_then(|n| uv.get(n).copied().flatten())
             };
-            let (x, y) = match unit.as_str() {
-                "player" => model.worldmap.player_uv,
-                u if u.starts_with("party") => slot("party", &model.worldmap.party_uv),
-                u if u.starts_with("raid") => slot("raid", &model.worldmap.raid_uv),
-                _ => None,
+            let (x, y) = if guid == 0 {
+                None
+            } else if guid == guids.player {
+                wm.player_uv
+            } else {
+                at(&guids.party, &wm.party_uv).or_else(|| at(&guids.raid, &wm.raid_uv))
             }
             .unwrap_or((0.0, 0.0));
             Ok((f64::from(x), f64::from(y)))

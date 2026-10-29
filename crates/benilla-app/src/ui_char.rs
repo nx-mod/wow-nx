@@ -11,15 +11,18 @@ use benilla_protocol::messages::{ItemInfo, PLAYER_SKILL_SLOTS};
 use benilla_protocol::ObjectFields;
 use benilla_ui::script::{
     weapon_subclass_skill, BankBagSlots, CombatRead, InvSlotView, InventorySlots, ItemRead,
-    SkillEntry, SkillsState, UnitCombatStats, SKILL_DEFENSE, SKILL_UNARMED,
+    SkillEntry, UnitCombatStats, SKILL_DEFENSE, SKILL_UNARMED,
 };
 
 use crate::entities::ItemDisplays;
 use crate::items::Items;
-use crate::net::{ClientCommand, NetCommands, ObjectStore, Objects, SelfPlayer};
+use crate::net::{ClientCommand, NetCommands, ObjectStore, Objects};
 use crate::query_cache::Ask;
 use crate::ui_items::find_equip_slot;
 use crate::ui_script::{gate, UiFeed};
+
+mod skills_live;
+pub(crate) use skills_live::SkillLive;
 
 /// Equipment slots, 0-based (`EQUIPMENT_SLOT_*`): main hand, off hand, ranged.
 const SLOT_MAIN_HAND: u8 = 15;
@@ -68,19 +71,11 @@ impl Plugin for UiCharPlugin {
                 (
                     // A `BAG_UPDATE` handler may read the bag item's own row
                     // (`GetInventoryItemLink("player", ContainerIDToInventoryID(bag))`): the lanes'
-                    // drain and the world-enter cascade both follow this push. Before the bag feed:
-                    // left to the VM pass, the pair links through one more command barrier
-                    // ([`crate::vm_pass`]).
+                    // drain and the world-enter cascade both follow this push.
                     feed_char
-                        .before(crate::ui_items::feed::feed_containers)
                         .in_set(UiFeed)
                         .in_set(crate::ui_unit::field_events::FieldEventPushes),
-                    // A seat, and ahead of the notice lane: the world-enter cascade's rebuild and
-                    // the skill watches' list what this pushed.
-                    feed_skills
-                        .in_set(UiFeed)
-                        .in_set(crate::ui_unit::field_events::FieldEventPushes)
-                        .in_set(crate::ui_unit::WorldEnterSeats),
+                    feed_skill_tiers.in_set(UiFeed),
                 ),
             );
     }
@@ -105,59 +100,22 @@ fn load_skill_tiers(mut commands: Commands, assets: Option<Res<benilla_assets::W
     }
 }
 
-/// The skills-pane feed: every `PLAYER_SKILL_INFO` line the reference lists, as a flat
-/// [`SkillEntry`] pushed through `set_skills` on change; the engine groups, sorts and folds at its
-/// rebuilds, which the skill watches' notices run (`crate::field_watch`) and the world-enter
-/// cascade.
-fn feed_skills(
+/// `SkillTiers.dbc`, once per VM, which `BuySkillTier` prices a step by; the skill list reads the
+/// slots through the call host ([`SkillLive`]).
+fn feed_skill_tiers(
     mut hosted_vm: crate::script_calls::HostedVm,
-    self_store: Query<Ref<ObjectStore>, With<SelfPlayer>>,
-    skill_lines: Option<Res<crate::ui_spellbook::SkillLines>>,
     tiers: Option<Res<SkillTiersRes>>,
-    mut last: Local<crate::ui_script::VmMemo<Option<SkillsState>>>,
     mut tiers_pushed: Local<crate::ui_script::VmMemo<bool>>,
 ) {
     hosted_vm.run(|script| {
-        let Some(script) = script else {
+        let (Some(script), Some(tiers)) = (script, tiers.as_deref()) else {
             return;
         };
-        // The cost table, once per VM.
         let pushed = tiers_pushed.get(script);
         if !*pushed {
-            if let Some(tiers) = tiers.as_deref() {
-                script.set_skill_tiers(tiers.0.tiers());
-                *pushed = true;
-            }
+            script.set_skill_tiers(tiers.0.tiers());
+            *pushed = true;
         }
-        let last = last.get(script);
-        let lines_moved = skill_lines.as_ref().is_some_and(|l| l.is_changed());
-        let (Ok(store), Some(skill_lines)) = (self_store.single(), skill_lines.as_deref()) else {
-            return;
-        };
-        // A pure function of the descriptor and the catalog: with both still, nothing can differ.
-        if last.is_some() && !store.is_changed() && !lines_moved {
-            return;
-        }
-        let (race, class) = (
-            store.0.unit_race().unwrap_or(0),
-            store.0.unit_class().unwrap_or(0),
-        );
-        let level = store.0.unit_level().unwrap_or(0);
-        let mut entries = Vec::new();
-        for i in 0..PLAYER_SKILL_SLOTS {
-            let Some(slot) = store.0.player_skill(i) else {
-                continue;
-            };
-            if let Some(e) = skills_row(&slot, &skill_lines.catalog, race, class, level) {
-                entries.push(e);
-            }
-        }
-        let fresh = SkillsState { entries };
-        if last.as_ref() == Some(&fresh) {
-            return;
-        }
-        script.set_skills(fresh.clone());
-        *last = Some(fresh);
     })
 }
 
@@ -549,7 +507,8 @@ fn slot_view(
         crate::items::record_flags(items, entry, guid),
         rolls.enchants,
     );
-    // Only read: the tooltip build asks the creator (`crate::ui_items::feed::ask_item_build_lookups`).
+    // Only read: the tooltip build asks the creator in its call
+    // ([`benilla_ui::script::RecordAsk::ItemBuildName`]).
     let creator = obj
         .item_creator()
         .filter(|&g| g != 0)
@@ -665,6 +624,43 @@ fn ammo_count(store: &ObjectStore, objects: &Objects, ammo_id: u32) -> u32 {
     n
 }
 
+/// The 0-based equipment slots of `0x4c7ee0`'s 11 worn regions, in `0x806eb8`'s order: head,
+/// shoulders, chest, waist, legs, feet, wrists, hands, main hand, off hand and ranged.
+const ALERT_REGIONS: [u8; 11] = [0, 2, 4, 5, 6, 7, 8, 9, 15, 16, 17];
+
+/// What the alert recompute `0x4c7ee0` reads off the active player `me`, each item found through
+/// `items`: the item in each worn region's slot (`0x6228a0`), its record's flags as cached
+/// (`records`, 0 uncached), and its temporary enchantment's milliseconds left (`left`, by guid);
+/// and with `PLAYER_AMMO_ID` set (`[+0xe68]+0x102c`, `0x4c7f53`), the carried count of that
+/// ammunition (`0x622130(id, 0)`, `0x4c7f73`).
+pub(crate) fn alert_inputs(
+    me: &ObjectFields,
+    items: &(impl crate::ui_items::ItemObjects + ?Sized),
+    records: &Items,
+    left: impl Fn(u64) -> u32,
+) -> benilla_ui::script::AlertInputs {
+    let worn = ALERT_REGIONS.map(|slot| {
+        let guid = me.player_inv_slot(slot).filter(|&g| g != 0)?;
+        let item = items.object(guid).filter(|f| f.is_item())?;
+        let record_flags = item
+            .object_entry()
+            .and_then(|entry| records.template(entry, 0, Ask::Read))
+            .map_or(0, |t| t.flags);
+        Some(benilla_ui::script::AlertItem {
+            flags: item.item_flags().unwrap_or(0),
+            durability: item.item_durability().unwrap_or(0),
+            max_durability: item.item_max_durability().unwrap_or(0),
+            record_flags,
+            temp_enchant: item.item_enchant(TEMP_ENCHANTMENT_SLOT).unwrap_or(0) as u32,
+            temp_enchant_left_ms: left(guid),
+        })
+    });
+    let ammo = me.player_ammo_id().filter(|&id| id != 0).map(|id| {
+        crate::ui_items::count_of(me, items, id, crate::ui_items::InventoryScope::DEFAULT)
+    });
+    benilla_ui::script::AlertInputs { worn, ammo }
+}
+
 /// The 24-wide inventory snapshot by `GetInventorySlotInfo` id: 0 ammo, 1..=19 the equipment,
 /// 20..=23 the equipped bags themselves (inv slots 19..22).
 fn inventory_slots(
@@ -713,7 +709,8 @@ fn inventory_slots(
             name: live.name(),
             link: live.link(),
             roll: Default::default(),
-            // No click or drag path reaches the ammo slot: nothing locks it, it fits nowhere.
+            // The ammo leg names the ammo by entry, never by an item object (`0x4c7509`): no guid
+            // to lock, and no equip slots, as `CursorCanGoInSlot(0)` answers held ammo alone.
             guid: 0,
             equip_slots: Vec::new(),
             bar_placeable: false,
@@ -833,9 +830,9 @@ pub(crate) fn feed_char(
         let (memo, vm_reset) = feed.vm.get_reset(script);
 
         let Some(store) = inv.self_store.iter().next() else {
-            // No self store is no data, not an empty inventory: it happens in the logout frames,
-            // where `PLAYER_LOGOUT` handlers still read equipment, so nothing is cleared (the next
-            // session starts a fresh VM).
+            // No self store is no data, not an empty inventory, so the copy stays: the getters
+            // that take a unit answer nothing while no active player is held (`0x4944c9`), and the
+            // next session starts a fresh VM.
             return;
         };
 
@@ -926,9 +923,10 @@ pub(crate) fn feed_char(
         // The doll's `UNIT_INVENTORY_CHANGED` is its producers' alone, the visible-item bridge, the
         // ammunition watch and the item paths ([`crate::field_watch`], [`crate::item_watch`]),
         // fired after this push; a view change raises none, a repair's durability included, which
-        // repaints through the push's `UPDATE_INVENTORY_ALERTS` (`0x5d9920` → `0x4c7ee0`). So is
-        // the bank bag buttons' `PLAYERBANKSLOTS_CHANGED` (`BankFrame.lua:206-208`): the
-        // inventory watcher's (`0x5ddd69`) and the item path's (`0x4c728d`).
+        // repaints through the durability watcher's alert recompute (`0x5d9920` → `0x4c7ee0`), on
+        // the item lane at its packet. So is the bank bag buttons' `PLAYERBANKSLOTS_CHANGED`
+        // (`BankFrame.lua:206-208`): the inventory watcher's (`0x5ddd69`) and the item path's
+        // (`0x4c728d`).
         if memo.last_inv.as_ref() != Some(&inv) || memo.last_bank_bags.as_ref() != Some(&bank_bags)
         {
             gate.audit("feed_char", "the inventory snapshot");
@@ -978,6 +976,7 @@ fn weapon_enchant(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::net::SelfPlayer;
     use benilla_ui::script::UiScript;
 
     /// A worn bag's view says how many of its seats are filled, which `ClickTradeButton` reads
