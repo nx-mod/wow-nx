@@ -26,10 +26,13 @@ use build::{build_item, InFlight, ItemBuild};
 use names::quality_color;
 use render::BuilderFlags;
 
-/// The cached template; a miss records the ask and waits for its answer (`0x52b716`).
+/// The cached template as the build reads it at the call, its spell lines expanded and its
+/// reputation line gendered against the player as it stands (`0x5075f0` at `0x52da24`,
+/// `0x52d80f`); a miss records the ask and waits for its answer (`0x52b716`).
 fn view_of(lua: &Lua, item_id: u32) -> Option<ItemTemplateView> {
+    let live = crate::script::item_stats::live_record(lua, item_id);
     let mut model = lua.app_data_mut::<Model>().expect("model app_data");
-    let v = model.item_templates.get(&item_id).cloned();
+    let v = live.unwrap_or_else(|| model.item_templates.get(&item_id).cloned());
     if v.is_none() && item_id != 0 {
         model.item_stat_asks.insert(item_id);
         build::note_miss(&mut model, build::CacheWait::Template(item_id));
@@ -178,11 +181,22 @@ pub(super) fn owned_instance(
             .find(held_copy)
             .map(|s| slot_instance(s, false))
     };
+    // The worn slots now, by live id (`0x6228a0`): the doll's keys, and a slot's view read once,
+    // only where its item is this one.
+    let keys = crate::script::worn::worn_keys(lua, model);
+    let views: [std::cell::OnceCell<Option<crate::script::InvSlotView>>;
+        crate::script::INVENTORY_SLOT_COUNT] = Default::default();
+    let worn_view = |i: usize| -> Option<&crate::script::InvSlotView> {
+        keys.get(i)
+            .copied()
+            .flatten()
+            .filter(|&(_, id)| id == item_id)?;
+        views[i]
+            .get_or_init(|| crate::script::worn::worn_slot(lua, model, i))
+            .as_ref()
+    };
     let worn = |i: usize| {
-        model
-            .inventory_slots
-            .get(i)
-            .and_then(Option::as_ref)
+        worn_view(i)
             .filter(worn_copy)
             .map(|s| worn_instance(s, true))
     };
@@ -199,7 +213,7 @@ pub(super) fn owned_instance(
     if !summed {
         return Some(found);
     }
-    let worn_charges = model.inventory_slots.iter().skip(1).take(23).flatten();
+    let worn_charges = (1..crate::script::INVENTORY_SLOT_COUNT).filter_map(worn_view);
     let held_charges = bags
         .iter()
         .filter(|(b, _, _)| (0..=4).contains(b) || *b == super::char_stats::KEYRING_CONTAINER)

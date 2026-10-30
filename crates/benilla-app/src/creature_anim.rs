@@ -502,14 +502,9 @@ impl AttackSeam<'_, '_> {
     }
 
     /// `0x48f200(1, 0, 0)`, the close with its release and `dl` clear (`0x493970`, `0x5e9a58`):
-    /// a disenchant window with rows left is swept, not closed; any other window closes as
-    /// `CloseLoot` does. Nothing with no window open (`0x48f23f`).
+    /// [`crate::ui_loot::end_loot_window`].
     pub(crate) fn close_loot(&mut self) {
-        if self.loot.disenchant_holds() {
-            self.loot.owe_sweep();
-            return;
-        }
-        crate::ui_loot::close_interaction(&mut self.loot, &mut self.loot_latch, Some(&self.net));
+        crate::ui_loot::end_loot_window(&mut self.loot, &mut self.loot_latch, &self.net);
     }
 
     /// The selection release's pet leg (`0x493910`): `0x5ee5a0` asked of the player
@@ -544,6 +539,15 @@ impl AttackSeam<'_, '_> {
             &mut self.stop_word,
             &mut self.slots.core(&self.net),
         );
+    }
+
+    /// StopAttack in a selection's release (`0x493a08`): whether its next-swing cancel reported a
+    /// stop (`0x5ecb63` → `0x6e6f30` → `0x6e4940`), whose listeners run there, ahead of the rest
+    /// of the release.
+    pub(crate) fn release_stop(&mut self) -> bool {
+        let queued = self.slots.reports_queued();
+        self.stop();
+        self.slots.reports_queued() > queued
     }
 
     /// `unit`'s stop in flight cleared, as its death zeroes it (`0x6058a8`).
@@ -836,8 +840,8 @@ pub(crate) use gesture::{select_gesture, Gesture, GestureQueue};
 
 /// The Bevy systems that execute the state machine `select` picks.
 mod driver;
-pub(crate) use driver::oneshot_is_live;
 use driver::{drive_animations, drive_hand_grip};
+pub(crate) use driver::{oneshot_is_live, toggle_model_refuses};
 
 /// The model event-keyframe scanner.
 mod events;
@@ -857,6 +861,8 @@ pub(crate) use impact::{DefenseAnim, PendingImpacts, SwingImpact, SwingSlowdown}
 
 /// The cast and auto-repeat state the seams queue for after the pass.
 mod edits;
+#[cfg(test)]
+pub(crate) use edits::applied_resources;
 pub(crate) use edits::{apply_unit_edits, flush_unit_edits, UnitEdit, UnitEdits};
 
 /// The unit's precast spell and its busy bit.

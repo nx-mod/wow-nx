@@ -92,6 +92,19 @@ impl LootSteps<'_, '_> {
         self.dead.after_close(closed);
     }
 
+    /// A movement start's close inside its call, `0x48f200(1, 1, 0)` at `0x60e9dd`: what `dl`
+    /// keeps stays ([`super::move_start_keeps`]), anything else closes as `CloseLoot` closes it,
+    /// its release now and `LOOT_CLOSED` in the call's tail, before the script's next line.
+    pub(crate) fn close_for_move(&mut self, script: &mut UiScript) -> Option<CallTail> {
+        let source = self.loot.source()?;
+        if super::move_start_keeps(&self.loot, source) {
+            return None;
+        }
+        let depth = self.loot.then.len();
+        self.end_window(script, false);
+        self.resume_tail(depth)
+    }
+
     /// `GetMasterLootCandidate`'s lookup inside its call
     /// ([`benilla_ui::script::RecordAsk::MasterLootName`]): the name cache asks a miss, and the
     /// callback `0x4c2fb0` waits on the name, once per call (`0x4c2f61`). The getter makes it only on
@@ -422,7 +435,7 @@ impl LootSteps<'_, '_> {
     fn sweep_end(&mut self, script: &mut UiScript, flag: bool) {
         self.byte.0 = false;
         self.loot.coin_line_shown = true; // `0x4c221e`
-        if self.loot.has_contents(&self.objects) {
+        if self.loot.sweep_has_contents(&self.objects) {
             if !flag {
                 script.fire_event("LOOT_OPENED", vec![]);
             }

@@ -37,9 +37,12 @@ pub(crate) use drain::{clear_wrap_on_right_press, dispatch_fork};
 pub(crate) use equip_error::{equip_error_key, inventory_result_key, EquipError, EquipErrors};
 // `UseContainerItem`, `UseInventoryItem` and the item verbs' calls, applied in call order by
 // `crate::script_calls`.
+#[cfg(test)]
+pub(crate) use bags::eval_with_bags;
 pub(crate) use bags::{BagLive, BagReads};
 pub(crate) use calls::ItemSteps;
 pub(crate) use drain::ScriptItemUse;
+pub(crate) use feed::ItemViewLive;
 use feed::{feed_item_stats, feed_random_properties};
 pub(crate) use requirements::RequirementsLive;
 pub(crate) use sets::ItemSetLive;
@@ -237,11 +240,18 @@ fn item_is_whole(fields: &ObjectFields) -> bool {
 pub(crate) trait ItemObjects {
     /// The object held under `guid`, `None` for none.
     fn object(&self, guid: u64) -> Option<&ObjectFields>;
+
+    /// The item's countdown cells under `guid` (`+0x320`, `+0x324`), `None` for no item.
+    fn countdowns(&self, guid: u64) -> Option<&crate::items::Countdowns>;
 }
 
 impl ItemObjects for Objects<'_, '_> {
     fn object(&self, guid: u64) -> Option<&ObjectFields> {
         Objects::object(self, guid)
+    }
+
+    fn countdowns(&self, guid: u64) -> Option<&crate::items::Countdowns> {
+        Objects::countdowns(self, guid)
     }
 }
 
@@ -1019,7 +1029,6 @@ impl Plugin for UiItemsPlugin {
         equip_error::add_equip_error_lane(app);
         // The icons come from the equipment renderer's `ItemDisplays`.
         app.init_resource::<crate::ui_items::locks::HeldItemLocks>()
-            .init_resource::<crate::ui_items::locks::LockWatch>()
             // The soulbind confirmations' pending records: the client's pending-equip array and
             // its one bind-on-use cell.
             .init_resource::<crate::ui_bind_confirm::PendingEquips>()
@@ -1032,16 +1041,9 @@ impl Plugin for UiItemsPlugin {
             .add_systems(
                 Update,
                 (
-                    // The dead objects' locks, ahead of the doll's feed.
-                    crate::ui_items::locks::forget_gone_item_locks
-                        .in_set(crate::ui_script::UiFeed)
-                        .before(crate::ui_char::feed_char),
                     // The item-tooltip store answers in the feed, so the next frame's input
                     // records, a re-hover among them, see the answer, and seats a new VM before its world entry.
                     feed_item_stats.in_set(UnitFeed),
-                    // The equip callbacks a lookup ran on a record the VM's copy lacked, after
-                    // the record feed has pushed it; an answer runs its own at its packet.
-                    crate::ui_bind_confirm::replay_equip_records.in_set(crate::ui_script::UiDrain),
                     // The roll table, pushed whole once per VM, before the first hover.
                     feed_random_properties.in_set(UnitFeed),
                     // The suffix template, copied once the frame's Lua has run.

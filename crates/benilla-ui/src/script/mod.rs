@@ -68,7 +68,7 @@ mod addon_enable;
 pub mod addon_gate;
 mod char_name;
 mod client;
-pub use client::FrameTimeRing;
+pub use client::{BindLocationQuery, FrameTimeRing};
 mod clock;
 mod cooldown_read;
 mod cvar_checks;
@@ -160,7 +160,8 @@ mod minimap;
 mod movieframe;
 pub mod nameplate;
 pub use nameplate::{
-    PlateBitWrite, PlateBitWrites, PlateGeometry, PlateState, PLATE_BIT_ENEMY, PLATE_BIT_FRIEND,
+    PlateAction, PlateBitWrite, PlateBitWrites, PlateClick, PlateGeometry, PlateState,
+    PLATE_BIT_ENEMY, PLATE_BIT_FRIEND,
 };
 mod model;
 mod modelframe;
@@ -217,7 +218,10 @@ mod ui_errors;
 mod ui_scale;
 mod update_walk;
 pub use tooltip_studied::{PetAbility, StudiedCreature};
-pub use tooltip_unit::{OwnerTitle, OwnerTitleKind, PartyRecord, TooltipTint, UnitTooltipFacts};
+pub use tooltip_unit::{
+    CorpsePlateQuery, ObjectPlate, ObjectPlateQuery, OwnerTitle, OwnerTitleKind, PartyRecord,
+    TooltipTint, UnitTooltipFacts,
+};
 mod trade;
 mod tradeskill;
 mod trainer;
@@ -229,6 +233,7 @@ mod weapon_enchant;
 mod who_sort;
 mod worldmap;
 mod worldstate;
+mod worn;
 mod worn_display;
 pub(crate) mod xml_layout;
 mod zone_text;
@@ -345,8 +350,8 @@ pub use guild_read::{GuildAnswer, GuildRead, OwnGuild, UnitGuildRead};
 pub use held::{BagGuidQuery, BagHead, BagItemsQuery, BagQuery, BagSlotQuery, HasKeyQuery};
 pub use host::{CallHost, CallTail, Deferring, LiveReader};
 pub use input_verbs::{
-    BindingInput, ClickCall, ClickMode, ClickPress, FiredInput, HeldInput, LookCall, PostureCall,
-    ViewAxis,
+    BindingInput, ClickCall, ClickMode, ClickPress, FiredInput, HeldInput, LookCall,
+    MouselookingQuery, PostureCall, ViewAxis,
 };
 pub use item_calls::ItemCall;
 pub use item_read::{ItemInfoFields, ItemKey, ItemRead, ItemRoll};
@@ -373,14 +378,15 @@ pub use tabard::{
 };
 pub use video_pairs::VIDEO_PAIR_CVARS;
 pub use worldmap_arrow::ARROW_MODEL;
+pub use worn::{WornKeys, WornKeysQuery, WornSlotQuery};
 
 pub(crate) use button::{refresh_label_lua, state_font_lua, LabelFont};
 pub(crate) use font_block::{face_loads, font_size_loads, own_font_lua, SAME_FONT_HEIGHT};
 pub use inspect::{InspectCall, UnitReach, UnitReachQuery, VisibleSlotQuery};
 pub use instance::InstanceCall;
 pub use item_stats::{
-    item_usable, ItemRecipe, ItemSetQuery, ItemSetView, ItemSpellLine, ItemTemplateView,
-    LiveItemSet, PlayerReqState, TaughtSpell,
+    item_usable, reputation_line, ItemRecipe, ItemSetQuery, ItemSetView, ItemSpellLine,
+    ItemTemplateView, ItemViewQuery, LiveItemSet, LiveItemView, PlayerReqState, TaughtSpell,
 };
 pub use item_text::{ItemTextCall, ItemTextCreator, ItemTextQuery, ItemTextState, ItemTextView};
 pub use layout_cache::{AnchorLayout, FrameLayout, LayoutPoint};
@@ -418,6 +424,7 @@ pub use model::{
     FontProbe, MacroIconSource, TextureProbe, TextureSizeFn, TextureSizeProbe, WorldLocFn,
     WorldLocProjector,
 };
+pub use mouseover::FreelookQuery;
 pub use party::{
     PartyMemberInfo, PartyRequest, PartyState, RaidMemberInfo, ReadyCheckState, SavedInstanceInfo,
 };
@@ -425,6 +432,7 @@ pub use pet::{
     PetActionView, PetBarFlags, PetBarFlagsView, PetBookNow, PetCall, PetMenuNow, PetSlot,
     PetSlots, PetStats, PetStatsNow, PET_DISMISS_WORD,
 };
+pub use pointer::PointerTarget;
 pub use pvp::{
     decorated_name, pvp_name_global_keys, HonorNow, HonorState, InspectHonorData, InspectHonorNow,
     InspectHonorSlot, PvpCall, RankTitle,
@@ -513,12 +521,13 @@ pub use unit::{
     UnitRelations, UnitState, UnitStateAnswer, UnitStateQuery, UnitTokenGlobals, UnitTokenObjects,
     UnitTokenParse,
 };
-pub use use_gates::ControlBypassQuery;
-pub use weapon_enchant::WeaponEnchant;
+pub use use_gates::{ControlBypassQuery, FarSightOnQuery};
+pub use weapon_enchant::{WeaponEnchant, WeaponEnchantQuery};
 pub use who_sort::{WhoSortChain, WhoSortKey};
 pub use worldmap::{
-    WorldMapContinentView, WorldMapLandmarkSource, WorldMapLandmarkView, WorldMapLevel,
-    WorldMapOverlayView, WorldMapSheetRow, WorldMapState, WorldMapZoneView,
+    UnitMapPosition, UnitMapPositionQuery, WorldMapContinentView, WorldMapLandmarkSource,
+    WorldMapLandmarkView, WorldMapLevel, WorldMapOverlayView, WorldMapSheetRow, WorldMapState,
+    WorldMapZoneView,
 };
 pub use worldstate::WorldStateUiView;
 pub use worn_display::{WornDisplay, WornDisplaySet};

@@ -102,8 +102,7 @@ impl Countdowns {
         remaining_ms(self.enchant(slot))
     }
 
-    /// [`Self::enchant_remaining_ms`] floored to the second, for the snapshot feeds: a per-ms read
-    /// would push a new snapshot every frame while a timer runs.
+    /// [`Self::enchant_remaining_ms`] floored to the second, the whole seconds a slot's view shows.
     pub(crate) fn enchant_remaining_display_ms(&self, slot: u32) -> Option<u64> {
         self.enchant_remaining_ms(slot).map(|ms| ms - ms % 1000)
     }
@@ -124,23 +123,6 @@ impl Countdowns {
     pub(crate) fn lifetime_remaining_display_ms(&self) -> Option<u64> {
         self.lifetime_remaining_ms().map(|ms| ms - ms % 1000)
     }
-
-    /// This item's share of [`ItemChanges::countdown_steps`]: `floor(seconds left) + 1` per live
-    /// cell, 0 when unset or elapsed, so the final `Some(0)` to `None` collapse is its own step.
-    fn steps(&self, now: Instant) -> u64 {
-        std::iter::once(self.lifetime)
-            .chain(self.enchants)
-            .flatten()
-            .map(|at| {
-                let left = at.saturating_duration_since(now);
-                if left.is_zero() {
-                    0
-                } else {
-                    left.as_secs() + 1
-                }
-            })
-            .sum()
-    }
 }
 
 /// An item entity whose fields or countdown cells were written since the reader last ran.
@@ -149,12 +131,12 @@ type ItemMoved = (
     Or<(Changed<ObjectStore>, Changed<Countdowns>)>,
 );
 
-/// Whether any item object was created, written or destroyed this frame; the inventory feeds' gate.
+/// Whether any item object was created, written or destroyed this frame; the worn-model
+/// resolve's gate.
 #[derive(SystemParam)]
 pub(crate) struct ItemChanges<'w, 's> {
     changed: Query<'w, 's, (), ItemMoved>,
     removed: RemovedComponents<'w, 's, ItemObject>,
-    countdowns: Query<'w, 's, &'static Countdowns>,
 }
 
 impl ItemChanges<'_, '_> {
@@ -163,23 +145,6 @@ impl ItemChanges<'_, '_> {
         let removed = self.removed.read().count() > 0;
         !self.changed.is_empty() || removed
     }
-
-    /// The sum of every item's [`Countdowns`] steps: it moves exactly when a second-floored read
-    /// can, and each term only falls between landings, so no change masks another.
-    pub(crate) fn countdown_steps(&self) -> u64 {
-        let now = Instant::now();
-        self.countdowns.iter().map(|c| c.steps(now)).sum()
-    }
-}
-
-/// The player's inventory as one read: the self descriptor, the object lookup and the item watch.
-#[derive(SystemParam)]
-pub(crate) struct Inventory<'w, 's> {
-    pub(crate) self_store: Query<'w, 's, &'static ObjectStore, With<crate::net::SelfPlayer>>,
-    pub(crate) self_changed:
-        Query<'w, 's, (), (With<crate::net::SelfPlayer>, Changed<ObjectStore>)>,
-    pub(crate) objects: Objects<'w, 's>,
-    pub(crate) changes: ItemChanges<'w, 's>,
 }
 
 /// The Copy slice of an [`ItemInfo`] that equipment rendering and combat animation read.
@@ -498,10 +463,6 @@ pub(crate) struct Items {
     /// dedupe for the dedupe flag 0, `dbcache/callbacks#callback-order`). A getter registers one
     /// from a lookup, so the list is locked like the in-flight asks and registering takes `&self`.
     callbacks: std::sync::Mutex<Vec<(u32, RecordCallback)>>,
-    /// The equip callbacks a lookup ran on a record the cache held and the VM's copy lacked,
-    /// `(entry, callback, found)` in the order they ran
-    /// ([`crate::ui_bind_confirm::replay_equip_records`]).
-    vm_callbacks: std::sync::Mutex<Vec<(u32, RecordCallback, bool)>>,
     /// The refusals' walks: the one running now, and each of this drain's, whose signals the
     /// drain fires under its marks ([`Self::walk_takes`]).
     walks: std::sync::Mutex<RefusalWalks>,
@@ -613,6 +574,9 @@ pub(crate) enum RecordCallback {
     /// The action bar's, asked by an item slot's icon, count and spell lookups (`0x4e6b10`,
     /// `0x4e6d69`, `0x4e5b30` with `0x4e5b80`), deduped.
     ActionSlots,
+    /// A game object plate's key line whose item was not cached (`0x52aca6` with
+    /// `CGTooltip::OnLockKeyItem` `0x52ad10`), deduped (`0x52ac8b`).
+    LockKey,
     /// A refused cast's reagent or tool line whose item was not cached (`0x6e1ea4` with
     /// `ShowItemCastFailure 0x6e29b0` and the reason), one per refusal; the spell picks the
     /// line's message as its first pass would.
@@ -778,17 +742,12 @@ impl Items {
         self.callbacks.lock_recover().retain(|&(_, cb)| cb != kind);
     }
 
-    /// Run `callback` for the record of `entry`, answered (`found`) or refused, with the VM, as
-    /// the frame's drain comes.
-    pub(crate) fn run_with_vm(&self, entry: u32, callback: RecordCallback, found: bool) {
-        self.vm_callbacks
+    /// `DBCache::CancelCallback` (`0x55c0c0`): `callback`'s registrations off the pending record
+    /// of `entry` alone.
+    pub(crate) fn cancel_wait(&self, entry: u32, callback: RecordCallback) {
+        self.callbacks
             .lock_recover()
-            .push((entry, callback, found));
-    }
-
-    /// The callbacks [`Self::run_with_vm`] queued, in order, spent.
-    pub(crate) fn take_vm_callbacks(&self) -> Vec<(u32, RecordCallback, bool)> {
-        std::mem::take(&mut *self.vm_callbacks.lock_recover())
+            .retain(|&waiting| waiting != (entry, callback));
     }
 
     /// An entry change asked for the record of `entry` with the callback `0x5d96b0`.
@@ -952,16 +911,12 @@ impl Items {
         self.templates.iter().map(|(&id, _)| id).collect()
     }
 
-    /// Disconnect: drop the callbacks waiting on asks or on the VM, and the queued enchant times,
+    /// Disconnect: drop the callbacks waiting on asks and the queued enchant times,
     /// keep the templates; [`crate::wdb`] clears their in-flight asks. The item objects and their
     /// countdowns go with the index's sweep.
     pub(crate) fn clear_session(&mut self) {
         self.pending_enchant_times.clear();
         self.callbacks
-            .get_mut()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
-        self.vm_callbacks
             .get_mut()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
@@ -1196,19 +1151,11 @@ mod tests {
         assert_ne!(items.template_epoch(), t0, "a landing is");
     }
 
-    /// The step count is bounded, not exact: the test cannot pin the sub-second phase.
+    /// The display reads floor to the second, and a cleared cell reads none.
     #[test]
-    fn countdown_steps_move_by_displayable_seconds() {
-        let now = Instant::now();
+    fn the_display_reads_floor_to_the_second() {
         let mut c = Countdowns::default();
-        assert_eq!(c.steps(now), 0, "no deadlines, no steps");
-
         assert!(c.set_enchant(1, 90));
-        let steps = c.steps(Instant::now());
-        assert!(
-            (90..=91).contains(&steps),
-            "a 90 s deadline contributes floor(secs)+1, got {steps}"
-        );
         let shown = c.enchant_remaining_display_ms(1).unwrap();
         assert_eq!(shown % 1000, 0, "the display read is second-floored");
         assert!(shown <= 90_000);
@@ -1217,15 +1164,9 @@ mod tests {
         let shown = c.lifetime_remaining_display_ms().expect("parked");
         assert_eq!(shown % 1000, 0);
         assert!(shown <= 1_800_000);
-        let steps = c.steps(Instant::now());
-        assert!(
-            (1890..=1892).contains(&steps),
-            "both cells step, got {steps}"
-        );
 
         assert!(c.set_enchant(1, 0));
         c.set_lifetime(0);
-        assert_eq!(c.steps(Instant::now()), 0, "cleared cells, terms gone");
         assert_eq!(c.enchant_remaining_display_ms(1), None);
         assert_eq!(c.lifetime_remaining_ms(), None);
     }
@@ -1419,7 +1360,7 @@ mod tests {
             .merge(ObjectFields::from_pairs(&[(14, 4)]));
         assert_eq!(world.run_system(read).unwrap(), (Some(117), Some(4), true));
         assert!(!world.run_system(read).unwrap().2);
-        // A countdown landing is the item's own change, and its cell joins the step sum.
+        // A countdown landing is the item's own change.
         world
             .get_mut::<Countdowns>(e)
             .expect("every item carries its cells")
@@ -1428,10 +1369,6 @@ mod tests {
             world.run_system(read).unwrap().2,
             "a landing moves the watch"
         );
-        let steps = world
-            .run_system_once(|c: ItemChanges| c.countdown_steps())
-            .unwrap();
-        assert!((90..=91).contains(&steps), "got {steps}");
         // The destroy: the index drops the guid, the entity goes, the watch moves once more.
         world.resource_mut::<GuidIndex>().0.remove(&GUID);
         world.despawn(e);

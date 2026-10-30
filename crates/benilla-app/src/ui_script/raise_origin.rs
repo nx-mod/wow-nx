@@ -14,9 +14,11 @@ use bevy::prelude::*;
 pub(crate) const RAISES_AT_THEIR_OWN_PLACE: &[Allow] = &[
     // Their reference places, outside every packet and call.
     Allow {
-        frame: "net::handlers::dispatch",
+        frame: "net::handlers::call",
         why: "a packet's handler that signals in place, inside its packet, as the reference's \
-              handlers run whole (`0x537ae5`) and signal inside themselves (`0x703e50`)",
+              handlers run whole (`0x537ae5`) and signal inside themselves (`0x703e50`): one \
+              handler's run, `NetHandlers::run`'s, not the dispatch's flushes, packet ends and \
+              span starts around it",
     },
     Allow {
         frame: "minimap::feed_minimap_inside",
@@ -62,13 +64,14 @@ pub(crate) const RAISES_AT_THEIR_OWN_PLACE: &[Allow] = &[
         why: "AT_THEIR_OWN_PLACE: the login and character screens' answers",
     },
     Allow {
-        frame: "bindings::sync_dispatch",
-        why: "NOT_YET_ON_A_LANE: `::account_data::AccountData`, whose binding sets' read owes the \
-              `UPDATE_BINDINGS` the copy into the live table signals (`0x4b649d`)",
-    },
-    Allow {
         frame: "capture::fixtures::seed_ui_fixture",
         why: "QUEUED_FOR_THE_TICK: a capture's fixture",
+    },
+    Allow {
+        frame: "capture::fixtures::open_character_fixture",
+        why: "a capture's fixture, dev tooling outside any session: the character window's open \
+              stands in for a login's items' creates, whose set-up signals \
+              `UNIT_INVENTORY_CHANGED` in place (`0x5d8606`)",
     },
     Allow {
         frame: "ui_world_map::feed_world_map",

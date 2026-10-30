@@ -440,11 +440,6 @@ impl super::UiScript {
         self.model_ref().pushed_unit(token).cloned()
     }
 
-    /// The unit-token resolver's inputs as last pushed ([`Self::set_unit_guids`]).
-    pub fn unit_guids_view(&self) -> UnitGuids {
-        self.model_ref().unit_guids.clone()
-    }
-
     /// Push the player's copper (`PLAYER_FIELD_COINAGE`), read by `GetMoney`.
     pub fn set_money(&mut self, copper: u64) {
         self.model_mut().money = copper;
@@ -606,6 +601,24 @@ pub(crate) fn view_held<'m>(
     token: &str,
 ) -> Option<Cow<'m, UnitState>> {
     view_as(lua, model, token, true)
+}
+
+/// The unit `guid` names as a builder that finds it by guid reads it (`0x529fe0` looks the object
+/// up at `0x52a021`, then the group's records at `0x52a02b`, `0x52a036`): through the lent host as
+/// a token naming it does, else, with no host, what the getters read for the guid.
+pub(crate) fn view_of_guid<'m>(lua: &Lua, model: &'m Model, guid: u64) -> Cow<'m, UnitState> {
+    let query = UnitStateQuery {
+        guid,
+        player: false,
+    };
+    if let Some(UnitStateAnswer::Held(state) | UnitStateAnswer::Unheld(state)) =
+        super::live::ask(lua, &query)
+    {
+        return Cow::Owned(state);
+    }
+    let held =
+        super::host::read_host(lua, |h| h.read_unit_object(guid, &mut |_| {})) != Some(false);
+    model.unit_of_guid(guid, held)
 }
 
 fn view_as<'m>(lua: &Lua, model: &'m Model, token: &str, thin: bool) -> Option<Cow<'m, UnitState>> {

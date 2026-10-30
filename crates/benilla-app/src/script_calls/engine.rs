@@ -13,8 +13,9 @@ impl ScriptCallHost<'_, '_> {
     /// `FollowUnit(unit)` (`0x489e00`) or `FollowByName(name, exact)` (`0x489ec0`), then
     /// `StartAutoMoveToObject(guid, 3)` (`0x60fed0`): the gate's line shown in place
     /// (`0x496720`), or the arm, whose stop of the auto-move it replaces signals `AUTOFOLLOW_END`
-    /// for a follow (`0x61113e` → `0x60fb84`), then `AUTOFOLLOW_BEGIN` with the followee's name
-    /// (`0x610071`), each running its listeners where it fires.
+    /// for a follow (`0x61113e` → `0x60fb84`) before that move stops and the new one is stored
+    /// (`0x611130`), then `AUTOFOLLOW_BEGIN` with the followee's name (`0x610071`), each running
+    /// its listeners where it fires.
     pub(super) fn follow(
         &mut self,
         script: &mut UiScript,
@@ -27,15 +28,20 @@ impl ScriptCallHost<'_, '_> {
                 crate::player::FollowRequest::Name { name, exact }
             }
         };
-        let (name, replaced) = match self.appliers.follow().start(&request) {
+        let (guid, name, replaced) = match self.appliers.follow().start(&request) {
             FollowStart::Refused(key) => return self.appliers.chat().display_error(script, key),
             FollowStart::Silent => return,
-            FollowStart::Started { name, replaced } => (name, replaced),
+            FollowStart::Started {
+                guid,
+                name,
+                replaced,
+            } => (guid, name, replaced),
         };
         if replaced {
             script.fire_event("AUTOFOLLOW_END", vec![]);
             self.at_point(script, mark);
         }
+        self.appliers.follow().arm(guid, name.clone());
         script.fire_event("AUTOFOLLOW_BEGIN", vec![ScriptValue::Str(name)]);
         self.at_point(script, mark);
     }
@@ -52,7 +58,6 @@ pub(crate) struct RecordAsks<'w, 's> {
     guild: Option<Res<'w, crate::ui_guild::GuildState>>,
     summon: Option<Res<'w, crate::ui_summon::SummonState>>,
     battlefield: Option<ResMut<'w, crate::ui_battlefield_positions::BattlefieldPositions>>,
-    ammo_hits: Option<ResMut<'w, crate::ui_char::AmmoRecordHits>>,
     quest: Option<ResMut<'w, crate::ui_quest::QuestGiver>>,
     /// The quest cache the rebuild's lookups ask, and the leaderboard's creature waits.
     quest_log: Option<ResMut<'w, crate::ui_quest_log::QuestLog>>,
@@ -74,7 +79,15 @@ impl RecordAsks<'_, '_> {
     pub(crate) fn apply(&mut self, ask: RecordAsk) {
         use crate::query_cache::Ask;
         match ask {
-            RecordAsk::PlayerName(guid) | RecordAsk::ItemBuildName(guid) => {
+            // `UnitName`'s miss keeps its callback (`0x5171f5`, `0x517290`), once (`0x5171f1`).
+            RecordAsk::PlayerName(guid) => {
+                if let Some(names) = self.names.as_deref() {
+                    if names.resolve_player(guid, Ask::Event(&self.net)).is_none() {
+                        names.wait_for_player(guid, crate::names::NameCallback::UnitName);
+                    }
+                }
+            }
+            RecordAsk::ItemBuildName(guid) => {
                 if let Some(names) = self.names.as_deref() {
                     let _ = names.resolve_player(guid, Ask::Event(&self.net));
                 }
@@ -136,10 +149,8 @@ impl RecordAsks<'_, '_> {
                 }
             }
             RecordAsk::AmmoItem { entry, owner } => {
-                if let (Some(items), Some(hits)) =
-                    (self.items.as_deref(), self.ammo_hits.as_deref_mut())
-                {
-                    crate::ui_char::ask_ammo_record(items, &self.net, hits, entry, owner);
+                if let Some(items) = self.items.as_deref() {
+                    crate::ui_char::ask_ammo_record(items, &self.net, entry, owner);
                 }
             }
             RecordAsk::CooldownItem { entry, owner } => {

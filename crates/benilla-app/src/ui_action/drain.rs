@@ -200,9 +200,9 @@ pub(crate) fn drain_arrival_casts(
     drain_click_casts(vm);
 }
 
-/// Sends the casts a dispatcher outside the world click queued (a nameplate's right-click, a
-/// crate's `Interact`) through the cast ladder, as an engine turn among the frame's input records.
-/// The world click's own are drained inside its call ([`ClickCastDrain::drain`]).
+/// Sends the casts a dispatcher outside any call queued (a crate's `Interact`) through the cast
+/// ladder, as an engine turn among the frame's input records. The world click's and a nameplate
+/// click's own are drained inside their calls ([`ClickCastDrain::drain`]).
 pub(crate) fn drain_click_casts(
     mut vm: crate::script_calls::VmWith<ClickCastDrain<'static, 'static>>,
 ) {
@@ -575,6 +575,12 @@ impl ActionBarSteps<'_> {
             // The host's own, with the action states ([`crate::script_calls`]).
             ActionBarCall::RefreshUsable | ActionBarCall::Notify { .. } => {}
         }
+    }
+
+    /// Whether our player's arrival has loaded this login's bar ([`ActionSlots::loaded`]); never
+    /// in a harness without the store.
+    pub(crate) fn loaded(&self) -> bool {
+        self.slots.as_deref().is_some_and(ActionSlots::loaded)
     }
 
     /// Our player's arrival's load of the staged words ([`ActionSlots::load_staged`]); nothing in

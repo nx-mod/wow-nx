@@ -164,6 +164,9 @@ fn arrival(world: &mut World, control_gained: bool) {
     leg(world, crate::ui_macro::derive_every);
     // `0x5dead1`: the slot pass with the manager's `+0xc8` clear, as at every create.
     leg(world, crate::ui_action::recount::arrival_slot_pass);
+    // Ours, no reference fact: a character's buttons moved off the older macro numbering, now the
+    // bar is loaded.
+    crate::ui_macro::renumber_parked_buttons(world);
     ghost_state(world);
     // `0x5deb49`: `+0xc8` clear, as at every create.
     if control_gained {
@@ -319,8 +322,8 @@ fn tutorial(world: &mut World, id: u32) {
 }
 
 /// `"player"` names us for the sequence's listeners: the stock windows bind their model panes to
-/// it at `PLAYER_ENTERING_WORLD` (`PaperDollFrame.lua:39`), ahead of the resolver feed's full push
-/// (`feed_unit_guids`).
+/// it at `PLAYER_ENTERING_WORLD` (`PaperDollFrame.lua:39`), with no host to ask too: a getter with
+/// one resolves it off the live player.
 fn seat_player(mut vm: crate::script_calls::VmWith<()>, me: Query<&Guid, With<SelfPlayer>>) {
     let Some(me) = me.iter().next().map(|g| g.0) else {
         return;
@@ -546,6 +549,14 @@ fn reads(world: &mut World) -> FilteredAccessSet {
     .flatten()
     {
         set.add_unfiltered_resource_read(id);
+    }
+    // The macro files the renumbering takes its moves from, holding the world; it writes the bar
+    // through the host.
+    if let Some(id) = world
+        .components()
+        .get_resource_id(std::any::TypeId::of::<crate::ui_macro::MacroFiles>())
+    {
+        set.add_unfiltered_resource_write(id);
     }
     set
 }

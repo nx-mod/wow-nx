@@ -132,6 +132,13 @@ pub enum ScriptCall {
     DoEmote(super::EmoteRequest),
     /// `UninviteByName(name)` (`0x48a610`): `CMSG_GROUP_UNINVITE` (`0x75`), sent at `0x48a669`.
     Uninvite(String),
+    /// `LoggingChat(flag)` and `LoggingCombat(flag)` (`0x49fe50`) called with an argument, the VM's
+    /// flag already set: with it on and no log open the host opens the log (`0x49fea2`) and a
+    /// failed open clears the flag (`0x49feab`); with it off the host closes the file.
+    Logging {
+        /// `LoggingCombat`, else `LoggingChat`.
+        combat: bool,
+    },
     /// `SendAddonMessage(prefix, message, type)` (`0x49f920`) past its checks: the send at
     /// `0x49faff`.
     AddonMessage(super::AddonSend),
@@ -299,11 +306,19 @@ pub enum ScriptCall {
     /// the press (`ArmClick 0x514810` → `0x481f00`), or the last primary's release and its
     /// dispatch (`ReleaseCommands 0x514b70` → `DispatchWorldClick 0x481f60`), inside the call.
     WorldClick(super::ClickCall),
+    /// A nameplate's click ([`super::PlateClick`]): `ClickObjectByAction` (`0x7cb92a` →
+    /// `0x4949f0`) on the plate's unit, its select, or its select and the unit's interact, inside
+    /// the click and ahead of the plate's `OnClick`.
+    PlateClick(super::PlateClick),
     /// A movement or camera binding function's call ([`super::BindingInput`]) on the engine's
     /// input state, inside the call: a command bit pressed or released through `SetCommands`
     /// (`0x515090`) with the cast cancel a new direction makes (`0x5150ce`-`0x515193`), a
     /// one-shot, or a camera axis.
     Input(super::BindingInput),
+    /// A look-session call ([`super::LookCall`]) on the camera's mouse state, inside the call:
+    /// `MouselookStart`/`Stop`'s TurnOrAction bit through `SetCommands` (`0x514231`, `0x51425b`),
+    /// `ToggleMouseMove` (`0x50f910`) or a mouse bit's release argument.
+    Look(super::LookCall),
     /// `DropItemOnUnit(unit)` (`0x48d960`) on the token: the trade leg, then the pet leg's feed
     /// on the unit it names, inside the call.
     DropItemOnUnit(String),
@@ -511,6 +526,7 @@ impl ScriptCall {
             | ScriptCall::TargetNearest { may_cast, .. }
             | ScriptCall::TargetLastTarget { may_cast }
             | ScriptCall::AttackTarget { may_cast, .. } => *may_cast,
+            ScriptCall::PlateClick(click) => click.may_cast,
             _ => true,
         }
     }

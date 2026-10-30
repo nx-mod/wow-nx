@@ -512,3 +512,91 @@ fn move_forward_start_mid_cast_cancels_inside_the_call() {
             .collect();
     assert_eq!(sent, [format!("cancel {HEAL}"), "chat".to_string()]);
 }
+
+/// The cancel's stop runs its listeners inside `SetCommands` (`0x51512a` → `0x6e4940`), before
+/// its tick (`0x5151a0`) writes the commands' state: no write of the tick follows the report's
+/// listeners ([`crate::script_calls::census::writes_after`]).
+#[test]
+fn a_movement_starts_cancel_report_runs_ahead_of_its_tick() {
+    let mut f = frame(false);
+    with_book_spell(
+        &mut f,
+        HEAL,
+        "Heal",
+        benilla_formats::SpellDisplay {
+            interrupt_flags: 0xf,
+            ..Default::default()
+        },
+    );
+    let world = f.app.world_mut();
+    world.init_resource::<crate::player::Player>();
+    world.resource_mut::<crate::player::Player>().active = true;
+    world
+        .resource_mut::<crate::bindings::BindingsState>()
+        .open_for_test();
+    run(&mut f, r#"CastSpellByName("Heal")"#);
+    let _ = reports(&mut f);
+    let _watch = benilla_ui::script::census::watch_writes();
+    benilla_ui::script::census::take_writes();
+    run_pressed(&mut f, "MoveForwardStart()");
+    assert_eq!(reports(&mut f), ["SPELLCAST_STOP"]);
+    assert_eq!(
+        crate::script_calls::census::writes_after(),
+        Vec::<String>::new()
+    );
+}
+
+/// `MouselookStart()` under a left drag mid-cast is `SetCommands(1, 1, …)` (`0x514231` →
+/// `0x515090`) inside the call: the press completes both mouse bits (`0x5150d6`-`0x5150ec`) and
+/// cancels the cast there (`0x51512a` → `0x6e4940`), so the next line reads the stop and its send
+/// follows the cancel. `MouselookStop()` releases the bit and cancels nothing. Main applied it at
+/// the frame's latch, after the chunk.
+#[test]
+fn mouselook_start_under_a_left_drag_cancels_inside_the_call() {
+    let mut f = frame(false);
+    with_book_spell(
+        &mut f,
+        HEAL,
+        "Heal",
+        benilla_formats::SpellDisplay {
+            interrupt_flags: 0xf,
+            ..Default::default()
+        },
+    );
+    let world = f.app.world_mut();
+    world.init_resource::<crate::player::Player>();
+    world.resource_mut::<crate::player::Player>().active = true;
+    world.init_resource::<crate::player::CameraControl>();
+    world
+        .resource_mut::<crate::bindings::BindingsState>()
+        .apply_unhosted(benilla_ui::script::BindingInput::Start(
+            benilla_ui::script::HeldInput::CameraOrSelectOrMove,
+        ));
+    run(&mut f, r#"CastSpellByName("Heal")"#);
+    assert_eq!(casts_and_cancels(&f), vec![("cast", HEAL)]);
+    let _ = reports(&mut f);
+
+    run(
+        &mut f,
+        &format!(r#"MouselookStart() {SNAPSHOT} SendChatMessage("hi", "SAY")"#),
+    );
+    assert_eq!(
+        seen(&mut f),
+        "SPELLCAST_STOP",
+        "the next line reads the stop"
+    );
+    assert!(f
+        .app
+        .world()
+        .resource::<crate::bindings::BindingsState>()
+        .pressed(crate::bindings::Input::TurnOrAction));
+    let sent: Vec<_> =
+        f.rx.try_iter()
+            .filter_map(|c| match c {
+                ClientCommand::CancelCast { spell_id } => Some(format!("cancel {spell_id}")),
+                ClientCommand::Chat { .. } => Some("chat".to_string()),
+                _ => None,
+            })
+            .collect();
+    assert_eq!(sent, [format!("cancel {HEAL}"), "chat".to_string()]);
+}

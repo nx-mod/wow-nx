@@ -28,6 +28,7 @@ use super::{
 };
 
 mod arrival;
+mod item_deactivate;
 mod update;
 
 pub(crate) use update::{release_unheld, Listed, ReleasePending, Released};
@@ -125,6 +126,11 @@ pub(crate) struct Scene<'w, 's> {
     house: Option<ResMut<'w, crate::ui_auction::HouseLane>>,
     // The loot window's rows and the pushes that wait on an item's record.
     loot: Option<ResMut<'w, crate::ui_loot::LootState>>,
+    /// What an item's deactivate lets go of besides the window above (`0x5d8660`): the loot
+    /// latch, the pending record's cast and the reader.
+    loot_latch: Option<ResMut<'w, crate::ui_loot::LootLatch>>,
+    item_cast: crate::spell::ItemCastLeg<'w>,
+    item_text: crate::ui_item_text::ItemTextLeg<'w>,
     // The group loot rolls and their lines that wait on an item's record.
     loot_rolls: crate::ui_loot_roll::RollRecordAnswers<'w>,
     // The vendor window's row and buy-back callbacks.
@@ -159,8 +165,9 @@ pub(crate) struct Scene<'w, 's> {
     place: crate::ui_party::net::SnapshotPlace<'w, 's>,
     /// The active mover, which its unit's release and destroy zero.
     mover: Option<ResMut<'w, super::MoverClaim>>,
-    /// The far-sight subject, whose view-out term the stun's tick reads.
-    view_subject: Option<Res<'w, crate::player::ViewSubject>>,
+    /// The far-sight machine the field's change starts or ends (`0x5de0d0`) and an arrival
+    /// starts, and whose latch the stun's tick reads (`0x514540`).
+    far_sight: Option<Res<'w, crate::player::FarSight>>,
     /// The active mover's auto-move, which its release and the watchers' stops end.
     follow: Option<ResMut<'w, crate::player::FollowState>>,
     approach: Option<ResMut<'w, crate::player::Approach>>,
@@ -377,7 +384,15 @@ fn run_record_callback(
                 &sc.bag_cache,
             );
             if run.notice.is_some() {
-                replay_enchant_times(&mut sc.items, &mut sc.countdowns, &sc.index, guid);
+                replay_enchant_times(
+                    &mut sc.items,
+                    &mut sc.countdowns,
+                    &sc.index,
+                    &mut sc.view_log,
+                    guid,
+                );
+                // Its entry sorts ahead of its own notice and behind the set-ups before it.
+                sc.view_log.close();
             }
             sc.item_lane.push(run);
         }
@@ -418,6 +433,12 @@ fn run_record_callback(
             ..Default::default()
         }),
         Cb::ActionSlots => {}
+        // The game object plate's rebuild, for a found record only (`0x52ad2f`).
+        Cb::LockKey if answered => sc.item_lane.push(crate::item_watch::Run {
+            notice: Some(crate::item_watch::ItemNotice::LockKeyRecord),
+            ..Default::default()
+        }),
+        Cb::LockKey => {}
         Cb::Swap
         | Cb::AutoEquip
         | Cb::ItemCooldown
@@ -519,6 +540,7 @@ fn on_item(In(ev): In<SessionEvent>, mut sc: Scene) {
             match sc.index.0.get(&item_guid).copied() {
                 Some(e) if sc.countdowns.contains(e) => {
                     if let Ok(mut c) = sc.countdowns.get_mut(e) {
+                        sc.view_log.countdowns(item_guid, Some(c.clone()));
                         c.set_lifetime(seconds);
                     }
                     debug!("item duration: item {item_guid:#x} → {seconds}s");
@@ -533,6 +555,7 @@ fn on_item(In(ev): In<SessionEvent>, mut sc: Scene) {
         } => match sc.index.0.get(&item_guid).copied() {
             Some(e) if sc.countdowns.contains(e) => {
                 if let Ok(mut c) = sc.countdowns.get_mut(e) {
+                    sc.view_log.countdowns(item_guid, Some(c.clone()));
                     if c.set_enchant(slot, seconds) {
                         debug!("enchant timer: item {item_guid:#x} slot {slot} → {seconds}s");
                     } else {
@@ -550,6 +573,7 @@ fn on_item(In(ev): In<SessionEvent>, mut sc: Scene) {
         },
         _ => {}
     }
+    sc.view_log.close();
 }
 
 /// `CGItem_C::ApplyRecord`'s replay (`0x5ebde0` at `0x5d85b7`): the enchant times queued on the
@@ -561,12 +585,16 @@ fn replay_enchant_times(
     items: &mut Items,
     countdowns: &mut Query<&mut crate::items::Countdowns>,
     index: &GuidIndex,
+    view_log: &mut crate::ui_unit::views::ViewLog,
     guid: u64,
 ) {
     let queued = items.take_enchant_times(guid);
     let Some(mut cells) = index.0.get(&guid).and_then(|&e| countdowns.get_mut(e).ok()) else {
         return;
     };
+    if !queued.is_empty() {
+        view_log.countdowns(guid, Some(cells.clone()));
+    }
     for (slot, seconds) in queued {
         if !cells.set_enchant(slot, seconds) {
             debug!("enchant timer: queued slot {slot} for {guid:#x} is past the seventh — refused");

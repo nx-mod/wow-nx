@@ -85,6 +85,10 @@ pub(crate) enum ItemNotice {
     /// recounts the entry (`0x4e5b8a` → `0x4e5c70`), for a found record only (`0x4e5b86`). It
     /// concerns no item of ours.
     ActionRecord { entry: u32 },
+    /// The key record a game object plate's lock line waited on landed: its callback `0x52ad10`
+    /// builds `GameTooltip`'s game object plate again while it keeps one (`0x52ad34`-`0x52ad52`),
+    /// for a found record only (`0x52ad2f`). It concerns no item of ours.
+    LockKeyRecord,
 }
 
 /// What a notice asks of the trade's own column (`0x4bfb10`, `0x4bfb60`).
@@ -107,6 +111,23 @@ pub(crate) enum Unlock {
     /// every item of ours with its entry the walk reaches ([`kin`]), bar the trade, mail and
     /// auction attachments, unlocks, then one `ITEM_LOCK_CHANGED` (`0x5d859a`, `0x5d94b9`).
     Entry(Vec<u64>),
+}
+
+/// The item objects a run frees, whose locks go with them silently, at its packet's place. The
+/// lock is the object's bit (`item+0x314` bit 0), which the constructor alone zeroes (`0x5d823e`)
+/// and a release leaves set, as the object lives on in the released table (`0x464920`) and a block
+/// that brings it back reuses it (`0x464530`): only a free takes it, and the next object under the
+/// guid starts unlocked.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Freed {
+    #[default]
+    Nothing,
+    /// The destroy's free of a live or released item (`0x467521`), or a new object's free of the
+    /// oldest released one of its type (`0x466e55`).
+    Items(Vec<u64>),
+    /// Every object, as the world's load and the session's end free them (`0x467700` →
+    /// `0x467800`).
+    All,
 }
 
 /// A bag event a run signals after its recount, at its handler's place in the run.
@@ -142,6 +163,11 @@ pub(crate) struct Run {
     /// visible item (`0x5dee7a`) among their steps, and alone the flags' force-red bit
     /// (`0x5d97aa`) and the durability (`0x5d9920`).
     pub(crate) alerts: bool,
+    /// The item objects freed at the run's place, after everything else it does.
+    pub(crate) freed: Freed,
+    /// The item whose deactivate lets the cursor go when it holds it, before everything else the
+    /// run does ([`Self::clearing_cursor`]).
+    pub(crate) cursor: Option<u64>,
 }
 
 impl Run {
@@ -152,6 +178,27 @@ impl Run {
             && self.unlocks.is_empty()
             && self.bags.is_empty()
             && !self.alerts
+            && self.freed == Freed::Nothing
+            && self.cursor.is_none()
+    }
+
+    /// A run that frees `freed` and does nothing else.
+    pub(crate) fn freeing(freed: Freed) -> Self {
+        Self {
+            freed,
+            ..Self::default()
+        }
+    }
+
+    /// `CGItem_C::Deactivate`'s cursor leg on `item` (`0x5d86c9`-`0x5d86e9`): an item the cursor
+    /// holds (`GetCursorItemGuid 0x494c60`) is let go as `ClearCursor(1, 1)` (`0x495190`), which
+    /// unlocks it (`0x4951d9`) and signals as it runs. The cursor is the interface's, so the run
+    /// compares it where it fires, at the deactivate's place.
+    pub(crate) fn clearing_cursor(item: u64) -> Self {
+        Self {
+            cursor: Some(item),
+            ..Self::default()
+        }
     }
 
     /// A handler's run that does nothing but the alert recompute.
@@ -360,9 +407,10 @@ impl ItemNotice {
             Self::Seat { old, new } => old.iter().chain(new.iter()).copied().collect(),
             Self::Bag { entries } => entries.clone(),
             Self::Visible { old, new } => vec![*old, *new],
-            Self::TradeRecord { .. } | Self::TooltipRecord { .. } | Self::ForeignVisible => {
-                Vec::new()
-            }
+            Self::TradeRecord { .. }
+            | Self::TooltipRecord { .. }
+            | Self::LockKeyRecord
+            | Self::ForeignVisible => Vec::new(),
         }
     }
 

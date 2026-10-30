@@ -190,11 +190,11 @@ impl Released {
     }
 
     /// A new object of type `type_id` frees the oldest released one of that type (`0x466e55`,
-    /// the head of the list).
-    fn free_oldest(&mut self, type_id: u8) {
-        if let Some(guid) = self.reuse.get_mut(&type_id).and_then(VecDeque::pop_front) {
-            self.objects.remove(&guid);
-        }
+    /// the head of the list); the guid it freed.
+    fn free_oldest(&mut self, type_id: u8) -> Option<u64> {
+        let guid = self.reuse.get_mut(&type_id).and_then(VecDeque::pop_front)?;
+        self.objects.remove(&guid);
+        Some(guid)
     }
 
     /// Frees every released object, as leaving the world does (`0x467700`).
@@ -376,7 +376,19 @@ fn on_object_create(In(ev): In<SessionEvent>, mut sc: Scene) {
 /// allocated apart and frees nothing (`0x466e0c`).
 fn allocate(sc: &mut Scene, guid: u64, ty: ObjectType) {
     if sc.self_guid.0 != Some(guid) {
-        sc.released.free_oldest(type_id(ty));
+        if let Some(freed) = sc.released.free_oldest(type_id(ty)) {
+            free_item(sc, freed);
+        }
+    }
+}
+
+/// An object freed here: an item's lock goes with it, at this place among the packet's runs
+/// ([`crate::item_watch::Freed`]).
+fn free_item(sc: &mut Scene, object: u64) {
+    if guid::is_item(object) {
+        sc.item_lane.push(crate::item_watch::Run::freeing(
+            crate::item_watch::Freed::Items(vec![object]),
+        ));
     }
 }
 
@@ -410,6 +422,7 @@ fn on_item_create(In(ev): In<SessionEvent>, mut sc: Scene) {
         ) => {
             let moved = write_fields(&mut store, fields);
             sc.view_log.replaced(guid, None);
+            sc.view_log.countdowns(guid, None);
             let e =
                 crate::items::spawn_item(&mut sc.commands, &mut sc.index, guid, store, container);
             if let Body::Item { countdowns, .. } = body {
@@ -421,6 +434,7 @@ fn on_item_create(In(ev): In<SessionEvent>, mut sc: Scene) {
         (None, None) => {
             allocate(&mut sc, guid, item_type(container));
             sc.view_log.replaced(guid, None);
+            sc.view_log.countdowns(guid, None);
             crate::items::spawn_item(&mut sc.commands, &mut sc.index, guid, fields, container);
             sc.pass.unshown.insert(guid);
             Vec::new()
@@ -458,7 +472,7 @@ fn write_logged(
 /// A held object leaving the live table: the store it takes, logged for any unit, as one a token
 /// names now or named earlier in the frame (the target's target before it changed) reads it in
 /// the frame's earlier listeners, and for any item, as a weapon the active player wore earlier in
-/// the frame reads to the stat getters there.
+/// the frame reads to the stat getters there, with the item's countdown cells.
 fn log_destroy(sc: &mut Scene, guid: u64) {
     let Some(&e) = sc.index.0.get(&guid) else {
         return;
@@ -466,6 +480,9 @@ fn log_destroy(sc: &mut Scene, guid: u64) {
     let before = sc.stores.get(e).ok().cloned();
     if before.is_some() {
         sc.view_log.replaced(guid, before);
+    }
+    if let Ok(cells) = sc.countdowns.get(e) {
+        sc.view_log.countdowns(guid, Some(cells.clone()));
     }
 }
 
@@ -612,6 +629,7 @@ fn respawn(sc: &mut Scene, guid: u64, body: Body, store: ObjectFields, pose: Opt
             let e =
                 crate::items::spawn_item(&mut sc.commands, &mut sc.index, guid, store, container);
             sc.commands.entity(e).insert(countdowns);
+            sc.view_log.countdowns(guid, None);
         }
         Body::World {
             kind,
@@ -769,15 +787,18 @@ fn on_object_destroyed(In(ev): In<SessionEvent>, mut sc: Scene, script: Option<N
         return;
     };
     crate::death::net::forget_corpse(guid, &mut sc.death_net);
-    // A released object ran its deactivate as it left.
+    // A released object ran its deactivate as it left, and is freed now.
     if sc.released.take(guid).is_some() {
+        free_item(&mut sc, guid);
         return;
     }
-    if let Some(&e) = sc.index.0.get(&guid) {
-        if held_by_play(&sc, e) {
-            sc.commands.entity(e).insert(ReleasePending);
-            return;
-        }
+    // A guid neither live nor released has nothing to release (`0x464931`, `0x46493a`).
+    let Some(&e) = sc.index.0.get(&guid) else {
+        return;
+    };
+    if held_by_play(&sc, e) {
+        sc.commands.entity(e).insert(ReleasePending);
+        return;
     }
     deactivate(&mut sc, guid, script.as_deref());
     log_destroy(&mut sc, guid);
@@ -789,18 +810,23 @@ fn on_object_destroyed(In(ev): In<SessionEvent>, mut sc: Scene, script: Option<N
     if let Some(mover) = sc.mover.as_deref_mut() {
         mover.forget(guid);
     }
-    // An item has no model to fade, so it goes now with its countdown cells.
+    // An item has no model to fade, so it goes now with its countdown cells, its lock behind its
+    // deactivate's run.
     if benilla_protocol::guid::is_item(guid) {
         sc.commands.entity(e).despawn();
+        free_item(&mut sc, guid);
         return;
     }
     sc.commands.entity(e).queue(super::tear_down);
 }
 
 /// The deactivate a release runs (vtable slot 1, `0x46496f`), reading the descriptor about to go:
-/// the item's (`0x5d8660`) and the party member's, which snapshots its record and sends
-/// `CMSG_REQUEST_PARTY_MEMBER_STATS`.
+/// the item's (`0x5d8660`), its head ([`super::item_deactivate::head`]) then its interface tail,
+/// and the party member's, which snapshots its record and sends `CMSG_REQUEST_PARTY_MEMBER_STATS`.
 fn deactivate(sc: &mut Scene, guid: u64, script: Option<&UiScript>) {
+    if benilla_protocol::guid::is_item(guid) {
+        super::item_deactivate::head(sc, guid);
+    }
     let gone = item_watch(&sc.index, &sc.stores, &sc.self_guid, &sc.items).destroyed_run(guid);
     sc.item_lane.push(gone.unwrap_or_default());
     let held = |g: u64| sc.index.0.get(&g).and_then(|e| sc.stores.get(*e).ok());
@@ -860,8 +886,9 @@ fn deactivate(sc: &mut Scene, guid: u64, script: Option<&UiScript>) {
 }
 
 /// Whether the mover's input tick takes its teardown leg (`0x5146c1`-`0x5146ce`): it may neither
-/// translate (`0x514560`) nor turn (`0x5145b0`), off its health, the far-sight latch, the root and
-/// the stun its new flags hold ([`crate::player::MoverInput`]).
+/// translate (`0x514560`) nor turn (`0x5145b0`), off its health, the far-sight latch as the packet
+/// leaves it (`[mover+0x1c70] & 1`, `0x514540`, past the active-player test `0x514537`), the root
+/// and the stun its new flags hold ([`crate::player::MoverInput`]).
 fn tick_tears_down(sc: &Scene, fields: &ObjectFields) -> bool {
     let driving_own_body = sc
         .mover_lock
@@ -871,9 +898,9 @@ fn tick_tears_down(sc: &Scene, fields: &ObjectFields) -> bool {
         dead: fields.unit_is_dead(),
         view_is_out: crate::player::view_is_out(
             driving_own_body,
-            sc.view_subject
+            sc.far_sight
                 .as_deref()
-                .is_some_and(|v| v.remote.is_some()),
+                .is_some_and(crate::player::FarSight::on),
         ),
     };
     let rooted = sc
@@ -896,6 +923,69 @@ pub(super) fn stop_auto_move(
 ) {
     if mover.is_some_and(|m| m.holds(guid)) {
         crate::player::end_auto_move(follow, approach, autorun, Some(lane));
+    }
+}
+
+/// `StartFarSight` (`0x5ee270`) on our player `me`, whose `PLAYER_FARSIGHT` names `object`, held:
+/// the update while far sight is off. A start (`0x5ee39c` on, past the unresolved return) stops
+/// the auto-move: a unit we control takes the active mover (`0x5ee45d` → `0x5ee477`), whose switch
+/// stops the outgoing one's (`0x600742`) and is a no-op when it already holds it (`0x6006fb`); the
+/// switch itself is possession's control update's. Any other object runs the mover's tick
+/// (`0x5ee4a2`), which the view's going out tears down.
+fn start_far_sight(sc: &mut Scene, me: u64, object: u64) {
+    let started = match sc.far_sight.as_deref() {
+        Some(far_sight) => {
+            let was_on = far_sight.on();
+            let index = &sc.index;
+            far_sight.start(Some(object), |g| index.0.contains_key(&g), &sc.net);
+            !was_on
+        }
+        // A harness without the machine: the start's stop.
+        None => true,
+    };
+    if !started {
+        return;
+    }
+    let active = sc.mover.as_deref().and_then(crate::net::MoverClaim::get);
+    // `IsClientControlled` (`0x5fa5f0`): our own control, or the unit's own bit.
+    let controlled = if object == me {
+        !sc.own_control_lost.as_deref().is_some_and(|l| l.0)
+    } else {
+        sc.client_controlled.contains(sc.index.0[&object])
+    };
+    let stops = if controlled {
+        active.filter(|&m| m != object)
+    } else {
+        Some(me)
+    };
+    if let Some(mover) = stops {
+        stop_auto_move(
+            sc.mover.as_deref(),
+            sc.follow.as_deref_mut(),
+            sc.approach.as_deref_mut(),
+            sc.call_autorun.as_deref_mut(),
+            &mut sc.field_notices,
+            mover,
+        );
+    }
+}
+
+/// The far-sight arrival of a new object: a unit's `PostInit` (`0x5fbb1a`) and a dynamic object's
+/// `OnCreate` (`0x5d552d`) look up the active player (`0x468460`, as a player) and, when its
+/// `PLAYER_FARSIGHT` (`[player+0xe68]+0x830`) names the new object, start far sight on it
+/// ([`start_far_sight`]).
+fn far_sight_arrives(sc: &mut Scene, guid: u64) {
+    let Some(me) = sc.self_guid.0 else {
+        return;
+    };
+    let field = sc
+        .index
+        .0
+        .get(&me)
+        .and_then(|&e| sc.stores.get(e).ok())
+        .and_then(|s| s.0.player_farsight());
+    if field == Some(guid) {
+        start_far_sight(sc, me, guid);
     }
 }
 
@@ -1191,7 +1281,11 @@ fn notify(sc: &mut Scene, guid: u64, block: Notified, bridged: bool) {
             }
             // The stun's tick (`0x5ff501` → `0x514640`): its teardown leg (`0x5146d6`).
             crate::field_watch::Step::Notice(crate::field_watch::FieldNotice::InputTick) => {
-                if tick_tears_down(sc, fields) {
+                if sc
+                    .stores
+                    .get(e)
+                    .is_ok_and(|store| tick_tears_down(sc, &store.0))
+                {
                     stop_auto_move(
                         sc.mover.as_deref(),
                         sc.follow.as_deref_mut(),
@@ -1202,38 +1296,18 @@ fn notify(sc: &mut Scene, guid: u64, block: Notified, bridged: bool) {
                     );
                 }
             }
-            // A far sight on a held object (`0x5ee39c` on, past the unresolved return). A unit we
-            // control takes the active mover (`0x5ee45d` → `0x5ee477`), whose switch stops the
-            // outgoing one's auto-move (`0x600742`) and is a no-op when it already holds it
-            // (`0x6006fb`); the switch itself is possession's control update's. Any other object
-            // runs the mover's tick (`0x5ee4a2`), which the view's going out tears down.
-            crate::field_watch::Step::Notice(crate::field_watch::FieldNotice::FarSightStop {
+            // The far-sight field's change (`0x5de0d0`): on a held object the start
+            // (`0x5de144` → `0x5ee270`, [`start_far_sight`]); else the end (`0x5de15d` →
+            // `0x5ee590`).
+            crate::field_watch::Step::Notice(crate::field_watch::FieldNotice::FarSight {
                 object,
             }) => {
-                if !sc.index.0.contains_key(&object) {
-                    continue;
-                }
-                let active = sc.mover.as_deref().and_then(crate::net::MoverClaim::get);
-                // `IsClientControlled` (`0x5fa5f0`): our own control, or the unit's own bit.
-                let controlled = if object == guid {
-                    !sc.own_control_lost.as_deref().is_some_and(|l| l.0)
-                } else {
-                    sc.client_controlled.contains(sc.index.0[&object])
-                };
-                let stops = if controlled {
-                    active.filter(|&m| m != object)
-                } else {
-                    Some(guid)
-                };
-                if let Some(mover) = stops {
-                    stop_auto_move(
-                        sc.mover.as_deref(),
-                        sc.follow.as_deref_mut(),
-                        sc.approach.as_deref_mut(),
-                        sc.call_autorun.as_deref_mut(),
-                        &mut sc.field_notices,
-                        mover,
-                    );
+                let field = (object != 0).then_some(object);
+                if field.is_some_and(|g| sc.index.0.contains_key(&g)) {
+                    start_far_sight(sc, guid, object);
+                } else if let Some(far_sight) = sc.far_sight.as_deref() {
+                    let index = &sc.index;
+                    far_sight.end(field, |g| index.0.contains_key(&g), &sc.net);
                 }
             }
             // The ghost flag's clear (`0x5dea20`): `SetAreaSpiritHealer(0, 0)` runs at the packet,
@@ -1246,7 +1320,8 @@ fn notify(sc: &mut Scene, guid: u64, block: Notified, bridged: bool) {
                     continue;
                 };
                 if spirit.set_healer(None).cancel_aura {
-                    let player = Some((e, fields.player_farsight()));
+                    let farsight = sc.stores.get(e).ok().and_then(|s| s.0.player_farsight());
+                    let player = Some((e, farsight));
                     let held = |guid: u64| sc.index.0.contains_key(&guid);
                     let spell = crate::ui_dialog_verbs::AREA_SPIRIT_HEALER_AURA;
                     if sc.aura.cancel_at_packet(player, held, spell) {
@@ -1290,7 +1365,8 @@ fn notify(sc: &mut Scene, guid: u64, block: Notified, bridged: bool) {
             .edges()
             .any(|(index, _, _)| index == benilla_protocol::field::FIELD_PLAYER_FIELD_COINAGE)
     {
-        if let (Some(trade), Some(purse)) = (sc.trade.as_mut(), fields.player_money()) {
+        let purse = sc.stores.get(e).ok().and_then(|s| s.0.player_money());
+        if let (Some(trade), Some(purse)) = (sc.trade.as_mut(), purse) {
             crate::ui_trade::trim_offer_to_purse(trade, purse, &sc.net);
         }
     }
@@ -1324,11 +1400,14 @@ fn mirror_guild(sc: &mut Scene) {
 
 /// The create hook of an object not yet shown (the table `0x465e78`), which alone asks the
 /// object's record: an item's record set-up (`0x5d8400` → `0x5d8300`); a unit's `PostInit`
-/// (`0x5fb880`), whose display resolve asks a creature's record (`0x60afb0`, at `0x60b15b`); a
-/// player's (`0x5debe0`), its name (`0x5dec12` → `0x609210`) and guild tag (`0x5dec19`) ahead of another
-/// player's party record (`0x5dec5f`, the active player skipped at `0x5dec48`-`0x5dec5b`), and for
-/// the active player its arrival last (`0x5dec7b`, [`super::arrival`]); a game object's template
-/// (`0x5f7c40`, at `0x5f7d81`), whose lockId decides use-vs-cast.
+/// (`0x5fb880`), whose display resolve asks a creature's record (`0x60afb0`, at `0x60b15b`) and
+/// which starts far sight late, ahead of its tail (`0x60c520`, `0x606fe0`, `0x607710`,
+/// `0x5ff130`, `0x612a30`; [`far_sight_arrives`]); a player's (`0x5debe0`), the unit's
+/// first (`0x5dec09`), then its name (`0x5dec12` → `0x609210`) and guild tag (`0x5dec19`) ahead of
+/// another player's party record (`0x5dec5f`, the active player skipped at `0x5dec48`-`0x5dec5b`),
+/// and for the active player its arrival last (`0x5dec7b`, [`super::arrival`]); a game object's
+/// template (`0x5f7c40`, at `0x5f7d81`), whose lockId decides use-vs-cast; a dynamic object's
+/// `OnCreate` (`0x5d5420`), a far-sight focus's arrival.
 fn create_hook(
     sc: &mut Scene,
     guid: u64,
@@ -1346,31 +1425,7 @@ fn create_hook(
         return;
     };
     match kind {
-        Created::Item => {
-            // The record, set up at once when cached, for our item in the world, and its signal
-            // for the owner of any item.
-            let run = item_watch(&sc.index, &sc.stores, &sc.self_guid, &sc.items).created_run(
-                guid,
-                &fields,
-                &sc.bag_cache,
-            );
-            // The set-up asks for the record of every item, whoever's, with the callback
-            // `0x5d8390` (`0x5d8300` into `0x55ba30`): the readers of a held item only read it.
-            if let Some(entry) = fields.object_entry() {
-                if sc
-                    .items
-                    .template(entry, guid, Ask::Event(&sc.net))
-                    .is_none()
-                {
-                    sc.items
-                        .wait(entry, crate::items::RecordCallback::SetUp(guid));
-                }
-            }
-            if let Some(crate::item_watch::ItemNotice::Record { guid, .. }) = run.notice {
-                super::replay_enchant_times(&mut sc.items, &mut sc.countdowns, &sc.index, guid);
-            }
-            sc.item_lane.push(run);
-        }
+        Created::Item => request_item_record(sc, guid, &fields),
         Created::World(EntityKind::Player) => {
             // Our own create runs the world-enter cascade (`0x5deb60` → `0x4908c0`), whose bag
             // watcher set-up zeroes and rescans the bag cache (`0x49098d` → `0x4f8cc0`).
@@ -1386,6 +1441,9 @@ fn create_hook(
                 sc.bag_cache.seat(&fields, &lookup);
             }
             resolve_display_records(sc, guid, &fields);
+            // The unit's `PostInit` (`0x5dec09` → `0x5fb880`): its far-sight arrival, ahead of
+            // its tail (`0x60c520`, `0x606fe0`, `0x607710`, `0x5ff130`, `0x612a30`).
+            far_sight_arrives(sc, guid);
             sc.names.lookup_fields(guid, &fields, &sc.net);
             sc.field_notices
                 .write_batch(crate::field_watch::guild_tag(guid));
@@ -1400,6 +1458,18 @@ fn create_hook(
         Created::World(EntityKind::Unit) => {
             resolve_display_records(sc, guid, &fields);
             sc.names.lookup_fields(guid, &fields, &sc.net);
+            far_sight_arrives(sc, guid);
+        }
+        // `OnCreate` (`0x5d5420`): a far-sight focus (the bytes' low byte 2, `0x5d54a7`) that
+        // the active player cast (`0x5d54b6`) is the far-sight arrival's.
+        Created::World(EntityKind::DynamicObject) => {
+            let focus = fields.dynamicobject_bytes().is_some_and(|b| b & 0xff == 2);
+            let ours = fields
+                .dynamicobject_caster()
+                .is_some_and(|caster| sc.self_guid.0 == Some(caster));
+            if focus && ours {
+                far_sight_arrives(sc, guid);
+            }
         }
         Created::World(EntityKind::GameObject) => {
             sc.go_templates.request_at_create(guid, &fields, &sc.net)
@@ -1412,7 +1482,9 @@ fn create_hook(
 /// when its records changed while it was away (`0x5fbe28` → `0x60abe0`); a player's `PostUpdate`
 /// (`0x5dec90`) runs the unit's, then compares its party record (`0x5decb7`), with no
 /// active-player gate, as the active player is never released; a game object's (`0x5f7ed0`) asks
-/// its template when it holds none (`+0x214`, `0x558560` at `0x5f7f31`).
+/// its template when it holds none (`+0x214`, `0x558560` at `0x5f7f31`); an item's and a bag's
+/// (`0x5d8430` → `0x5d8300`) request their record as their create did, set up at once when
+/// cached ([`request_item_record`]).
 fn reactivated_end(sc: &mut Scene, guid: u64, script: Option<&UiScript>) {
     let Some(e) = sc.index.0.get(&guid).copied() else {
         return;
@@ -1429,8 +1501,42 @@ fn reactivated_end(sc: &mut Scene, guid: u64, script: Option<&UiScript>) {
             compare_party_record(sc, guid, &fields, script);
         }
         Some(ObjectType::GameObject) => sc.go_templates.request_at_create(guid, &fields, &sc.net),
+        Some(ObjectType::Item | ObjectType::Container) => request_item_record(sc, guid, &fields),
         _ => {}
     }
+}
+
+/// `CGItem_C::RequestRecord` (`0x5d8300`), an item's create hook (`0x5d8400`) and its slot 3
+/// (`EndReactivation 0x5d8430`): the record, set up at once when cached (`0x5d834a` →
+/// `0x5d8440`), for our item in the world, and its signal for the owner of any item; a miss asks
+/// for it with the callback `0x5d8390` (`0x5d833f` → `0x55ba30`), whoever's the item. The readers
+/// of a held item only read it.
+fn request_item_record(sc: &mut Scene, guid: u64, fields: &ObjectFields) {
+    let run = item_watch(&sc.index, &sc.stores, &sc.self_guid, &sc.items).created_run(
+        guid,
+        fields,
+        &sc.bag_cache,
+    );
+    if let Some(entry) = fields.object_entry() {
+        if sc
+            .items
+            .template(entry, guid, Ask::Event(&sc.net))
+            .is_none()
+        {
+            sc.items
+                .wait(entry, crate::items::RecordCallback::SetUp(guid));
+        }
+    }
+    if let Some(crate::item_watch::ItemNotice::Record { guid, .. }) = run.notice {
+        super::replay_enchant_times(
+            &mut sc.items,
+            &mut sc.countdowns,
+            &sc.index,
+            &mut sc.view_log,
+            guid,
+        );
+    }
+    sc.item_lane.push(run);
 }
 
 /// `CGUnit_C::ResolveDisplayRecords` from the unit's `PostInit` (`0x5fb88b` → `0x60afb0`): the

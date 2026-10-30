@@ -10,8 +10,8 @@
 //! script comes in by: the mouse and key feed, the bindings pass, an `OnUpdate`, the handlers of
 //! the events a feed fires, a chunk. A system that holds the host's own state alongside the VM runs
 //! as an engine turn ([`VmWith`]): a call its Lua makes waits, as one made while the host applies a
-//! call does, and applies before the system ends; a feed's events fire after its turn, with the
-//! host lent ([`VmWith::feed`]). Every host runs in one order, the VM pass ([`crate::vm_pass`]). An
+//! call does, and applies before the system ends. Every host runs in one order, the VM pass
+//! ([`crate::vm_pass`]). An
 //! addon's or a macro's cast passes the gate's tag 2 (`0x494a92`) only inside an input event; the
 //! client's own code passes it outside any (`0x494a5a` → `0x494b11`).
 
@@ -32,7 +32,9 @@ pub(crate) mod live;
 mod windows;
 mod world_click;
 #[cfg(test)]
-pub(crate) use world_click::{error_lines, record_error_lines, release_click, take_error_lines};
+pub(crate) use world_click::{
+    click_plate, error_lines, record_error_lines, release_click, take_error_lines,
+};
 pub(crate) use world_click::{submit_waiting_clicks, InputHost};
 
 /// `DoEmote` (`0x5ef560`) in the reference's order: a posture emote's stand change to a state but 0
@@ -156,6 +158,8 @@ disjoint::disjoint_set! {
         click: crate::target::ClickLegs<'static, 'static>,
         /// The binding functions' input state, and `DropItemOnUnit`'s legs.
         commands: crate::player::CommandSteps<'static, 'static>,
+        look: crate::player::LookSteps<'static>,
+        sheath: crate::player::SheathToggle<'static, 'static>,
         drop_item: crate::ui_action::drop_item::DropItemLeg<'static, 'static>,
     }
 }
@@ -370,6 +374,38 @@ impl ScriptCallHost<'_, '_> {
         }
     }
 
+    /// Placements an engine writer makes outside any call on this login's bar, once our player's
+    /// arrival has loaded it ([`crate::ui_action::ActionSlots::loaded`]): `writes` picks the
+    /// 1-based `(id, word)` pairs off the bar as it stands, and each goes out as a placement's does
+    /// ([`crate::ui_action::ActionBarSteps::set`]), `CMSG_SET_ACTION_BUTTON` sent and the slot
+    /// stored, into the VM's copy with its usable pair ([`Self::engine_slot_written`]), with
+    /// nothing signalled. The ids written, in order; `None` while the bar is not loaded.
+    pub(crate) fn engine_bar_writes(
+        &mut self,
+        script: &mut UiScript,
+        writes: impl FnOnce(&[benilla_protocol::messages::ActionButton]) -> Vec<(u32, u32)>,
+    ) -> Option<Vec<u32>> {
+        let bar = self.appliers.action_bar();
+        if !bar.loaded() {
+            return None;
+        }
+        let buttons: Vec<_> = bar.buttons().copied().collect();
+        let mut writes = writes(&buttons);
+        writes.sort_unstable();
+        for &(id, word) in &writes {
+            let mut bar = self.appliers.action_bar();
+            bar.set(id, word);
+            let slot = bar.button(id).map(|b| benilla_ui::script::ActionSlot {
+                kind: b.kind,
+                action: b.action,
+                ..Default::default()
+            });
+            script.set_action(id, slot);
+            self.engine_slot_written(script, id);
+        }
+        Some(writes.into_iter().map(|(id, _)| id).collect())
+    }
+
     /// `0x4e6d20(entry)`, a recount's one count of its entry (`0x4e5c75`); `None` in a harness
     /// without the action feed's inputs.
     pub(crate) fn engine_item_count(&mut self, entry: u32) -> Option<u32> {
@@ -507,6 +543,124 @@ impl ScriptCallHost<'_, '_> {
         self.appliers.stand().finish();
     }
 
+    /// `SetCommands` (`0x515090`) inside a binding call: the bit, then the cast cancel (`0x51512a`
+    /// → `0x6e4940`, `0x515193` → `0x6e9b70`), whose stop the call's reports signal, then the
+    /// tick's legs (`0x5151a0` → `0x514640`, [`crate::player::TickLegs`]): the away clear's line,
+    /// a start's `AUTOFOLLOW_END` and its loot close, each signalled in its place, the loot's
+    /// `LOOT_CLOSED` in the call's tail.
+    fn set_commands(
+        &mut self,
+        script: &mut UiScript,
+        mark: &mut crate::ui_cast::ReportMark,
+        input: benilla_ui::script::BindingInput,
+    ) -> Option<CallTail> {
+        use benilla_ui::script::BindingInput::{Fire, ViewStart, ViewStop};
+        use benilla_ui::script::FiredInput;
+        match input {
+            // The camera's axes are its own state (`[cam+0x128]`), set inside the call.
+            ViewStart(axis) | ViewStop(axis) => {
+                self.appliers
+                    .views()
+                    .move_axis(axis, matches!(input, ViewStart(_)));
+                return None;
+            }
+            // The zoom runs the camera's distance axis (`0x50fc60`, `0x50fcd0`).
+            Fire(FiredInput::CameraZoomIn(yards)) => {
+                self.appliers.views().zoom(false, yards);
+                return None;
+            }
+            Fire(FiredInput::CameraZoomOut(yards)) => {
+                self.appliers.views().zoom(true, yards);
+                return None;
+            }
+            // `ToggleSheath` (`0x48a070`) is no command bit: the player's own toggle.
+            Fire(FiredInput::ToggleSheath) => {
+                self.appliers.sheath().toggle();
+                return None;
+            }
+            _ => {}
+        }
+        // A bound mouse command's press that sets the first primary bit enters freelook before
+        // its tick (`0x514840` → `0x51491f`, then `0x5151a0`).
+        let before = self.appliers.look().bits_before(input);
+        let called = self.appliers.commands().call(input);
+        let looked = self.appliers.look().bound(input, before);
+        self.freelook_edges_here(script, mark, looked);
+        self.run_called(script, mark, called)
+    }
+
+    /// The world frame's half of a freelook a call entered or left ([`freelook_edges`]), whose
+    /// handlers run there, ahead of the call's cast cancel and tick (`0x51491f` inside `0x514840`,
+    /// then `0x51512a`, `0x5151a0`) or its look-session work (`0x493070`, then `0x514231`).
+    fn freelook_edges_here(
+        &mut self,
+        script: &mut UiScript,
+        mark: &mut crate::ui_cast::ReportMark,
+        looked: crate::player::Looked,
+    ) {
+        freelook_edges(script, looked);
+        if looked.entered || looked.left {
+            self.at_point(script, mark);
+        }
+    }
+
+    /// A look-session call inside its verb ([`benilla_ui::script::ScriptCall::Look`]): the world
+    /// mouse's channel and the freelook it enters or leaves, then for `MouselookStart`/`Stop` the
+    /// `SetCommands` work its bit change runs (`0x514231`, `0x51425b`), as [`Self::set_commands`]
+    /// runs a bound one's.
+    fn look(
+        &mut self,
+        script: &mut UiScript,
+        mark: &mut crate::ui_cast::ReportMark,
+        call: benilla_ui::script::LookCall,
+    ) -> Option<CallTail> {
+        let looked = self.appliers.look().call(call);
+        self.freelook_edges_here(script, mark, looked);
+        let benilla_ui::script::LookCall::Mouselook(on) = call else {
+            return None;
+        };
+        let called = self.appliers.commands().mouselook(on, looked.changed);
+        self.run_called(script, mark, called)
+    }
+
+    /// What a `SetCommands` call leaves its host ([`crate::player::Called`]), run in its order.
+    fn run_called(
+        &mut self,
+        script: &mut UiScript,
+        mark: &mut crate::ui_cast::ReportMark,
+        called: crate::player::Called,
+    ) -> Option<CallTail> {
+        if let Some(mover_is_player) = called.cancel {
+            self.appliers.self_cancel().cancel_for_move(mover_is_player);
+        }
+        let legs = called.legs;
+        if legs == crate::player::TickLegs::default() {
+            return None;
+        }
+        // The cancel's stop goes ahead of the tick's lines (`0x51512a` before `0x5151a0`), its
+        // listeners running there, before the tick writes.
+        self.at_point(script, mark);
+        // The away clear's line (`0x5eb878`) runs its listeners before the mirror's zero and the
+        // AFK packet (`0x5eb885`, `0x5eb8d0`).
+        if legs.clear_afk && self.appliers.chat().clear_afk_line(script) {
+            self.at_point(script, mark);
+            self.appliers.chat().finish_clear_afk();
+        }
+        // `StopAutoMove` signals a follow's end before it stops the move (`0x60fb84`, then
+        // `0x60e7f0`), and the loot close comes after.
+        if legs.stop_auto_move {
+            if self.appliers.commands().following() {
+                script.fire_event("AUTOFOLLOW_END", vec![]);
+                self.at_point(script, mark);
+            }
+            self.appliers.commands().stop_auto_move();
+        }
+        if legs.close_loot {
+            return self.appliers.loot().close_for_move(script);
+        }
+        None
+    }
+
     /// The reports the call made since `mark` signalled now, ahead of whatever it signals next:
     /// a selection's teardown runs StopAttack (`0x493a08`), whose next-swing cancel
     /// (`0x5ecb63` → `0x6e6f30`) reports there, ahead of the teardown's `PET_BAR_UPDATE`
@@ -544,8 +698,9 @@ impl ScriptCallHost<'_, '_> {
     }
 
     /// A selection's `SetSelection` from its signals on, `owed` being what its commit owes after
-    /// them: the teardown's `PET_BAR_UPDATE` (`0x4bd6b4`) runs its listeners before the store and
-    /// the send (`0x4936e2`, `0x493871`), the change's signals run theirs before the re-swing
+    /// them: the teardown's stop report (`0x493a08`) runs its listeners before the pet leg
+    /// (`0x493a0f`), whose `PET_BAR_UPDATE` (`0x4bd6b4`) runs its own before the store and the
+    /// send (`0x4936e2`, `0x493871`), the change's signals run theirs before the re-swing
     /// (`0x4938c8`), and a payment that selects again (StartAttack's own select, `0x5eccaa`)
     /// signals in turn before what it owes. A selection a listener makes at a point signals
     /// itself, nested, so each point moves the mark to the selection as the listeners left it.
@@ -556,14 +711,23 @@ impl ScriptCallHost<'_, '_> {
         mut owed: crate::target::SelectDebt,
     ) {
         loop {
-            if let Some(send) = owed.take_send() {
-                // The teardown's StopAttack reported first (`0x493a08`); `PetStopAttack` lowered
-                // the latch and signals with the selection zeroed (`0x4bd6ae`, `0x4939d3`).
+            if let Some(mut send) = owed.take_send() {
+                // The teardown's StopAttack reports first (`0x493a08`), with the selection zeroed
+                // (`0x4939d3`), and its listeners run there, before the pet leg.
                 self.signal_reports(script, &mut at.mark);
-                script.fire_event("PET_BAR_UPDATE", vec![]);
-                at.latched = false;
                 script.seat_selection(self.appliers.select().seated());
-                self.at_point(script, &mut at.mark);
+                if send.owes_pet_leg() {
+                    self.at_point(script, &mut at.mark);
+                    // A listener's `PetStopAttack` lowered the latch and signalled there, so the
+                    // pet leg and the change find it down and signal nothing (`0x4bd650`).
+                    at.latched = self.appliers.pet().attack_latched();
+                }
+                // `PetStopAttack` lowered the latch and signals (`0x4bd6ae`, `0x4bd6b4`).
+                if self.appliers.select().run_pet_leg(&mut send) {
+                    script.fire_event("PET_BAR_UPDATE", vec![]);
+                    at.latched = false;
+                    self.at_point(script, &mut at.mark);
+                }
                 // The store over a listener's pick (`0x4936e2`), or for a clear the send of the
                 // listener's pick, and either signals after (`0x49389c`, `0x493a73`), so the
                 // mark stays the selection the call found.
@@ -918,6 +1082,7 @@ impl CallHost for ScriptCallHost<'_, '_> {
                 emote_in_order!(appliers, appliers.emote().do_emote(script, request));
             }
             ScriptCall::Uninvite(name) => appliers.chat().uninvite(name),
+            ScriptCall::Logging { combat } => appliers.chat().logging(script, combat),
             ScriptCall::RequestTimePlayed => appliers.chat().request_time_played(),
             ScriptCall::OpeningCinematic => appliers.chat().opening_cinematic(),
             ScriptCall::AddonMessage(send) => appliers.chat().addon_message(send),
@@ -936,6 +1101,13 @@ impl CallHost for ScriptCallHost<'_, '_> {
             ScriptCall::Gossip(GossipCall::Close) => self.close_gossip(script, &mut at.mark),
             ScriptCall::Gossip(call) => appliers.gossip().apply(script, call),
             ScriptCall::Mail(MailCall::Close) => self.close_mail(script, &mut at.mark),
+            // An unread mail's mark signals (`0x4add9d`) and its listeners run before the open
+            // arms the close's re-query (`0x4adda6`).
+            ScriptCall::Mail(call @ MailCall::Open { unread: true, .. }) => {
+                appliers.mail().apply(script, call);
+                self.at_point(script, &mut at.mark);
+                self.appliers.mail().arm_close_refresh();
+            }
             ScriptCall::Mail(call) => appliers.mail().apply(script, call),
             // The partner's slot 7 is the trade's, the bind the targeting cursor's.
             ScriptCall::Trade(
@@ -1080,13 +1252,9 @@ impl CallHost for ScriptCallHost<'_, '_> {
             }
             ScriptCall::RecordAsk(ask) => appliers.asks().apply(ask),
             ScriptCall::WorldClick(step) => self.world_click(script, &mut at, step),
-            // `SetCommands` (`0x515090`): the bit, then the cast cancel (`0x51512a` → `0x6e4940`,
-            // `0x515193` → `0x6e9b70`), whose stop the call's reports signal as it returns.
-            ScriptCall::Input(input) => {
-                if let Some(mover_is_player) = appliers.commands().call(input) {
-                    appliers.self_cancel().cancel_for_move(mover_is_player);
-                }
-            }
+            ScriptCall::PlateClick(click) => self.plate_click(script, &mut at, click),
+            ScriptCall::Input(input) => tail = self.set_commands(script, &mut at.mark, input),
+            ScriptCall::Look(call) => tail = self.look(script, &mut at.mark, call),
             ScriptCall::DropItemOnUnit(token) => appliers.drop_item().drop_on(script, &token),
         }
         // A profession opener the call cast toggles its window inside the cast (`0x6e4c22`,
@@ -1223,6 +1391,24 @@ pub(crate) fn hosted<R>(
     }
 }
 
+/// The world frame's half of a freelook a call entered or left (`0x493070`, `0x493090`), inside
+/// the call: the entry turns every plate's mouse off, which ends a hovered plate's hover through
+/// its leave (`0x483e9a` → `0x60f830`), then publishes the empty mouseover (`0x483ec3`), the hover
+/// driver's teardown, so the next line's `"mouseover"` names nobody, then moves the mouse focus to
+/// the world frame (`0x493085` → `0x764dc0`); the leave turns the plates' mouse back on
+/// (`0x483e70`) and has the hover picked again (`0x4930a0`).
+fn freelook_edges(script: &mut UiScript, looked: crate::player::Looked) {
+    if looked.entered {
+        script.set_nameplate_mouse(false);
+        script.set_unit("mouseover", None);
+        script.publish_world_mouseover(None);
+        script.focus_world_frame();
+    } else if looked.left {
+        script.set_nameplate_mouse(true);
+        script.repick_hover();
+    }
+}
+
 /// The VM and the host, for a system that also holds `P`, some of the host's own state: the
 /// cast ladder of a drain that applies a click's cast, the pet bar a feed pushes. It runs Lua
 /// with the host lent ([`VmWith::run`]), or does its engine work on the VM and `P` together as
@@ -1279,29 +1465,6 @@ impl<P: SystemParam + 'static> VmWith<'_, '_, P> {
             }
         }
         r
-    }
-
-    /// A feed: `f` pushes what it read of `P` into the VM as an engine turn ([`Self::turn`]) and
-    /// leaves its events in `fires`, which are signalled in order once it returns, with the host
-    /// lent, so the calls their handlers make apply inside the verb. For a feed whose events end
-    /// its pass, so its handlers read every push it made.
-    #[track_caller]
-    pub(crate) fn feed(
-        &mut self,
-        f: impl FnOnce(Option<&mut UiScript>, SystemParamItem<'_, '_, P>, &mut Fires),
-    ) {
-        let mut fires = Fires::default();
-        self.turn(|script, p| f(script, p, &mut fires));
-        if fires.0.is_empty() {
-            return;
-        }
-        self.run(|script| {
-            if let Some(script) = script {
-                for (event, args) in fires.0 {
-                    script.fire_event(&event, args);
-                }
-            }
-        });
     }
 }
 
@@ -1452,17 +1615,6 @@ impl<'w, 's, P: SystemParam + 'static> VmWith<'w, 's, P> {
     }
 }
 
-/// The events a feed's engine turn leaves for [`VmWith::feed`] to signal once it has pushed.
-#[derive(Default)]
-pub(crate) struct Fires(Vec<(String, Vec<benilla_ui::script::ScriptValue>)>);
-
-impl Fires {
-    /// Signal `event` with `args` once the turn's pushes are in, after the ones posted before it.
-    pub(crate) fn post(&mut self, event: &str, args: Vec<benilla_ui::script::ScriptValue>) {
-        self.0.push((event.to_string(), args));
-    }
-}
-
 /// Run `f` on the world's VM with the host lent, for an entry that holds the whole world (a
 /// reload, a session's end, a world-leave sweep): the host is built off the world as a system's
 /// would be, and what its calls queued applied after. `f` gets `None` with no VM.
@@ -1565,9 +1717,9 @@ pub(crate) fn run_cached<O: 'static, M, S: IntoSystem<(), O, M> + 'static>(
     r
 }
 
-/// Bind the units a plate click's select found the targeting cursor up for (`SelectTarget`,
-/// `0x4935d5`), in the click's legs, ahead of its interact: a call binds its own as it applies, and
-/// a handler at its select ([`crate::spell::PickBind`]).
+/// Bind the units a selection writer's `SelectTarget` found the targeting cursor up for
+/// (`0x4935d5`): a call binds its own as it applies, and a handler at its select
+/// ([`crate::spell::PickBind`]).
 pub(crate) fn bind_parked_picks(mut bind: crate::spell::PickBind) {
     bind.bind();
 }
@@ -1638,10 +1790,12 @@ mod tests {
     mod closes;
     mod dialogs;
     mod engine;
+    mod plates;
     mod refusals;
     mod selection;
     mod sends;
     mod systems;
+    mod ticks;
     mod window_verbs;
 
     const ME: u64 = 0x10;

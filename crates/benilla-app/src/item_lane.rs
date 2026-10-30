@@ -20,7 +20,7 @@ use bevy::prelude::*;
 use benilla_ui::script::UiScript;
 
 use crate::field_watch::FieldNotice;
-use crate::item_watch::{BagEvent, ItemNotice, Run, TradeTouch, Unlock};
+use crate::item_watch::{BagEvent, Freed, ItemNotice, Run, TradeTouch, Unlock};
 use crate::lanes::{Stamp, Until};
 
 /// The item watchers' runs, each stamped as its packet's handler readied it
@@ -171,7 +171,8 @@ pub(crate) fn seat_item_lane(world: &mut World) {
 /// reads the objects as of its place through the lent host: behind a visible item's rebuilds,
 /// ahead of its recounts (`0x5dee75`, `0x5dee7a`), else last, behind the stack count's quest log
 /// ask (`0x5d9519`, `0x5d952a`), the enchantment's slot signal (`0x5d9b2a`, `0x5d9b2f`), and alone
-/// for the flags' and the durability's.
+/// for the flags' and the durability's. The objects it frees go last ([`forget_freed`]); a
+/// deactivate's cursor leg goes first ([`let_cursor_go`]).
 fn fire_run(vm: &mut RunVm, reads: &mut RunReads, run: Run, touch: Option<TradeTouch>) {
     let Run {
         notice,
@@ -179,7 +180,12 @@ fn fire_run(vm: &mut RunVm, reads: &mut RunReads, run: Run, touch: Option<TradeT
         unlocks,
         bags,
         alerts,
+        freed,
+        cursor,
     } = run;
+    if let Some(item) = cursor {
+        on_vm(vm, |script| let_cursor_go(script, item));
+    }
     let Some(notice) = notice else {
         on_vm(vm, |script| fire_unlocks(script, unlocks));
         fire_bags(vm, &bags);
@@ -187,6 +193,7 @@ fn fire_run(vm: &mut RunVm, reads: &mut RunReads, run: Run, touch: Option<TradeT
         if alerts {
             on_vm(vm, UiScript::recompute_inventory_alerts);
         }
+        on_vm(vm, |script| forget_freed(script, freed));
         return;
     };
     let rebuild = rebuild_at(&notice);
@@ -223,6 +230,30 @@ fn fire_run(vm: &mut RunVm, reads: &mut RunReads, run: Run, touch: Option<TradeT
     fire_tail(vm, &mut reads.sink, &notice, &bags, signals, rebuild);
     if alerts && !alerts_first {
         on_vm(vm, UiScript::recompute_inventory_alerts);
+    }
+    on_vm(vm, |script| forget_freed(script, freed));
+}
+
+/// [`Run::clearing_cursor`]: `ClearCursor(1, 1)` with the host lent, its `ITEM_LOCK_CHANGED` and
+/// `CURSOR_UPDATE` signalled as it runs, when the cursor holds `item` as the run fires.
+fn let_cursor_go(script: &mut UiScript, item: u64) {
+    if script.cursor_item().is_some_and(|held| held.guid == item) {
+        script.clear_cursor_payload();
+    }
+}
+
+/// The locks of the item objects freed at the run's place, forgotten with no event: each was its
+/// object's bit (`item+0x314`), and the next object under the guid is built unlocked (`0x5d821f`,
+/// `0x5d823e`).
+fn forget_freed(script: &mut UiScript, freed: Freed) {
+    match freed {
+        Freed::Nothing => {}
+        Freed::Items(guids) => {
+            for guid in guids {
+                script.forget_item_lock(guid);
+            }
+        }
+        Freed::All => script.forget_all_item_locks(),
     }
 }
 
@@ -266,6 +297,7 @@ fn rebuild_at(notice: &ItemNotice) -> Option<Rebuild> {
         | ItemNotice::Enchantment { .. }
         | ItemNotice::TradeRecord { .. }
         | ItemNotice::TooltipRecord { .. }
+        | ItemNotice::LockKeyRecord
         | ItemNotice::ActionRecord { .. } => None,
     }
 }
@@ -284,8 +316,8 @@ fn rebuild_lists(script: &mut UiScript) {
 /// (`0x5d85d9`, `0x5d85e8`, `0x5d8606`) and the destroy (`0x5d87b2` before `0x5d87c1`), and behind
 /// both in the stack count's (`0x5d94ff`, `0x5d950e`, `0x5d9519`); the spell charges'
 /// `BAG_UPDATE_COOLDOWN` (`0x4f93d0`); a trade getter's record callback's `TRADE_UPDATE`
-/// (`0x4c034f`); the tooltips' record callbacks (`0x52e530`, `0x52f820`); and every other run's
-/// bag events, then its signals.
+/// (`0x4c034f`); the tooltips' record callbacks (`0x52e530`, `0x52f820`, `0x52ad10`); and every
+/// other run's bag events, then its signals.
 fn fire_tail(
     vm: &mut RunVm,
     sink: &mut crate::ui_action::MessageSink,
@@ -317,6 +349,11 @@ fn fire_tail(
         }
         ItemNotice::TooltipRecord { entry } => {
             on_vm(vm, |script| script.answer_item_tooltips(entry));
+        }
+        ItemNotice::LockKeyRecord => {
+            on_vm(vm, |script| {
+                script.tooltip_object_refresh();
+            });
         }
         _ => {
             if rebuild == Some(Rebuild::BeforeBags) {
