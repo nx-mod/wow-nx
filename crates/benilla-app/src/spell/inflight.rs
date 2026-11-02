@@ -40,9 +40,16 @@ pub(crate) struct PendingCast {
     caster_is_player: bool,
     record_spell: u32,
     record_target: Option<u64>,
+    /// The bits a bind that left the word standing or-ed into the record's mask (`0xceac5c`,
+    /// `0x6e5e13`, `0x6e5fc7`), which the send writes beside the last bind's (`0x7e4e10`).
+    record_mask: u16,
     /// The record's source (`0xceac48 + 0x00`) when it is an item, which the item's deactivate
     /// compares ([`Self::record_item`]).
     record_item: Option<u64>,
+    /// The record as `SendCast` sends it ([`Self::record_send`]).
+    record_send: Option<super::cast_send::CastSend>,
+    /// How many fills the record has had ([`Self::fills`]).
+    fills: u32,
 }
 
 struct PendingCastState {
@@ -107,16 +114,29 @@ impl PendingCast {
     /// `ITEM_FLAG_PLAYERCAST` and a queued strike included, though neither holds this slot.
     pub(crate) fn fill_record(&mut self) {
         self.caster_is_player = true;
-        self.record_target = None;
-        self.record_item = None;
+        self.refill();
     }
 
     /// [`Self::fill_record`] for a caster other than the active player (the pet bar's presses
     /// through `0x6e4b60`, `0x4bd385`): the caster word names that unit, so no cancel event fires.
     pub(crate) fn fill_unit_record(&mut self) {
         self.caster_is_player = false;
+        self.refill();
+    }
+
+    /// The fill's zero of the record (`rep stos` at `0x6e4f80`).
+    fn refill(&mut self) {
         self.record_target = None;
+        self.record_mask = 0;
         self.record_item = None;
+        self.record_send = None;
+        self.fills = self.fills.wrapping_add(1);
+    }
+
+    /// A count of the record's fills, which tells an attempt whether a listener's attempt has
+    /// filled it since its own ([`super::cast_send::ArmPark`]).
+    pub(crate) fn fills(&self) -> u32 {
+        self.fills
     }
 
     /// The attempt's source write (`0x6e4f8f`-`0x6e4fa1`): the casting item's guid when the
@@ -134,9 +154,14 @@ impl PendingCast {
 
     /// The gate of `AbortCast 0x6e4940`'s events: `SPELLCAST_STOP`, `_FAILED` or `_INTERRUPTED`
     /// fires only while the caster word is the active player's (`0x6e4a04`–`0x6e4a1e`), and firing
-    /// clears it (`0x6e4a5a`), so one record fires at most once whatever pops after it.
+    /// clears it (`0x6e4a5a`), so one record fires at most once whatever pops after it. A send
+    /// the record still owes finds no caster then and leaves unsent (`0x6e5572` → `0x6e59b0`).
     pub(crate) fn take_caster_event(&mut self) -> bool {
-        std::mem::take(&mut self.caster_is_player)
+        let caster = std::mem::take(&mut self.caster_is_player);
+        if caster {
+            self.record_send = None;
+        }
+        caster
     }
 
     /// The record's spell (`0xceac48 + 0x10`), written by the attempt (`0x6e4f88`) and the
@@ -158,10 +183,38 @@ impl PendingCast {
         self.record_target
     }
 
+    /// The record as an attempt or a cursor's bind completed it for `SendCast 0x6e54f0`, which
+    /// reads it past the signals ahead of it; a refill or a cancel since leaves none.
+    pub(crate) fn record_send(&self) -> Option<&super::cast_send::CastSend> {
+        self.record_send.as_ref()
+    }
+
+    /// The record completed for its send ([`Self::record_send`]).
+    pub(crate) fn set_record_send(&mut self, send: super::cast_send::CastSend) {
+        self.record_send = Some(send);
+    }
+
     /// `BindTarget 0x6e5b40`'s write of the bound unit, game object or corpse (`0x6e5cdc`,
     /// `0x6e5f77`, `0x6e5fbe`), or the arm's parked guid (`0x6e5454`); an item goes to `+0x20`.
     pub(crate) fn bind_target(&mut self, guid: u64) {
         self.record_target = Some(guid);
+    }
+
+    /// A bind that left the word standing (`0x6e60c1`): its object written into the record's
+    /// target, as [`Self::bind_target`], and its bit into the mask.
+    pub(crate) fn hold_target(&mut self, guid: u64, mask_bit: u16) {
+        self.record_target = Some(guid);
+        self.record_mask |= mask_bit;
+    }
+
+    /// The bits held binds wrote into the record's mask, 0 when none has.
+    pub(crate) fn record_mask(&self) -> u16 {
+        self.record_mask
+    }
+
+    /// The mask a refused bind's restore puts back (`0x6e609d`), over a refill.
+    pub(crate) fn restore_mask(&mut self, mask: u16) {
+        self.record_mask = mask;
     }
 }
 
@@ -201,6 +254,12 @@ impl QueuedMeleeSpell {
     #[cfg(test)]
     pub(crate) fn arm(&mut self, spell_id: u32) {
         self.slot = Some(spell_id);
+    }
+
+    /// `slot` in the slot over `save` in the save, as a strike cast over a queued one leaves them.
+    #[cfg(test)]
+    pub(crate) fn hold(&mut self, slot: u32, save: u32) {
+        self.push(Some(save), Some(slot));
     }
 
     /// The push (`0x6e4adf`-`0x6e4af8`): the save takes the strike the slot `held`, and the slot
@@ -380,8 +439,9 @@ impl ActiveChannel {
 }
 
 /// The live auto-repeat spell, the client's `0xceac30`: set at cast send (`0x6e54f0`) for
-/// `AttributesEx2 & 0x20`, cleared by `SMSG_CANCEL_AUTO_REPEAT` (`0x6ea080`) and a matching cast
-/// failure. `IsAutoRepeatAction` and the button flash read it; the sticky
+/// `AttributesEx2 & 0x20`, cleared by the stop `0x6ea080`
+/// ([`crate::creature_anim::cancel_auto_repeat_local`]), whichever of its callers runs it.
+/// `IsAutoRepeatAction` and the button flash read it; the sticky
 /// `creature_anim::AutoRepeatArmed` is the idle gate.
 #[derive(Resource, Default)]
 pub(crate) struct AutoRepeatActive(pub Option<u32>);
@@ -427,7 +487,8 @@ pub(crate) struct LocalMoveStart {
 /// by the fade.
 pub(crate) fn local_self_cancel(mut moved: ResMut<LocalMoveStart>, mut cancel: SelfCancel) {
     if std::mem::take(&mut moved.pressed) {
-        cancel.cancel(false, true, moved.mover_is_player);
+        cancel.cancel_for_move();
+        cancel.cancel_channel_for_move(moved.mover_is_player);
     }
 }
 
@@ -468,13 +529,41 @@ pub(crate) fn drop_hold<P: bevy::ecs::system::SystemParam + 'static>(
 impl SelfCancel<'_> {
     /// `SpellStopCasting()` (`0x6e6e80`), the ESC chain's cast rung.
     pub(crate) fn stop_casting(&mut self) {
-        self.cancel(true, false, false);
+        self.cancel(true, false);
     }
 
-    /// A movement command's cancel inside its call (`0x51512a`, `0x515193`, `Script::Jump`'s
-    /// `0x513c43`); `mover_is_player` gates the channel's.
-    pub(crate) fn cancel_for_move(&mut self, mover_is_player: bool) {
-        self.cancel(false, true, mover_is_player);
+    /// A movement command's cast cancel (`0x51512a`, `Script::Jump`'s `0x513c43`), which signals
+    /// before the channel's ([`Self::cancel_channel_for_move`]).
+    pub(crate) fn cancel_for_move(&mut self) {
+        self.cancel(false, true);
+    }
+
+    /// A movement command's channel cancel (`0x515193` → `0x6e9b70`), past the cast cancel's
+    /// listeners: with the player as the mover (`0x51517b`-`0x515191`), a running channel whose
+    /// `ChannelInterruptFlags` take movement goes on the wire, the send only.
+    pub(crate) fn cancel_channel_for_move(&mut self, mover_is_player: bool) {
+        if !mover_is_player {
+            return;
+        }
+        let Some(spell_id) = self.channel.current(Instant::now()) else {
+            return;
+        };
+        if !record_flags(
+            &self.spells,
+            |d| d.channel_interrupt_flags & CHANNEL_INTERRUPT_MOVING != 0,
+            spell_id,
+        ) {
+            return;
+        }
+        if *crate::net::CAST_TRACE {
+            info!(
+                "cast-trace: LOCAL channel self-cancel — spell {spell_id}, CMSG_CANCEL_CHANNELLING"
+            );
+        }
+        let _ = self
+            .net
+            .0
+            .send(ClientCommand::CancelChannelling { spell_id });
     }
 
     /// `CancelCast(1, 1, 0x1c)` (`0x6e4940`) as `UseSoulstone`'s item leg calls it (`0x48ae6b`),
@@ -534,8 +623,7 @@ impl SelfCancel<'_> {
         }
     }
 
-    fn cancel(&mut self, esc: bool, moved: bool, mover_is_player: bool) {
-        let now = Instant::now();
+    fn cancel(&mut self, esc: bool, moved: bool) {
         let self_e = self.self_entity();
         // Esc stops one thing, auto-repeat first (`0x6e6e80`).
         let esc = if esc && self.auto_repeat.0.is_some() {
@@ -573,16 +661,6 @@ impl SelfCancel<'_> {
         if !esc && !moved {
             return;
         }
-        let flags_open = |spells: &Option<Res<Spells>>,
-                          pick: fn(&benilla_formats::SpellDisplay) -> bool,
-                          spell_id: u32| {
-            // A spell with no record is spared: both tests leave on a null record (`0x51511a`,
-            // `0x515171`; `Script::Jump`'s `0x513c34`, `0x513c8c`).
-            spells
-                .as_ref()
-                .and_then(|s| s.catalog.get(spell_id))
-                .is_some_and(pick)
-        };
         // `AbortCast` treats a cast and a queued strike alike; only the local teardown differs.
         if let Some(slot) = inflight(&self.pending, &self.queued_melee, &self.ground) {
             let spell_id = slot.spell_id();
@@ -591,7 +669,7 @@ impl SelfCancel<'_> {
             // while the word is up (`0x5150fd`, and `Script::Jump`).
             if esc
                 || (!self.ground.active()
-                    && flags_open(
+                    && record_flags(
                         &self.spells,
                         |d| d.interrupt_flags & SPELL_INTERRUPT_MOVEMENT != 0,
                         spell_id,
@@ -601,26 +679,21 @@ impl SelfCancel<'_> {
                 self.cancel_inflight(false, if esc { "esc" } else { "moved" });
             }
         }
-        // The channel: movement only, with the player as the mover, and the send only
-        // (`0x6e9b70`).
-        if moved && mover_is_player {
-            if let Some(spell_id) = self.channel.current(now) {
-                if flags_open(
-                    &self.spells,
-                    |d| d.channel_interrupt_flags & CHANNEL_INTERRUPT_MOVING != 0,
-                    spell_id,
-                ) {
-                    if *crate::net::CAST_TRACE {
-                        info!("cast-trace: LOCAL channel self-cancel — spell {spell_id}, CMSG_CANCEL_CHANNELLING");
-                    }
-                    let _ = self
-                        .net
-                        .0
-                        .send(ClientCommand::CancelChannelling { spell_id });
-                }
-            }
-        }
     }
+}
+
+/// Whether `spell_id`'s record passes `pick`. A spell with no record is spared: both of the move
+/// cancel's tests leave on a null record (`0x51511a`, `0x515171`; `Script::Jump`'s `0x513c34`,
+/// `0x513c8c`).
+fn record_flags(
+    spells: &Option<Res<Spells>>,
+    pick: fn(&benilla_formats::SpellDisplay) -> bool,
+    spell_id: u32,
+) -> bool {
+    spells
+        .as_ref()
+        .and_then(|s| s.catalog.get(spell_id))
+        .is_some_and(pick)
 }
 
 #[cfg(test)]

@@ -52,8 +52,6 @@ pub(crate) enum Held {
         item_flags: Option<u32>,
         item: Option<u64>,
     },
-    /// The spell whose cursor the arm raises next ([`SpellTargeting::enter_as`]).
-    Cursor,
 }
 
 /// The in-flight slot, the record's caster word and the targeting word as the two reporters reach
@@ -105,7 +103,6 @@ impl CastCore<'_> {
                 self.queued_melee.push(strike, None);
                 self.pending.push_cast(spell_id, item_flags, item);
             }
-            Held::Cursor => self.queued_melee.push(strike, None),
         }
         self.reports.changed();
     }
@@ -213,14 +210,17 @@ impl CastCore<'_> {
     }
 
     /// The merge's range refusal re-arms the cursor as its attempt left it
-    /// ([`super::targeting`]'s `merge`, a deviation): the word, the caster, and its spell over
-    /// whatever the cancel's pop restored when the attempt had pushed it, unsignalled.
+    /// ([`super::targeting`]'s `merge`, a deviation): the word, the cursor mode as it stood
+    /// (`shown`, off for a held spell), the caster, and its spell over whatever the cancel's pop
+    /// restored when the attempt had pushed it, unsignalled. The record's mask is the one the
+    /// refused bind's restore puts back (`0x6e609d`).
     pub(crate) fn rearm_cursor(
         &mut self,
         spell_id: u32,
         commit: super::CastCommit,
         word: u16,
         in_slot: bool,
+        shown: bool,
     ) {
         if in_slot {
             let strike = match self.slot() {
@@ -230,7 +230,12 @@ impl CastCore<'_> {
             self.queued_melee.push(strike, None);
         }
         self.ground.enter_as(spell_id, commit, word, in_slot);
+        if !shown {
+            self.ground.hide();
+        }
+        let mask = self.pending.record_mask();
         self.pending.fill_record();
+        self.pending.restore_mask(mask);
         self.pending.fill_record_item(commit.item_guid());
     }
 
@@ -244,14 +249,28 @@ impl CastCore<'_> {
         true
     }
 
-    /// `CancelQueuedCast 0x6e6f30`, StopAttack's tail: a strike in the slot is cancelled as
-    /// `SpellStopCasting` cancels (`0x6e6f68`, `0x6e4940(0, 1, 0x1c)`); then a strike in the save
-    /// goes on the wire by itself and leaves it, unsignalled (`0x6e6f9d`-`0x6e701a`: a strike's
-    /// save holds no item guid, so it sends).
+    /// `CancelQueuedCast 0x6e6f30`, StopAttack's tail, for a test with nobody to signal between
+    /// its legs: [`Self::cancel_queued_slot`], then [`Self::cancel_queued_save`].
+    #[cfg(test)]
     pub(crate) fn cancel_queued(&mut self) {
-        if let Some(Inflight::Strike(_)) = self.slot() {
+        self.cancel_queued_slot();
+        self.cancel_queued_save();
+    }
+
+    /// `0x6e6f30`'s first leg: a strike in the slot is cancelled as `SpellStopCasting` cancels
+    /// (`0x6e6f68`, `0x6e4940(0, 1, 0x1c)`), which signals. Whether it cancelled one.
+    pub(crate) fn cancel_queued_slot(&mut self) -> bool {
+        let strike = matches!(self.slot(), Some(Inflight::Strike(_)));
+        if strike {
             self.cancel(false, true, REASON_ERROR);
         }
+        strike
+    }
+
+    /// `0x6e6f30`'s second leg, the save read past the first leg's listeners (`0x6e6f6d`): a
+    /// strike in it goes on the wire by itself and leaves it, unsignalled (`0x6e6f9d`-`0x6e701a`:
+    /// a strike's save holds no item guid, so it sends, `0x6e6ff3`).
+    pub(crate) fn cancel_queued_save(&mut self) {
         if let Some(spell_id) = self.queued_melee.take_save() {
             let _ = self.net.0.send(ClientCommand::CancelCast { spell_id });
         }
@@ -261,15 +280,28 @@ impl CastCore<'_> {
     /// `reaches_tail` says the reporter gets to ([`crate::ui_action::report_reaches_pop`]): the
     /// spell in flight is cancelled with its failed flag, sending only for the client's own
     /// refusal (`0x6e2213 sete`); another spell in flight fires nothing (`0x6e2228`), nor does
-    /// "Another action is in progress" (`0x6e2234`); anything else fires the failure's edge.
+    /// "Another action is in progress" (`0x6e2234`); anything else fires the failure's edge. Its
+    /// auto-repeat leg (`0x6e1cd9`-`0x6e1cea`), ahead of the line, reads the key and our unit, so
+    /// each caller runs it first: the ladder's refusals and the failed cast's handler.
     pub(crate) fn report(&mut self, fail: CastFail, from_server: bool, reaches_tail: bool) {
-        let (spell_id, reason) = (fail.spell_id, fail.reason);
+        self.report_line(fail);
+        self.report_tail(fail, from_server, reaches_tail);
+    }
+
+    /// [`Self::report`]'s line (`0x6e1cca`-`0x6e21fc`): `UI_ERROR_MESSAGE` (`0x6e21dd`) and the
+    /// combat log's line (`0x6e21fc`), which signal ahead of the tail.
+    pub(crate) fn report_line(&mut self, fail: CastFail) {
         // The player cleanup's switch, ahead of the line: `NEED_AMMO` triggers Ammunition
         // (`0x6e1cc3`-`0x6e1cca`).
-        if reason == REASON_NEED_AMMO {
+        if fail.reason == REASON_NEED_AMMO {
             self.trigger_tutorial(crate::tutorial::id::AMMUNITION);
         }
         self.reports.refused(fail);
+    }
+
+    /// [`Self::report`]'s tail (`0x6e2201`-`0x6e224a`), past its line's signals.
+    pub(crate) fn report_tail(&mut self, fail: CastFail, from_server: bool, reaches_tail: bool) {
+        let (spell_id, reason) = (fail.spell_id, fail.reason);
         if !reaches_tail {
             return;
         }
@@ -321,11 +353,6 @@ impl CastSlots<'_> {
     /// The tutorial bank, for the attack seams' other sites (`0x4b5390`).
     pub(crate) fn tutorials(&self) -> Option<&crate::tutorial::Tutorials> {
         self.tutorials.as_deref()
-    }
-
-    /// How many cast reports are queued, for a step that asks whether it reported.
-    pub(crate) fn reports_queued(&self) -> usize {
-        self.reports.len()
     }
 }
 

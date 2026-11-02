@@ -91,6 +91,14 @@ pub(crate) struct DeathNet {
 }
 
 impl DeathNet {
+    /// The teardown's free of the offer's name callback (`0x5e7d02`, `0x55f990`): the offer stays,
+    /// and no answer shows it.
+    pub(crate) fn free_store_callbacks(&mut self) {
+        if let Some(offer) = self.resurrect.as_mut() {
+            offer.waits_name = false;
+        }
+    }
+
     /// Our own death's timer, by `PLAYER_FIELD_BYTES` bit 0x8 as the death finds it (`0x5e9a27`):
     /// armed at `now` plus the window when set, else off.
     pub(crate) fn arm_release(&mut self, timer_bit: bool, now: f64) {
@@ -109,12 +117,9 @@ impl DeathNet {
 }
 
 /// The interface's death globals beside the stores, world-scoped and cleared at the session's end:
-/// the body's last state, which the corpse asks' edges compare, and the corpse-range latch. A
-/// `/reload` keeps both.
+/// the corpse-range latch. A `/reload` keeps it.
 #[derive(Resource, Default)]
 pub(crate) struct DeathLatches {
-    /// The last `(guid, dead, ghost)` the self body showed.
-    mirror: Option<(u64, bool, bool)>,
     /// The corpse-range latch `[0xb4e324]`: whether the last verdict signalled was in range
     /// (`0x4920f0`), which the cascade's corpse step zeroes into whichever VM is live.
     corpse_in_range: bool,
@@ -276,10 +281,10 @@ impl crate::script_calls::live::LiveFamily for DeathView<'_, '_> {
     }
 }
 
-/// What the corpse poll reads and writes beside the host: the self body and the session, the
-/// death stores, the latches and the map shown.
+/// What the corpse poll reads and writes beside the host: the self body's place and the session,
+/// the death stores, the latches and the map shown.
 type CorpsePoll = (
-    Query<'static, 'static, (&'static ObjectStore, &'static Transform), With<SelfPlayer>>,
+    Query<'static, 'static, &'static Transform, With<SelfPlayer>>,
     Res<'static, SelfGuid>,
     Res<'static, crate::net::NetStatus>,
     Res<'static, DeathNet>,
@@ -288,11 +293,11 @@ type CorpsePoll = (
 );
 
 /// `CheckCorpseRange 0x492130`, which the world frame's update runs every frame after its pick
-/// (`0x4818c5`, in `0x481790`'s unconditional tail): a ghost on the map shown within 40 yards of
-/// the cached corpse is in range (`0x492196`), and `SetCorpseInRange` signals a change in place
-/// ([`DeathLatches::set_in_range`]). Ahead of it, the corpse asks of the ghost bit's edges, which
-/// a `/reload` must not repeat.
-pub(crate) fn poll_corpse(mut vm: crate::script_calls::VmWith<CorpsePoll>, net: Res<NetCommands>) {
+/// (`0x4818c5`, in `0x481790`'s unconditional tail): the active player on the map shown within 40
+/// yards of the cached corpse is in range (`0x492196`), and `SetCorpseInRange` signals a change in
+/// place ([`DeathLatches::set_in_range`]). The cache holds a corpse only for a ghost: an answer is
+/// stored for one alone, and the ghost bit's edges reset it ([`reset_corpse`]).
+pub(crate) fn poll_corpse(mut vm: crate::script_calls::VmWith<CorpsePoll>) {
     let signal = {
         let (self_q, self_guid, status, death_net, mut latches, map) = vm.own();
         // A disconnect keeps the self avatar with its frozen descriptor; only a live session's
@@ -300,45 +305,24 @@ pub(crate) fn poll_corpse(mut vm: crate::script_calls::VmWith<CorpsePoll>, net: 
         let body = self_guid
             .0
             .filter(|_| status.connected)
-            .and_then(|guid| Some((guid, self_q.single().ok()?)));
-        let Some((guid, (store, self_t))) = body else {
+            .and_then(|_| self_q.single().ok());
+        let Some(self_t) = body else {
             return;
         };
-        let dead = store.0.unit_is_dead();
-        let ghost = store.0.player_is_ghost();
-        let prev = latches.mirror.filter(|&(g, ..)| g == guid);
-        latches.mirror = Some((guid, dead, ghost));
-        match (prev, dead, ghost) {
-            // Dead to ghost (released): ask where the corpse is.
-            (Some((_, true, false)), _, true) => {
-                let _ = net.0.send(ClientCommand::CorpseQuery);
-            }
-            // Ghost to alive: reclaim, spirit healer or an accepted res.
-            (Some((_, _, true)), false, false) => {
-                // The not-found answer drops the map markers. The reference sends nothing on this
-                // edge: its ghost-bit watcher (`0x5ee990`) clears the corpse cache, and `0x491f50`
-                // queries only while a ghost. The server's own push needs a looter
-                // (`Map.cpp:3617-3629`).
-                let _ = net.0.send(ClientCommand::CorpseQuery);
-            }
-            _ => {}
-        }
         // Against the query's display position; the coordinate transform is isometric, so the
-        // Bevy-space compare is in yards. The ghost test stands in for the ghost flag's clear of
-        // the corpse cache, which is not built (`0x5eeac1` → `0x491f50`, #392).
+        // Bevy-space compare is in yards.
         let corpse = death_net.corpse.as_ref();
-        let in_range = ghost
-            && corpse.is_some_and(|cp| {
-                // Deviation: `0x492130` compares the positions whatever map we stand on, so a
-                // ghost on another map at the corpse's coordinates reads in range for a reclaim
-                // the server refuses; here only the corpse's display map counts.
-                let on_display_map = map
-                    .as_ref()
-                    .is_some_and(|m| m.0 == u32::try_from(cp.display_map).unwrap_or(u32::MAX));
-                on_display_map
-                    && wow_to_bevy(cp.position).distance_squared(self_t.translation)
-                        <= CORPSE_RANGE_SQ
-            });
+        let in_range = corpse.is_some_and(|cp| {
+            // Deviation: `0x492130` compares the positions whatever map we stand on, so a
+            // ghost on another map at the corpse's coordinates reads in range for a reclaim the
+            // server refuses; here only the corpse's display map counts because the server refuses
+            // that reclaim.
+            let on_display_map = map
+                .as_ref()
+                .is_some_and(|m| m.0 == u32::try_from(cp.display_map).unwrap_or(u32::MAX));
+            on_display_map
+                && wow_to_bevy(cp.position).distance_squared(self_t.translation) <= CORPSE_RANGE_SQ
+        });
         latches.set_in_range(in_range, corpse)
     };
     if let Some(signal) = signal {
@@ -417,21 +401,37 @@ type CorpseStores = (
     Option<ResMut<'static, DeathLatches>>,
 );
 
-/// `QueryCorpse 0x491f50` in the world-enter cascade (`0x490a28`), after its other sends: the
-/// corpse cache reset (`0x491f74` → `0x492010(-1, …)`), the range latch zeroed (`0x491f7b` →
-/// `0x4920f0(0)`), which signals `CORPSE_OUT_OF_RANGE` from a set latch, then, for a ghost
-/// (`PLAYER_FLAGS` bit 4, `0x491fad`), `MSG_CORPSE_QUERY` (`0x491fb2`). The flags watcher's
-/// release and revive asks are [`poll_corpse`]'s.
+/// `QueryCorpse 0x491f50`'s head: the corpse cache reset (`0x491f74` → `0x492010(-1, …)`) and the
+/// range latch zeroed (`0x491f7b` → `0x4920f0(0)`). Whether the latch was set, so its caller
+/// signals `CORPSE_OUT_OF_RANGE` (`0x49211f`) in place, ahead of [`ask_corpse`].
+pub(crate) fn reset_corpse(
+    death_net: Option<&mut DeathNet>,
+    latches: Option<&mut DeathLatches>,
+) -> bool {
+    if let Some(death_net) = death_net {
+        death_net.corpse = None;
+    }
+    latches.is_some_and(|latches| std::mem::take(&mut latches.corpse_in_range))
+}
+
+/// `QueryCorpse 0x491f50`'s tail: `MSG_CORPSE_QUERY` (`0x491fb2`-`0x491fdf`) while the active
+/// player is a ghost (`PLAYER_FLAGS` bit 4, `0x491fa1`-`0x491fb0`), nothing otherwise.
+pub(crate) fn ask_corpse(ghost: bool, net: &NetCommands) {
+    if ghost {
+        let _ = net.0.send(ClientCommand::CorpseQuery);
+    }
+}
+
+/// `QueryCorpse 0x491f50` in the world-enter cascade (`0x490a28`), after its other sends
+/// ([`reset_corpse`], [`ask_corpse`]). The flags watcher's run on the ghost bit's edges is the
+/// update packet's (`0x5eeac1`, [`crate::field_watch::FieldNotice::QueryCorpse`]).
 pub(crate) fn query_corpse_on_world_enter(
     self_q: Query<&ObjectStore, With<SelfPlayer>>,
     mut vm: crate::script_calls::VmWith<CorpseStores>,
     net: Res<NetCommands>,
 ) {
-    let (death_net, feed) = vm.own();
-    if let Some(mut death_net) = death_net {
-        death_net.corpse = None;
-    }
-    let was_in = feed.is_some_and(|mut latches| std::mem::take(&mut latches.corpse_in_range));
+    let (mut death_net, mut latches) = vm.own();
+    let was_in = reset_corpse(death_net.as_deref_mut(), latches.as_deref_mut());
     if was_in {
         vm.run(|script| {
             if let Some(script) = script {
@@ -439,9 +439,10 @@ pub(crate) fn query_corpse_on_world_enter(
             }
         });
     }
-    if self_q.single().is_ok_and(|store| store.0.player_is_ghost()) {
-        let _ = net.0.send(ClientCommand::CorpseQuery);
-    }
+    ask_corpse(
+        self_q.single().is_ok_and(|store| store.0.player_is_ghost()),
+        &net,
+    );
 }
 
 /// The world-enter cascade's last test (`0x490a2d`-`0x490a38`): with our health 0 or less it
@@ -659,9 +660,11 @@ impl DeathSteps<'_, '_> {
                     send(&self.net, ClientCommand::AreaSpiritHealerQueue { healer });
                 }
             }
+            // The host runs the use past the cancel's listeners ([`Self::soulstone_head`]); a
+            // harness with no host runs it here.
             DeathAction::UseSoulstone { .. } => {
-                if let Some(store) = store {
-                    self.use_soulstone(script, &store);
+                if let Some(stone) = self.soulstone_head() {
+                    self.soulstone_use(script, stone);
                 }
             }
         }
@@ -706,17 +709,17 @@ impl DeathSteps<'_, '_> {
         }
     }
 
-    /// `UseSoulstone()` (`0x48ad70`), with no health test: with `PLAYER_SELF_RES_SPELL` set,
-    /// `CMSG_SELF_RES` (`0x48adb6`, `0x48ae05`); else the carried item (`0x5ed630`), the cast
-    /// cancelled before its use (`0x48ae6b` into `0x6e4940`, cl=1, dl=1, reason `0x1c`), then an
-    /// ordinary item use, `0x5d8d00` (`0x48ae7d`), like every bag click: a locked stone is refused
-    /// at its first gate (`0x5d8d32`), after the cancel. Nothing is cleared here: the server zeroes
-    /// the field.
-    fn use_soulstone(&mut self, script: &mut UiScript, store: &benilla_protocol::ObjectFields) {
+    /// `UseSoulstone()` (`0x48ad70`) up to its use, with no health test: with
+    /// `PLAYER_SELF_RES_SPELL` set, `CMSG_SELF_RES` (`0x48adb6`, `0x48ae05`); else the carried item
+    /// (`0x5ed630`) and the cast cancelled before its use (`0x48ae6b` into `0x6e4940`, cl=1, dl=1,
+    /// reason `0x1c`), whose signals' listeners a caller runs before [`Self::soulstone_use`].
+    /// Nothing is cleared here: the server zeroes the field.
+    pub(crate) fn soulstone_head(&mut self) -> Option<SoulstoneUse> {
+        let store = self.targeting.self_store.single().ok()?.0.clone();
         let res = {
             let ladder = self.cast.p0();
             self_res(
-                store,
+                &store,
                 &ladder.objects,
                 &ladder.items,
                 ladder.spells.as_deref(),
@@ -733,11 +736,28 @@ impl DeathSteps<'_, '_> {
             if res.is_some() {
                 let _ = self.net.0.send(ClientCommand::SelfRes);
             }
-            return;
+            return None;
         };
         // Its failed flag disarms the trade-skill repeat on every branch (`0x6e4abc`-`0x6e4ac2`
         // into `0x4fd790`), queued with its event.
         self.cast.p1().abort_cast();
+        Some(SoulstoneUse {
+            bag_index,
+            slot,
+            guid,
+            entry,
+        })
+    }
+
+    /// `UseSoulstone()` past its cancel: an ordinary item use, `0x5d8d00` (`0x48ae7d`), like every
+    /// bag click, a locked stone refused at its first gate (`0x5d8d32`).
+    pub(crate) fn soulstone_use(&mut self, script: &mut UiScript, stone: SoulstoneUse) {
+        let SoulstoneUse {
+            bag_index,
+            slot,
+            guid,
+            entry,
+        } = stone;
         if crate::ui_items::item_use_refused(script, Some(guid)) {
             debug!("death: soulstone {guid:#x} is locked — refused");
             return;
@@ -768,6 +788,14 @@ impl DeathSteps<'_, '_> {
             &self.ui_errors,
         );
     }
+}
+
+/// The carried soulstone `UseSoulstone` uses past its cast cancel ([`DeathSteps::soulstone_head`]).
+pub(crate) struct SoulstoneUse {
+    bag_index: u8,
+    slot: u8,
+    guid: u64,
+    entry: u32,
 }
 
 /// `SpiritHealerDialog 0x5df730(npc)` asking: for a ghost (`PLAYER_FLAGS` bit 0x10, `0x5df74a`),
@@ -1143,6 +1171,41 @@ mod tests {
         );
     }
 
+    /// The item leg's cancel signals (`0x48ae6b` into `0x6e4940`) before the stone's use
+    /// (`0x48ae7d`), so its `SPELLCAST_FAILED` listener's packet goes between the cancel's and the
+    /// use's.
+    #[test]
+    fn the_soulstones_cancel_listener_sends_ahead_of_its_use() {
+        let (mut app, rx) = soulstone_app();
+        let world = app.world_mut();
+        let mut pending = world.resource_mut::<crate::spell::PendingCast>();
+        pending.fill_record();
+        pending.push(FIREBALL, None, std::time::Instant::now());
+        crate::script_calls::with_hosted_vm(app.world_mut(), |vm| {
+            vm.expect("a VM").run(
+                r#"local r = CreateFrame("Frame")
+                r:RegisterEvent("SPELLCAST_FAILED")
+                r:SetScript("OnEvent", function() RandomRoll(1, 2) end)"#,
+            )
+        })
+        .unwrap();
+        let _ = rx.try_iter().count();
+        press_soulstone(&mut app);
+        let sent: Vec<&str> = rx
+            .try_iter()
+            .filter_map(|c| match c {
+                ClientCommand::CancelCast { .. } => Some("cancel"),
+                ClientCommand::RandomRoll { .. } => Some("roll"),
+                // The stone's template starts a quest, so its use is the offer's query.
+                ClientCommand::UseItem { .. } | ClientCommand::QuestgiverQuery { .. } => {
+                    Some("use")
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sent, ["cancel", "roll", "use"]);
+    }
+
     /// A pending targeting spell is dropped in place of a cast (`0x6e4955`): no
     /// `CMSG_CANCEL_CAST`, the cursor down, and the use still goes out.
     #[test]
@@ -1348,14 +1411,13 @@ mod tests {
         );
     }
 
-    /// A `/reload` keeps the body's mirror, so it re-sends no corpse ask; a relog must clear it.
-    /// A `/logout` is a session edge although `session_over` is false for it.
+    /// The session's end clears the range latch, so a relog starts out of range. A `/logout` is a
+    /// session edge although `session_over` is false for it.
     #[test]
     fn the_session_edge_clears_the_world_scoped_death_memory() {
         let mut world = World::new();
         world.init_resource::<DeathNet>();
         world.insert_resource(DeathLatches {
-            mirror: Some((0x1234, true, true)),
             corpse_in_range: true,
         });
         world
@@ -1368,10 +1430,7 @@ mod tests {
             )
             .expect("the teardown runs");
         let latches = world.resource::<DeathLatches>();
-        assert!(
-            latches.mirror.is_none() && !latches.corpse_in_range,
-            "a relog must find no mirror, or the login-while-ghost arm cannot fire"
-        );
+        assert!(!latches.corpse_in_range, "a relog starts out of range");
     }
 
     /// `PLAYER_FIELD_BYTES`, whose bit 0x8 our own death's timer reads (`0x5e9a27`).

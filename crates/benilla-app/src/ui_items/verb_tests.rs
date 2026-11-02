@@ -437,6 +437,50 @@ fn the_bind_answers_act_inside_their_calls() {
     assert_eq!(h.sent(), Vec::<String>::new(), "a cancel sends nothing");
 }
 
+/// `CancelPendingEquip` frees its record only after each end's `ITEM_LOCK_CHANGED` listeners ran
+/// (`0x5e1ca5`, `0x5e1d04`, then `0x5e1d09`): a listener that cancels the same index again finds
+/// it filed and releases both ends itself, and the outer cancel's second end, read from the table
+/// the listener freed (`0x5e1caa`), releases nothing more. Three signals.
+#[test]
+fn a_cancels_lock_listener_finds_its_record_still_filed() {
+    let mut h = Bags::new();
+    h.run("PickupContainerItem(0, 7) PickupInventoryItem(1)");
+    h.run(
+        r#"LOCKS = 0
+        local f = CreateFrame("Frame") f:RegisterEvent("ITEM_LOCK_CHANGED")
+        f:SetScript("OnEvent", function()
+            LOCKS = LOCKS + 1
+            if not AGAIN then AGAIN = 1 CancelPendingEquip(0) end
+        end)"#,
+    );
+    h.run("CancelPendingEquip(0)");
+    assert_eq!(h.eval::<i64>("return LOCKS"), 3);
+}
+
+/// `EquipPendingItem` frees its record after its replay's listeners ran (`0x5e1c46`, then
+/// `0x5e1d09`): one that accepts the same index again finds it filed and replays the swap again.
+#[test]
+fn an_accepts_listener_finds_its_record_still_filed() {
+    let mut h = Bags::new();
+    h.run("PickupContainerItem(0, 7) PickupInventoryItem(1)");
+    h.run(
+        r#"local f = CreateFrame("Frame") f:RegisterAllEvents()
+        f:SetScript("OnEvent", function()
+            if not AGAIN then AGAIN = 1 EquipPendingItem(0) end
+        end)"#,
+    );
+    let _ = h.sent();
+    h.run("EquipPendingItem(0)");
+    let swap = format!(
+        "{:?}",
+        ClientCommand::SwapInvItem {
+            src_slot: 29,
+            dst_slot: 0
+        }
+    );
+    assert_eq!(h.sent(), [swap.clone(), swap]);
+}
+
 /// An accepted pending swap sends `CMSG_SWAP_INV_ITEM` (`0x5e0fdb`) and only then clears the
 /// cursor (`0x5e0fe7`), so the clear's handlers send after the packet. The send is handed over in
 /// place, so the census counts no send made while a handler waits.
@@ -885,6 +929,76 @@ fn the_bind_on_use_accept_uses_the_item_inside_its_call() {
             .iter()
             .any(|c| c.starts_with("UseItem {")),
         "{sent:?}"
+    );
+}
+
+/// A worn use item with no durability left is refused (`0x5d9005`-`0x5d9027`) and sends nothing;
+/// with any left it casts.
+#[test]
+fn a_broken_worn_use_item_sends_nothing() {
+    /// Goblin Rocket Boots, doll slot 8 (wire 7).
+    const BOOTS: u32 = 7189;
+    const R: u64 = 0x4000_0000_0000_0A30;
+    let mut h = Bags::new();
+    let world = h.app.world_mut();
+    world.resource_mut::<crate::net::SelfGuid>().0 = Some(ME);
+    let me = world
+        .query_filtered::<Entity, With<SelfPlayer>>()
+        .single(world)
+        .expect("our own player");
+    world
+        .entity_mut(me)
+        .insert(ObjectStore(ObjectFields::from_pairs(&[
+            (22, 100),
+            (F_INV_SLOT_HEAD + 14, R as u32),
+            (F_INV_SLOT_HEAD + 15, (R >> 32) as u32),
+        ])));
+    // Fields 8 `ITEM_FIELD_CONTAINED`, 46 durability, 47 its maximum.
+    let boots = |durability: u32| {
+        ObjectFields::from_pairs(&[
+            (F_TYPE, 0x3),
+            (FIELD_OBJECT_ENTRY, BOOTS),
+            (8, ME as u32),
+            (9, 0),
+            (14, 1),
+            (46, durability),
+            (47, 50),
+        ])
+    };
+    let worn = test_spawn_item(world, R, boots(0), false);
+    world.resource_mut::<Items>().insert_template(
+        BOOTS,
+        Some(ItemInfo {
+            inventory_type: 8,
+            spells: vec![benilla_protocol::messages::ItemSpellEntry {
+                index: 0,
+                spell_id: 4321,
+                trigger: 0,
+                charges: 0,
+                cooldown_ms: -1,
+                category: 0,
+                category_cooldown_ms: -1,
+            }],
+            use_spell: Some(benilla_protocol::messages::ItemUseSpell {
+                spell_id: 4321,
+                cooldown_ms: -1,
+                category: 0,
+                category_cooldown_ms: -1,
+            }),
+            ..test_template("Goblin Rocket Boots")
+        }),
+    );
+
+    assert_eq!(h.verb("", "UseInventoryItem(8)"), [roll()], "refused");
+
+    h.app
+        .world_mut()
+        .entity_mut(worn)
+        .insert(ObjectStore(boots(1)));
+    let sent = h.verb("", "UseInventoryItem(8)");
+    assert!(
+        sent.iter().any(|c| c.starts_with("UseItem {")),
+        "one point left: {sent:?}"
     );
 }
 

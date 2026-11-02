@@ -134,11 +134,12 @@ impl AttackStopInFlight {
 
 /// The local player's auto-repeat is armed: the reference's `[+0xd58] & 0x200`, set only by the
 /// local cast-send (`0x6e593b`); with the ranged sheath drawn a standing unit idles on the Load
-/// clip (`0x5fd460`). Cleared only through `cancel_auto_repeat_local`: on the selection's death
-/// (`0x605906`) and on `SMSG_CANCEL_AUTO_REPEAT`, which vmangos sends when a volley's target dies
-/// (`SpellCaster.cpp:1829`). A remote shooter plays LoadBow once at its `SMSG_SPELL_START`
-/// (`CastHold`, `0x6e7901`), then the fire clip per GO; the reference holds HoldBow (109) from
-/// the end of the Load until the first GO.
+/// clip (`0x5fd460`). Cleared by the stop `cancel_auto_repeat_local` (`0x6ea113`), whichever of
+/// its callers runs it, `SMSG_CANCEL_AUTO_REPEAT` among them, which vmangos sends when a volley's
+/// target dies (`SpellCaster.cpp:1829`). Not built: the reference's other clear, a cast result of
+/// 0x2f or 0x30 for any spell (`0x6e1e45`). A remote shooter plays LoadBow once at its
+/// `SMSG_SPELL_START` (`CastHold`, `0x6e7901`), then the fire clip per GO; the reference holds
+/// HoldBow (109) from the end of the Load until the first GO.
 #[derive(Component)]
 pub(crate) struct AutoRepeatArmed;
 
@@ -204,13 +205,22 @@ pub(crate) fn cancel_auto_repeat_local(
     core.reports.auto_repeat(false);
 }
 
-/// The local StopAttack, reference `0x5ecac0`: when attacking, `CMSG_ATTACKSTOP` (`0x624370`),
-/// then `CancelQueuedCast` (`0x6e6f30`, [`crate::spell::CastCore::cancel_queued`]), which cancels
-/// a queued on-next-swing spell with `CMSG_CANCEL_CAST`: in the slot, as Esc does, with its pop's
-/// signal and `SPELLCAST_STOP`; in the save under a cast, by the packet alone, which is why Auto
-/// Shot (`0x6e5976`) darkens a Raptor Strike ring. `Engaged` stays until the `SMSG_ATTACKSTOP` echo
-/// (`0x624e40`), as in the reference. The send marks `me`'s stop in flight in `word`
-/// (`0x6243b2`). Ahead of the send, `low`'s Food and Drink tutorials (`0x5ecb17`, `0x5ecb54`).
+/// The reach test of our landed swing (`0x5ea880`-`0x5ea8a4`): the squared 3D distance between
+/// the two units' positions against `(4 * max(r1 + r2 + 4/3, 5))^2`, `reach` being the melee reach
+/// `max(...)` ([`crate::target::cursor_mode::melee_reach`]). At or beyond it, `SendAttackStop`
+/// (`0x5ea8a8`); a NaN distance does not stop (`0x5ea8a4` jp).
+fn swing_beyond_stop_reach(dist_sq: f32, reach: f32) -> bool {
+    let limit = reach * 4.0;
+    dist_sq >= limit * limit
+}
+
+/// The local StopAttack, reference `0x5ecac0`, for a caller with nobody to signal between its
+/// steps: [`stop_attack_head`], [`stop_attack_send`], then the save's leg of `CancelQueuedCast`
+/// ([`crate::spell::CastCore::cancel_queued_save`]). A queued on-next-swing spell is cancelled
+/// with `CMSG_CANCEL_CAST`: in the slot, as Esc does, with its pop's signal and `SPELLCAST_STOP`;
+/// in the save under a cast, by the packet alone, which is why Auto Shot (`0x6e5976`) darkens a
+/// Raptor Strike ring. `Engaged` stays until the `SMSG_ATTACKSTOP` echo (`0x624e40`), as in the
+/// reference.
 pub(crate) fn stop_attack_local(
     me: Option<Entity>,
     low: crate::tutorial::LowVitals,
@@ -218,20 +228,50 @@ pub(crate) fn stop_attack_local(
     word: &mut AttackStopInFlight,
     core: &mut crate::spell::CastCore,
 ) {
-    // The reference's `!IsAttacking(0x60ecb0) && [+0xc50] == 0` early-out: nothing sent, a queued
-    // strike survives. `[+0xc50]` is set only beside `[+0xc48]` (`0x47bf70`), so the attack
-    // target as the queue leaves it answers both.
-    if !me.is_some_and(|me| edits.attacking(me)) {
-        return;
+    if let Some(tail) = stop_attack_head(me, low, edits, core) {
+        stop_attack_send(tail, word, core);
+        core.cancel_queued_save();
     }
+}
+
+/// StopAttack's head (`0x5ecac0`-`0x5ecb54`): the reference's `!IsAttacking(0x60ecb0) &&
+/// [+0xc50] == 0` early-out, which sends nothing and leaves a queued strike, then `low`'s Food and
+/// Drink tutorials (`0x5ecb17`, `0x5ecb54`), whose `TUTORIAL_TRIGGER` signals before the send.
+/// What follows, when it goes on ([`stop_attack_send`]).
+pub(crate) fn stop_attack_head(
+    me: Option<Entity>,
+    low: crate::tutorial::LowVitals,
+    edits: &UnitEdits,
+    core: &mut crate::spell::CastCore,
+) -> Option<StopTail> {
+    // `[+0xc50]` is set only beside `[+0xc48]` (`0x47bf70`), so the attack target as the queue
+    // leaves it answers both.
+    let me = me.filter(|&me| edits.attacking(me))?;
     for id in low.tutorials() {
         core.trigger_tutorial(id);
     }
+    Some(StopTail { me })
+}
+
+/// What StopAttack does past its tutorials ([`stop_attack_head`]).
+#[must_use]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StopTail {
+    me: Entity,
+}
+
+/// StopAttack past its tutorials: `CMSG_ATTACKSTOP` (`0x5ecb5b` → `0x624370`), which marks
+/// `me`'s stop in flight in `word` (`0x6243b2`), then `CancelQueuedCast`'s first leg (`0x5ecb63`
+/// → `0x6e6f30`, [`crate::spell::CastCore::cancel_queued_slot`]), whose cancel signals before the
+/// save's leg. Whether that cancel ran.
+pub(crate) fn stop_attack_send(
+    tail: StopTail,
+    word: &mut AttackStopInFlight,
+    core: &mut crate::spell::CastCore,
+) -> bool {
     let _ = core.net.0.send(crate::net::ClientCommand::AttackStop);
-    if let Some(me) = me {
-        word.set(me);
-    }
-    core.cancel_queued();
+    word.set(tail.me);
+    core.cancel_queued_slot()
 }
 
 /// What StartAttack (`0x5ecb70`) reads of the active player before it does anything: the pacified
@@ -306,8 +346,8 @@ pub(crate) fn start_attack_local(
     spells: Option<&crate::ui_action::Spells>,
     core: &mut crate::spell::CastCore,
 ) {
-    if start_attack_head(entity, verdict, gate, stop_word, stand, edits, spells, core) {
-        start_attack_tail(
+    match start_attack_head(entity, verdict, gate, stand, edits, spells, core) {
+        StartHead::Go => start_attack_tail(
             entity,
             target,
             stop_word,
@@ -316,34 +356,52 @@ pub(crate) fn start_attack_local(
             edits,
             spells,
             core,
-        );
+        ),
+        StartHead::Stop(tail) => {
+            stop_attack_send(tail, stop_word, core);
+            core.cancel_queued_save();
+        }
+        StartHead::Returned => {}
     }
+}
+
+/// How StartAttack's head ends ([`start_attack_head`]).
+#[must_use]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StartHead {
+    /// It goes on to its select (`0x5ecca0`-`0x5eccaa`) and [`start_attack_tail`].
+    Go,
+    /// It returned with nothing stopped.
+    Returned,
+    /// A refused target's StopAttack (`0x5ecc48`) ran its head, its tutorials queued; what
+    /// follows ([`stop_attack_send`], then the save's leg), past their listeners, and StartAttack
+    /// returns (`0x5ecc53`).
+    Stop(StopTail),
 }
 
 /// StartAttack up to its select (`0x5ecb70`-`0x5ecc9b`): it returns first when
 /// [`StartGate::refuses`] or the target is [`StartTarget::Unheld`]; a [`StartTarget::Refused`]
-/// target stops a running attack and returns. Then it reads the caster's precast, cancelling the
-/// cast in flight for a ranged one, and stands a seated player. Whether it goes on to its select
-/// (`0x5ecca0`-`0x5eccaa`) and [`start_attack_tail`]. The player's own legs of the attack test
-/// (`0x605f30`, mounted at `0x5ecc06`) are the callers'.
+/// target stops a running attack and returns, its StopAttack's head run here
+/// ([`StartHead::Stop`]). Then it reads the caster's precast, cancelling the cast in flight for a
+/// ranged one, and stands a seated player. The player's own legs of the attack test (`0x605f30`,
+/// mounted at `0x5ecc06`) are the callers'.
 pub(crate) fn start_attack_head(
     entity: Entity,
     verdict: StartTarget,
     gate: StartGate,
-    stop_word: &mut AttackStopInFlight,
     stand: &mut MessageWriter<crate::player::StandStateRequest>,
     edits: &UnitEdits,
     spells: Option<&crate::ui_action::Spells>,
     core: &mut crate::spell::CastCore,
-) -> bool {
+) -> StartHead {
     if gate.refuses() {
-        return false;
+        return StartHead::Returned;
     }
     match verdict {
-        StartTarget::Unheld => return false,
+        StartTarget::Unheld => return StartHead::Returned,
         StartTarget::Refused => {
-            stop_attack_local(Some(entity), gate.low, edits, stop_word, core);
-            return false;
+            return stop_attack_head(Some(entity), gate.low, edits, core)
+                .map_or(StartHead::Returned, StartHead::Stop);
         }
         StartTarget::Attackable => {}
     }
@@ -376,7 +434,7 @@ pub(crate) fn start_attack_head(
             stand,
         );
     }
-    true
+    StartHead::Go
 }
 
 /// StartAttack past its select (`0x5eccaf` on): a precast that auto-attack interrupts returns;
@@ -453,6 +511,8 @@ pub(crate) struct AttackSeam<'w, 's> {
     pub(crate) loot: ResMut<'w, crate::ui_loot::LootState>,
     /// The loot latch: the teardown's close drops it, and the right-click loot legs arm it.
     pub(crate) loot_latch: ResMut<'w, crate::ui_loot::LootLatch>,
+    /// The record fetches the close's teardown cancels; absent in a harness without the cache.
+    items: Option<Res<'w, crate::items::Items>>,
     /// Our stop in flight (`[+0xc54]`), which StopAttack's send sets and StartAttack reads.
     stop_word: ResMut<'w, AttackStopInFlight>,
     /// The pet's attack latch, which the selection's release lowers for a possessed unit
@@ -504,7 +564,12 @@ impl AttackSeam<'_, '_> {
     /// `0x48f200(1, 0, 0)`, the close with its release and `dl` clear (`0x493970`, `0x5e9a58`):
     /// [`crate::ui_loot::end_loot_window`].
     pub(crate) fn close_loot(&mut self) {
-        crate::ui_loot::end_loot_window(&mut self.loot, &mut self.loot_latch, &self.net);
+        crate::ui_loot::end_loot_window(
+            &mut self.loot,
+            &mut self.loot_latch,
+            &self.net,
+            self.items.as_deref(),
+        );
     }
 
     /// The selection release's pet leg (`0x493910`): `0x5ee5a0` asked of the player
@@ -529,25 +594,31 @@ impl AttackSeam<'_, '_> {
         self.me.single().is_ok_and(|me| self.edits.attacking(me))
     }
 
-    /// StopAttack (`0x5ecac0`).
+    /// StopAttack (`0x5ecac0`), with nobody to signal between its steps.
     pub(crate) fn stop(&mut self) {
-        let me = self.me.single().ok();
-        stop_attack_local(
-            me,
-            self.start_gate().low,
-            &self.edits,
-            &mut self.stop_word,
-            &mut self.slots.core(&self.net),
-        );
+        if let Some(tail) = self.stop_head() {
+            self.stop_send(tail);
+            self.stop_save();
+        }
     }
 
-    /// StopAttack in a selection's release (`0x493a08`): whether its next-swing cancel reported a
-    /// stop (`0x5ecb63` → `0x6e6f30` → `0x6e4940`), whose listeners run there, ahead of the rest
-    /// of the release.
-    pub(crate) fn release_stop(&mut self) -> bool {
-        let queued = self.slots.reports_queued();
-        self.stop();
-        self.slots.reports_queued() > queued
+    /// StopAttack's head ([`stop_attack_head`]): its gate and its tutorials, whose listeners a
+    /// caller runs before [`Self::stop_send`].
+    pub(crate) fn stop_head(&mut self) -> Option<StopTail> {
+        let me = self.me.single().ok();
+        let low = self.start_gate().low;
+        stop_attack_head(me, low, &self.edits, &mut self.slots.core(&self.net))
+    }
+
+    /// StopAttack's send and its next-swing cancel ([`stop_attack_send`]), whose listeners a
+    /// caller runs before [`Self::stop_save`]: whether the cancel ran.
+    pub(crate) fn stop_send(&mut self, tail: StopTail) -> bool {
+        stop_attack_send(tail, &mut self.stop_word, &mut self.slots.core(&self.net))
+    }
+
+    /// StopAttack's last leg, the save's `CMSG_CANCEL_CAST` (`0x6e6ff3`), read where it runs.
+    pub(crate) fn stop_save(&mut self) {
+        self.slots.core(&self.net).cancel_queued_save();
     }
 
     /// `unit`'s stop in flight cleared, as its death zeroes it (`0x6058a8`).
@@ -562,31 +633,39 @@ impl AttackSeam<'_, '_> {
         if self.engaged() && self.start_gate().has_control() {
             self.stop();
         } else {
-            // The validator's final gate passed `target` (`0x613169`).
-            self.start(target, StartTarget::Attackable);
+            // The validator's final gate passed `target` (`0x613169`), so nothing is refused.
+            if self.start_head(StartTarget::Attackable) == StartHead::Go {
+                self.start_tail(target);
+            }
         }
     }
 
     /// StartAttack (`0x5ecb70`) at `target`, which the caller selected already, so its own select
     /// (`0x5eccaa`) is the setter's dedup ([`start_attack_local`]); a no-op before our own entity
-    /// streams in.
-    pub(crate) fn start(&mut self, target: u64, verdict: StartTarget) {
-        if self.start_head(verdict) {
-            self.start_tail(target);
+    /// streams in. A refused target's stop past its head, for the caller to run past its
+    /// tutorials' listeners ([`StartHead::Stop`]).
+    #[must_use]
+    pub(crate) fn start(&mut self, target: u64, verdict: StartTarget) -> Option<StopTail> {
+        match self.start_head(verdict) {
+            StartHead::Go => {
+                self.start_tail(target);
+                None
+            }
+            StartHead::Stop(tail) => Some(tail),
+            StartHead::Returned => None,
         }
     }
 
-    /// StartAttack up to its select ([`start_attack_head`]): whether it goes on.
-    pub(crate) fn start_head(&mut self, verdict: StartTarget) -> bool {
+    /// StartAttack up to its select ([`start_attack_head`]).
+    pub(crate) fn start_head(&mut self, verdict: StartTarget) -> StartHead {
         let Ok(e) = self.me.single() else {
-            return false;
+            return StartHead::Returned;
         };
         let gate = self.start_gate();
         start_attack_head(
             e,
             verdict,
             gate,
-            &mut self.stop_word,
             &mut self.stand,
             &self.edits,
             self.spells.as_deref(),
@@ -641,6 +720,9 @@ pub(crate) struct CastEvent {
     pub(crate) kind: CastEventKind,
     /// `PlaySeq` stamp, carried to the kit's `EmoteAnim`.
     pub(crate) seq: u64,
+    /// The cast packet's place among what the packets queue ([`crate::lanes::stamp`]); `None` for
+    /// an edge the frame raised (a missile's arrival, a probe line), after every packet.
+    pub(crate) at: Option<crate::lanes::Stamp>,
 }
 
 /// Which cast edge fired.
@@ -820,6 +902,9 @@ pub(crate) struct SpellGoTargets {
     pub(crate) ammo_display_id: Option<u32>,
     /// `PlaySeq` stamp, the GO's `CastEvent`'s.
     pub(crate) seq: u64,
+    /// The GO packet's place, its `CastEvent`'s, which its impact kits carry; `None` for a GO the
+    /// frame raised, after every packet.
+    pub(crate) at: Option<crate::lanes::Stamp>,
 }
 
 /// The sheath policy: requests, ceremony overlays, the `AnimationData.dbc` table.
@@ -872,13 +957,14 @@ pub(crate) use precast::install_visuals_for_tests;
 pub(crate) use precast::{end_precast, precast_at_send, Precast, PrecastTail};
 
 /// The melee blood spurt.
-mod blood;
+pub(crate) mod blood;
 mod env_damage;
 pub(crate) mod net;
 pub(crate) mod spell_visual;
 use blood::{blood_spurts, load_blood_tables};
 use env_damage::{hard_landing_dust, load_env_damage_table};
 pub(crate) use env_damage::{EnvDamageTable, HardLanding, HARD_LANDING_DESCENT};
+pub(crate) use spell_visual::DeathStamps;
 use spell_visual::{
     arm_aura_state_fx, arm_level_up_fx, arm_loot_fx, arm_morph_latch, arm_mount_poof_fx,
     load_spell_visuals, replay_morph_kit, route_cast_visuals, MorphLatch,
@@ -887,8 +973,9 @@ use spell_visual::{
 #[cfg(test)]
 pub(crate) use spell_visual::arm_aura_state_fx as arm_aura_state_fx_for_test;
 pub(crate) use spell_visual::{
-    held_strike_sound, ChainProcPlay, FxClass, FxStage, GroundList, KitPush, MissileSpawn,
-    PrecastTables, PrecastVisuals, SpellKitFx, SpellKitShake, SpellKitSound, SpellVisuals,
+    held_strike_sound, replay_rebuilt_kit_sounds, ChainProcPlay, FxClass, FxStage, GroundList,
+    KitPush, MissileSpawn, PrecastTables, PrecastVisuals, SpellKitFx, SpellKitShake, SpellKitSound,
+    SpellVisuals,
 };
 
 /// The per-unit animation state machine; `Transform` is required, its scale divides the rate, and
@@ -962,6 +1049,8 @@ pub(crate) struct AnimDriver {
     /// short kick, its mechanism open: the reference's blend source keeps running, so it stays
     /// scoped to the airborne cut.
     frozen: Option<bevy::animation::graph::AnimationNodeIndex>,
+    /// When the armed Death clip's pass ends, at which the death settles ([`DeathStamps`]).
+    death_end: Option<f32>,
 }
 
 impl AnimDriver {
@@ -1039,6 +1128,7 @@ impl Default for AnimDriver {
             mount_display: 0,
             last_special: None,
             frozen: None,
+            death_end: None,
         }
     }
 }
@@ -1126,6 +1216,9 @@ impl Plugin for CreatureAnimPlugin {
             .add_message::<HardLanding>()
             // The pending-morph latch, the reference's per-unit `[+0xd54]`.
             .init_resource::<MorphLatch>()
+            .init_resource::<DeathStamps>()
+            // `violenceLevel`'s stored word, read by the blood spurt (`0x60a39d`).
+            .init_resource::<blood::ViolenceLevel>()
             .add_systems(
                 Startup,
                 (

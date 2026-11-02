@@ -107,8 +107,8 @@ pub(super) fn press_tick(
         Query<Option<&crate::net::ObjectStore>, With<Embodied>>,
         SelfPosture,
     ),
-    // The loot window's move-start close.
-    mut loot: ResMut<crate::ui_loot::LootMoveStart>,
+    // The loot window's move-start close, run at the press.
+    mut loot: crate::ui_loot::MoveStartClose,
     // The auto-move a pitch start or stop ends, and where its `AUTOFOLLOW_END` goes.
     mut auto_move: (
         ResMut<FollowState>,
@@ -182,6 +182,11 @@ pub(super) fn press_tick(
         super::approach::end_auto_move(Some(follow), Some(approach), None, lane.as_deref_mut());
     }
     let prev = player.move_flags;
+    // A start's `OnMoveInput 0x60e990` (`0x60dc6a`, `0x60dcba`, `0x60dd55`) closes the loot at the
+    // press (`0x60e9dd`), before the start queues on the mover (`0x60dc7d`) for the stream below.
+    if lock.foreign_mover.is_none() && (loot_walk_away(prev, bits) || pitched) {
+        loot.close();
+    }
     // The tick runs in the air, whose translate predicate tests root alone (`0x514560` tests
     // `0x1200`, not the fall bit), so its legs above ran; the start it queues is the frame time's
     // to stream there, where only the mover's standstill nudge breaks the silence.
@@ -189,10 +194,6 @@ pub(super) fn press_tick(
         let ended = movement_net::stream_commands(&net.0, &mut player, bits, time.elapsed_secs());
         player.press_ended_precast |= ended;
         move_trace::press(word, prev, player.move_flags);
-    }
-    // A start's `0x60e990` (`0x60dc6a`, `0x60dcba`, `0x60dd55`) closes the loot at the press.
-    if lock.foreign_mover.is_none() && (loot_walk_away(prev, bits) || pitched) {
-        loot.0 = true;
     }
 }
 
@@ -283,13 +284,15 @@ struct TickReads<'w, 's> {
 }
 
 /// What a binding call leaves its host to run inside it, in the reference's order: the cast
-/// cancel, then the tick's legs.
+/// cancel, then the tick ([`CommandSteps::tick_called`]) and its legs.
 #[derive(Default)]
 pub(crate) struct Called {
     /// The cast cancel's verdict: whether the player is the active mover, the one extra test of the
     /// channel's cancel (`0x51517b`-`0x515191`).
     pub(crate) cancel: Option<bool>,
-    pub(crate) legs: TickLegs,
+    /// The tick `SetCommands` runs at its tail (`0x5151a0`), after the cancel: the input and the
+    /// emitters as they stood before the call moved its bit.
+    tick: Option<(BindingInput, Option<Emitters>)>,
 }
 
 /// What the tick's emitters make of the command bits as they stand.
@@ -341,7 +344,16 @@ impl CommandSteps<'_, '_> {
         let cancel = if changed { self.cancel(input) } else { None };
         Called {
             cancel,
-            legs: self.tick(input, before),
+            tick: Some((input, before)),
+        }
+    }
+
+    /// The tick `called` owes, at `SetCommands`' tail (`0x5151a0`), past the cancel's listeners
+    /// ([`Self::tick`]): the stand-up sent now, the rest returned for the host.
+    pub(crate) fn tick_called(&mut self, called: &mut Called) -> TickLegs {
+        match called.tick.take() {
+            Some((input, before)) => self.tick(input, before),
+            None => TickLegs::default(),
         }
     }
 
@@ -366,7 +378,7 @@ impl CommandSteps<'_, '_> {
         };
         Called {
             cancel: if on { self.cancel(input) } else { None },
-            legs: self.tick(input, before),
+            tick: Some((input, before)),
         }
     }
 

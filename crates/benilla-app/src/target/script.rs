@@ -141,16 +141,33 @@ impl ScriptSelect<'_, '_> {
         })
     }
 
-    /// The rest of a call's teardown its signals held back, now that their listeners have run
-    /// ([`SelectCommit::pay_send`]).
-    pub(crate) fn pay_send(&mut self, send: super::scan::OwedSend) {
-        self.commit.pay_send(send);
+    /// The rest of a call's teardown its signals held back, now that their listeners have run, up
+    /// to the send its ladder's listeners hold back ([`SelectCommit::store_send`]).
+    pub(crate) fn store_send(&mut self, send: super::scan::OwedSend) -> super::scan::OwedWire {
+        self.commit.store_send(send)
     }
 
-    /// The teardown's pet leg, if it waits behind its stop's report, now that the report's
-    /// listeners have run: whether it called a unit off ([`SelectCommit::run_pet_leg`]).
+    /// A select's send, now that its ladder's listeners have run ([`SelectCommit::send_wire`]).
+    pub(crate) fn send_wire(&self, wire: super::scan::OwedWire) {
+        self.commit.send_wire(wire);
+    }
+
+    /// The teardown's pet leg, if it waits behind its stop, now that the stop's listeners have
+    /// run: whether it called a unit off ([`SelectCommit::run_pet_leg`]).
     pub(crate) fn run_pet_leg(&mut self, send: &mut super::scan::OwedSend) -> bool {
         self.commit.run_pet_leg(send)
+    }
+
+    /// The teardown's StopAttack past its head, now that its tutorials' listeners have run:
+    /// whether its next-swing cancel ran ([`SelectCommit::stop_send`]).
+    pub(crate) fn stop_send(&mut self, stop: crate::creature_anim::StopTail) -> bool {
+        self.commit.stop_send(stop)
+    }
+
+    /// The teardown's StopAttack's save leg, now that the cancel's listeners have run
+    /// ([`SelectCommit::stop_save`]).
+    pub(crate) fn stop_save(&mut self) {
+        self.commit.stop_save();
     }
 
     /// Pay what a selecting call still owes, now that its signals' listeners have run, up to a

@@ -25,9 +25,9 @@ pub(crate) use emote::EmoteDoer;
 #[cfg(test)]
 pub(super) use parse::lua_quoted_string;
 pub(super) use parse::{parse_line, ParsedChat};
-pub(crate) use send::ChatSender;
 #[cfg(test)]
 pub(crate) use send::{chat_world, run_chat};
+pub(crate) use send::{ChatSender, ChatStep};
 
 use crate::creature_anim::MovementState;
 use crate::net::{ClientCommand, NetCommands, SelfPlayer};
@@ -670,6 +670,7 @@ pub(super) fn drain_chat_input(
                                 spell_id,
                                 kind,
                                 seq: play_seq.next(),
+                                at: None,
                             });
                             // A selected caster's GO hits us, so a missile flies end to end; a
                             // self-cast has no target. `ground` sends the pure dest shape instead,
@@ -691,6 +692,7 @@ pub(super) fn drain_chat_input(
                                         target_mask: 0x40,
                                         ammo_display_id: None,
                                         seq: play_seq.next(),
+                                        at: None,
                                     });
                                 } else if let Some(me) = me.filter(|&m| m != entity) {
                                     go_targets.write(crate::creature_anim::SpellGoTargets {
@@ -705,6 +707,7 @@ pub(super) fn drain_chat_input(
                                         // Rough Arrow, display id 5996.
                                         ammo_display_id: Some(5996),
                                         seq: play_seq.next(),
+                                        at: None,
                                     });
                                 }
                             }
