@@ -605,7 +605,7 @@ dependencies = [
 
 [[package]]
 name = "benilla-horizon"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "cc",
  "getrandom 0.2.17",
@@ -652,7 +652,7 @@ dependencies = [
 
 [[package]]
 name = "benilla-pad"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "benilla-app",
  "benilla-buildstamp",
@@ -689,7 +689,7 @@ dependencies = [
 
 [[package]]
 name = "benilla-uam"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "cc",
  "naga",

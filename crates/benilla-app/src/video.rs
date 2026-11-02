@@ -506,7 +506,7 @@ impl Plugin for VideoPlugin {
 /// library and names none of its calls), and benilla builds no tree for one to read. The adapter's
 /// UI Automation provider is not inert where a client runs: Proton-based Wine's `tabtip.exe` queries
 /// the focused window, and that traffic faults in `rpcrt4` on reused memory and damages the heap.
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg(windows)]
 fn drop_accessibility_adapter(
     mut created: MessageReader<bevy::window::WindowCreated>,
     _main_thread: bevy::ecs::system::NonSendMarker,
