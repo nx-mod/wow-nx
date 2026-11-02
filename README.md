@@ -16,6 +16,8 @@ In progress, and playable: it logs in to a 1.12.1 server, enters the world, and 
 with the Joy-Con, touch, or a USB keyboard and mouse. Tested on Kronos (TwinStar) with a night elf druid, levels
 1–4, in Teldrassil.
 
+Built on benilla 0.3.0 (wow-nx 0.1.4).
+
 Known issues, being worked on ([docs/SWITCH.md](docs/SWITCH.md) has the details):
 
 - **Speed:** 17–22 fps in the world at 720p on the first release build (30–60 on the character screen). The main
